@@ -1,5 +1,6 @@
-//! Scalar vs NEON for every kernel at dims 96 (Deep), 128 (SIFT) and
-//! 768 (text embeddings). Run with `cargo bench -p kernels`.
+//! Scalar vs NEON for every kernel: distances at dims 96 (Deep), 128 (SIFT)
+//! and 768 (text embeddings), and the 4-bit PQ fast-scan at m = 16, 32, 64.
+//! Run with `cargo bench -p kernels`.
 
 use std::hint::black_box;
 use std::time::Duration;
@@ -63,6 +64,27 @@ fn benches(c: &mut Criterion) {
         pair(c, "l2_sq_i8", i8s, scalar::l2_sq_i8, neon::l2_sq_i8);
         pair(c, "dot_i8", i8s, scalar::dot_i8, neon::dot_i8);
     }
+    pq4_scan(c);
+}
+
+/// 4-bit fast-scan over 1024 codes (32 blocks), throughput in codes.
+fn pq4_scan(c: &mut Criterion) {
+    let mut g = c.benchmark_group("pq4_scan");
+    g.warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for m in [16, 32, 64] {
+        let blocks: Vec<u8> = i8s(32 * m * 16, 1).into_iter().map(|x| x as u8).collect();
+        let lut: Vec<u8> = i8s(m * 16, 2).into_iter().map(|x| x as u8).collect();
+        let mut out = vec![0u16; 1024];
+        g.throughput(Throughput::Elements(1024));
+        g.bench_with_input(BenchmarkId::new("scalar", m), &m, |bch, _| {
+            bch.iter(|| scalar::pq4_scan(black_box(&blocks), black_box(&lut), &mut out))
+        });
+        g.bench_with_input(BenchmarkId::new("neon", m), &m, |bch, _| {
+            bch.iter(|| neon::pq4_scan(black_box(&blocks), black_box(&lut), &mut out))
+        });
+    }
+    g.finish();
 }
 
 criterion_group!(kernel_benches, benches);
