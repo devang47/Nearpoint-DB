@@ -878,6 +878,35 @@ mod tests {
         );
     }
 
+    /// Durable appends/s under `Batch` as writer threads grow: group commit
+    /// should let N writers share each F_FULLFSYNC.
+    /// `cargo test --release -p storage -- --ignored --nocapture sync_throughput`
+    #[test]
+    #[ignore]
+    fn sync_throughput_batch_by_threads() {
+        for threads in [1u64, 2, 4, 8, 16, 32] {
+            let d = TempDir::new("throughput");
+            let (wal, _) = Wal::open(&d.0, SyncPolicy::Batch).unwrap();
+            let per = 1600 / threads;
+            let t = Instant::now();
+            std::thread::scope(|s| {
+                for w in 0..threads {
+                    let wal = &wal;
+                    s.spawn(move || {
+                        for i in 0..per {
+                            wal.append(&upsert(w * per + i)).unwrap();
+                        }
+                    });
+                }
+            });
+            let secs = t.elapsed().as_secs_f64();
+            println!(
+                "SyncPolicy::Batch {threads:>2} writers: {:.0} durable appends/s",
+                (threads * per) as f64 / secs
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
