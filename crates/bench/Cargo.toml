@@ -11,6 +11,7 @@ thiserror.workspace = true
 index = { path = "../index" }
 kernels = { path = "../kernels" }
 rayon.workspace = true
+roaring.workspace = true
 storage = { path = "../storage" }
 # binary only
 anyhow.workspace = true

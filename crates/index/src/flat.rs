@@ -87,22 +87,34 @@ impl Index for Flat {
         Ok(ids)
     }
 
-    fn search(&self, query: &[f32], k: usize, _: &SearchParams) -> Result<Vec<Hit>> {
+    fn search(&self, query: &[f32], k: usize, params: &SearchParams) -> Result<Vec<Hit>> {
         check_dim(self.dim, query.len())?;
         let q = self.metric.prepare(query);
+        let dim = self.dim;
         Ok(self
             .data
-            .par_chunks(self.dim * ROWS_PER_TASK)
+            .par_chunks(dim * ROWS_PER_TASK)
             .enumerate()
             .map(|(t, rows)| {
-                top_k(
-                    rows,
-                    self.dim,
-                    self.metric,
-                    &q,
-                    k,
-                    (t * ROWS_PER_TASK) as u32,
-                )
+                let first = (t * ROWS_PER_TASK) as u32;
+                let hit = |id: u32, row: &[f32]| Hit {
+                    id,
+                    dist: self.metric.distance(&q, row),
+                };
+                match params.filter {
+                    None => top_k(
+                        rows.chunks_exact(dim)
+                            .zip(first..)
+                            .map(|(r, id)| hit(id, r)),
+                        k,
+                    ),
+                    // Visit only the filter's ids in this task's rows.
+                    Some(f) => {
+                        let end = first + (rows.len() / dim) as u32;
+                        let row = |id: u32| &rows[(id - first) as usize * dim..][..dim];
+                        top_k(f.range(first..end).map(|id| hit(id, row(id))), k)
+                    }
+                }
             })
             .reduce(Vec::new, |mut a, b| {
                 a.extend(b);
@@ -113,14 +125,10 @@ impl Index for Flat {
     }
 }
 
-/// The `k` nearest of `rows` to `q`, nearest first; ids start at `first_id`.
-fn top_k(rows: &[f32], dim: usize, metric: Metric, q: &[f32], k: usize, first_id: u32) -> Vec<Hit> {
+/// The `k` nearest of `hits`, nearest first.
+pub(crate) fn top_k(hits: impl Iterator<Item = Hit>, k: usize) -> Vec<Hit> {
     let mut heap = BinaryHeap::with_capacity(k + 1);
-    for (i, row) in rows.chunks_exact(dim).enumerate() {
-        let hit = Hit {
-            id: first_id + i as u32,
-            dist: metric.distance(q, row),
-        };
+    for hit in hits {
         if heap.len() < k {
             heap.push(hit);
         } else if let Some(mut far) = heap.peek_mut()
@@ -136,6 +144,7 @@ fn top_k(rows: &[f32], dim: usize, metric: Metric, q: &[f32], k: usize, first_id
 mod tests {
     use super::*;
     use crate::{Error, test_data};
+    use roaring::RoaringBitmap;
 
     fn ids(hits: &[Hit]) -> Vec<u32> {
         hits.iter().map(|h| h.id).collect()
@@ -171,6 +180,41 @@ mod tests {
         all.sort();
         let got = f.search(&q, 25, &SearchParams::default()).unwrap();
         assert_eq!(ids(&got), ids(&all[..25]));
+
+        // Filtered across tasks, with ids past the end ignored.
+        let filter: RoaringBitmap = (0..n as u32 + 50).filter(|i| i % 3 == 1).collect();
+        let p = SearchParams {
+            filter: Some(&filter),
+            ..SearchParams::default()
+        };
+        all.retain(|h| filter.contains(h.id));
+        assert_eq!(ids(&f.search(&q, 25, &p).unwrap()), ids(&all[..25]));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn filtered_equals_brute_force_over_the_bitmap(
+            n in 1usize..300,
+            picks in proptest::collection::vec(0u32..320, 0..200),
+            k in 0usize..20,
+            seed in 0u64..1000,
+        ) {
+            let dim = 4;
+            let data = test_data::vectors(n, dim, seed);
+            let q = test_data::vectors(1, dim, seed + 1);
+            let mut f = Flat::new(dim, Metric::L2);
+            f.add(&data).unwrap();
+            let filter: RoaringBitmap = picks.into_iter().collect();
+            let p = SearchParams { filter: Some(&filter), ..SearchParams::default() };
+            let mut want: Vec<Hit> = filter
+                .iter()
+                .filter(|&id| (id as usize) < n)
+                .map(|id| Hit { id, dist: Metric::L2.distance(&q, &data[id as usize * dim..][..dim]) })
+                .collect();
+            want.sort();
+            want.truncate(k);
+            proptest::prop_assert_eq!(f.search(&q, k, &p).unwrap(), want);
+        }
     }
 
     #[test]

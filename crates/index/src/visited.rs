@@ -9,6 +9,9 @@ use std::cell::RefCell;
 pub(crate) struct Visited {
     stamps: Vec<u32>,
     generation: u32,
+    /// Distances computed by searches on this thread so far. Searches bump
+    /// it; benchmarks read it (`hnsw::distances`). Never reset.
+    pub distances: u64,
 }
 
 impl Visited {
@@ -37,7 +40,7 @@ impl Visited {
 
 thread_local! {
     pub(crate) static VISITED: RefCell<Visited> = const {
-        RefCell::new(Visited { stamps: Vec::new(), generation: 0 })
+        RefCell::new(Visited { stamps: Vec::new(), generation: 0, distances: 0 })
     };
 }
 
@@ -50,6 +53,7 @@ mod tests {
         let mut v = Visited {
             stamps: Vec::new(),
             generation: u32::MAX - 1,
+            distances: 0,
         };
         v.reset(4);
         assert!(v.insert(2));
