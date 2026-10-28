@@ -192,7 +192,10 @@ fn main() -> Result<()> {
                 seed: args.seed,
             };
             let label = format!("hnsw m={} efc={}", cfg.m, cfg.ef_construction);
-            (Box::new(Hnsw::new(base.dim(), Metric::L2, cfg)), label)
+            let mut h = Hnsw::new(base.dim(), Metric::L2, cfg);
+            // The total is known: reserve it so batched adds never regrow.
+            h.reserve(base.len());
+            (Box::new(h), label)
         }
         IndexKind::Ivfpq => {
             let cfg = ivfpq::Config {
