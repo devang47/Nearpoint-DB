@@ -15,6 +15,12 @@ pub(crate) fn put_u64(out: &mut Vec<u8>, x: u64) {
     out.extend_from_slice(&x.to_le_bytes());
 }
 
+pub(crate) fn put_f32s(out: &mut Vec<u8>, xs: &[f32]) {
+    for x in xs {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
 pub(crate) fn put_header(out: &mut Vec<u8>, magic: &[u8; 4], dim: usize, metric: Metric) {
     out.extend_from_slice(magic);
     put_u32(out, VERSION);
@@ -51,6 +57,16 @@ impl<'a> Reader<'a> {
         let mut a = [0; 4];
         a.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(a))
+    }
+
+    /// `count` f32s.
+    pub(crate) fn f32s(&mut self, count: usize) -> Result<Vec<f32>> {
+        let b = self.take_n(count, 4)?;
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect())
     }
 
     pub(crate) fn u64(&mut self) -> Result<u64> {

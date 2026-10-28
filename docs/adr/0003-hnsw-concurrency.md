@@ -39,3 +39,21 @@ allowed in `index`, and no concurrency crates beyond rayon.
   incremental `add`.
 - A seeded `rand` RNG for levels: fine for one thread, but with a parallel
   build the order of draws depends on scheduling.
+
+## Addendum (2026-10-28): striped node locks, `reserve`
+- **Locks are striped:** 4096 mutexes, node `i` takes `i % 4096`. On
+  macOS a `Mutex<()>` is 16 B inline plus a 64 B pthread mutex boxed on
+  first lock, and every node gets locked during a build, so a mutex per
+  node was ~80 B per vector (76 MiB at 1M, ~8 GB at 100M), more than half
+  of layer 0's links. A writer still holds one lock at a time, so stripes
+  can't deadlock; two writers wanting the same stripe at once (≈ 10
+  threads / 4096) just wait briefly.
+- **`Hnsw::reserve(n)`:** `add` grows its arrays like any `Vec`, so a
+  build fed in batches regrows (old + new copies at once, up to 2x slack).
+  Callers that know the total (the bench, the Phase 6 segment builder)
+  reserve it exactly first.
+- Per-vector cost at M = 16, dim 128, after both: vectors 512 B, layer 0
+  132 B, level 1 B, upper-layer box 16 B + ≈ 5 B of upper lists on
+  average (1/15 node-levels × 68 B, rounded up by malloc), locks ≈ 0:
+  ≈ 666 B, i.e. ≈ 154 B on top of the f32 vector (was ≈ 234 B). Searches
+  add a 4 B-per-node visited array per searching thread.

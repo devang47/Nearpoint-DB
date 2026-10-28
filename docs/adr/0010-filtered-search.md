@@ -89,3 +89,32 @@ ef 64 is unchanged.
   The walk stays correct (it just visits more), and the planner only
   sees cardinality.
 - IVF-PQ filtering (the other half of 7.3) is a separate change.
+
+## Addendum (2026-10-28): correlated filters
+`filtered --filter far` keeps the base vectors farthest (L2) from the
+mean of the queries: the matches sit together at the edge of the data,
+far from most queries. SIFT1M, M=16, efc=200, 1000 queries, forced walk
+(`--plan graph`), tie-aware recall@10 and mean distances per query:
+
+| selectivity | uniform ef 64 | far ef 64 | far ef 128 | far: distances ef 64 (uniform) | auto plan |
+|-------------|--------------:|----------:|-----------:|-------------------------------:|-----------|
+| 1%  | 0.9999 | 0.9999 | 0.9999 | 293,120 (45,393) | brute force (exact) |
+| 10% | 0.9986 | 0.9995 | 0.9998 | 110,191 (7,941)  | walk |
+| 50% | 0.9803 | 0.9920 | 0.9978 | 10,721 (2,158)   | walk |
+
+- **Recall holds** (≥ 0.99 everywhere, slightly higher than uniform: the
+  walk can't stop until it holds `ef` matches, so it ends up exploring
+  the matching region thoroughly). No change to the walk.
+- **Cost doesn't.** Reaching the matching region takes 5–14x the
+  distances of a uniform filter. At 10% the walk computes 110k
+  distances where brute force over the 100k ids would compute 100k, yet
+  the planner walks: it only sees cardinality, so it is wrong by about
+  1.1x (ef 64) to 1.3x (ef 128) on this filter, not catastrophically.
+- **If it matters** (Phase 6 soak or real payloads show it): cap the
+  walk at a distance budget of `filtered` and fall back to brute force
+  when it runs out. That bounds any filter at ≈ 2x the cheaper plan
+  without having to estimate correlation. Not done now: recall is met
+  and the worst measured overshoot is 1.3x.
+- Not measured: filters correlated *with* the query (matches near it),
+  which only help the walk, and per-query filters (the bench uses one
+  filter for all queries).

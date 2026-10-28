@@ -2,17 +2,17 @@
 
 A sealed, immutable segment: its vectors, their external ids, and an
 opaque index blob produced by the `index` crate. Code:
-`crates/storage/src/segment.rs` (container), `crates/index/src/{flat,hnsw,blob}.rs`
+`crates/storage/src/segment.rs` (container), `crates/index/src/{flat,hnsw,ivfpq,blob}.rs`
 (blobs).
 
 All integers are little-endian with explicit widths. No `usize` on disk.
 
-## File layout (v1)
+## File layout (v2; v1 is the same with element type 0 only)
 
 | Part         | Offset                         | Length          |
 |--------------|--------------------------------|-----------------|
 | Header       | 0                              | 64              |
-| Vectors      | 64                             | `count * dim * 4` |
+| Vectors      | 64                             | `count * dim * 4`, or 0 if element type is 1 |
 | zero padding | to a multiple of 64            | 0–63            |
 | Ids          | `align64(end of vectors)`      | `count * 8`     |
 | zero padding | to a multiple of 64            | 0–63            |
@@ -25,7 +25,8 @@ the vector section is viewed in place as `&[f32]` and the id section as
 `&[u64]` (`bytemuck::try_cast_slice`, checked once on open). The footer
 follows the blob directly and is not aligned.
 
-v1 has exactly one layout for given `(dim, count, blob_len)`. The reader
+There is exactly one layout for given `(dim, count, element type,
+blob_len)`. The reader
 recomputes it and requires the footer's section table and the file length
 to match exactly; anything else is `Corrupt`.
 
@@ -34,18 +35,24 @@ to match exactly; anything else is `Corrupt`.
 | Offset | Type    | Field |
 |--------|---------|-------|
 | 0      | [u8; 8] | magic `NPSEGMT\0` |
-| 8      | u32     | format version (1) |
-| 12     | u32     | element type: 0 = f32 (int8 reserved for later) |
+| 8      | u32     | format version (2; 1 still read) |
+| 12     | u32     | element type: 0 = f32 vectors; 1 = no vector section (v2 only) |
 | 16     | u32     | dim (> 0) |
 | 20     | u32     | metric code: 0 = L2, 1 = inner product, 2 = cosine (`index::Metric::code`) |
 | 24     | u64     | vector count |
-| 32     | u32     | blob kind: 0 = flat, 1 = hnsw |
+| 32     | u32     | blob kind: 0 = flat, 1 = hnsw, 2 = ivf-pq |
 | 36     | [u8; 28]| reserved, zero |
 
 ### Sections
 
 - **Vectors:** `count` rows of `dim` f32, row-major, in the index's stored
-  form (unit length for cosine). Dense index id `i` is row `i`.
+  form (unit length for cosine). Dense index id `i` is row `i`. Empty
+  (length 0) when the element type is 1: the writer passes no vectors
+  for a non-empty segment, and `Segment::vectors()` returns `&[]`. That is
+  for indexes whose blob is the whole index (IVF-PQ keeps PQ and int8
+  codes): f32 vectors would cost 4x the int8 codes, which Phase 9's
+  compressed-only mode can't afford. Writers that keep f32 vectors (for
+  `get`, or a later f32 re-rank from the map) write element type 0.
 - **Ids:** `count` u64 external ids; `ids[i]` belongs to dense id `i`.
 - **Index blob:** opaque to storage; layouts below.
 
@@ -72,9 +79,10 @@ requires it to be zero instead, so every single-bit flip anywhere in the
 file is detected (tested exhaustively on a small file).
 
 `Segment::open` checks, in order: header magic (`BadMagic`), length ≥ 160
-(`Truncated`), version (`UnsupportedVersion`; read before any CRC so a
+(`Truncated`), version 1 or 2 (`UnsupportedVersion`; read before any CRC so a
 newer file gets a clear error), footer magic (`Truncated`), footer CRC, header CRC
-(`Checksum`), element type (`UnsupportedElementType`), dim/blob kind/section
+(`Checksum`), element type (`UnsupportedElementType`: 0, or 1 in a v2
+file), dim/blob kind/section
 table/file length/padding (`Corrupt`), then every section CRC (`Checksum`).
 
 **Cost.** v1 verifies every section on open, which reads the whole file
@@ -101,7 +109,7 @@ covers them.
 
 | Offset | Type    | Field |
 |--------|---------|-------|
-| 0      | [u8; 4] | magic: `NPFL` (flat) or `NPHW` (hnsw) |
+| 0      | [u8; 4] | magic: `NPFL` (flat), `NPHW` (hnsw) or `NPIV` (ivf-pq) |
 | 4      | u32     | blob version (1) |
 | 8      | u32     | dim |
 | 12     | u32     | metric code |
@@ -137,6 +145,53 @@ isn't a node on the top layer (or isn't `u64::MAX` exactly when n = 0).
 Sizes come from bytes actually present, so a corrupt blob can't trigger a
 huge allocation.
 
+### IVF-PQ blob v1
+
+Self-contained: loading and searching need no f32 vectors, so its segment
+is normally written with element type 1.
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 16     | u32  | nlist |
+| 20     | u32  | m (PQ subspaces) |
+| 24     | u32  | nbits: 8, or 4 (fast-scan) |
+| 28     | u32  | trained: 0 or 1 |
+| 32     | u64  | max_train |
+| 40     | u64  | seed |
+| 48     | u64  | n (vector count) |
+
+If trained is 0, n must be 0 and the blob ends here. Otherwise, with
+`ksub = 2^nbits`, `dsub = dim / m`:
+
+| Part | Size |
+|------|------|
+| coarse centroids, row-major | nlist × dim × f32 |
+| PQ codebooks: subspace j, centroid c, component | m × ksub × dsub × f32 |
+| SQ per-dimension min | dim × f32 |
+| SQ scale | f32 |
+| list sizes | nlist × u32 |
+| lists, in cell order: ids, then codes | per list: size × u32, then codes |
+| SQ int8 codes by id | n × dim × i8 |
+
+List codes: 8-bit, `size × m` bytes (one code after another, in id
+order); 4-bit, `ceil(size / 32)` fast-scan blocks of `m × 16` bytes,
+the last zero-padded (block layout in docs/adr/0009-ivf-pq.md).
+
+`IvfPq::from_bytes` rejects: a config `IvfPq::new` would reject (m not
+dividing dim, nbits not 8/4, 4-bit with m > 256, nlist 0), a trained
+flag other than 0/1 or 0 with n > 0, n > u32::MAX, an SQ scale that
+isn't finite and > 0, list sizes not summing to n, list ids that aren't
+each of `0..n` exactly once, truncation and trailing bytes. Every size
+is read from bytes actually present before anything is allocated for it.
+Floats are not range-checked otherwise: a NaN centroid gives bad
+results, not a panic (the random-corruption proptest searches and
+extends whatever loads).
+
+Size at SIFT10M (nlist 4096, m 16, 8-bit, dim 128): centroids 2 MB +
+codebooks 128 KB + lists 10M × (4 + 16) B + SQ codes 10M × 128 B ≈
+1.48 GB, the in-RAM size. `to_bytes` builds it in one `Vec` (exact
+capacity), so writing a segment holds the index twice for a moment.
+
 **Vectors on load.** `from_bytes` takes the vectors as an owned
 `Vec<f32>` (callers pass `segment.vectors().to_vec()`). That is one copy:
 for SIFT1M, 512 MB of heap on top of the (evictable) mapped pages. v1
@@ -165,5 +220,7 @@ would shrink it, at the cost of a rebuild step on load.
 | Version | Date | Change |
 |---------|------|--------|
 | 1 | 2026-10-28 | Initial format (task 3.2). Fixture: `crates/storage/testdata/segment-v1.seg`. |
+| 2 | 2026-10-28 | Element type 1 = no vector section; blob kind 2 = IVF-PQ. v1 files still load; v1 cannot hold element type 1. Fixture (no vectors): `crates/storage/testdata/segment-v2.seg`. |
 
-HNSW and Flat blobs: version 1, same date.
+HNSW and Flat blobs: version 1, same date. IVF-PQ blob: version 1,
+added with segment v2.

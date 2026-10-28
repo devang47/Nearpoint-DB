@@ -88,3 +88,48 @@ lists fill.
   anyway.
 - **Optional SQ codes (compressed-only mode):** needed for Phase 9 (1B ×
   128 B = 128 GB won't fit); add the switch then.
+
+## Addendum (2026-10-28): cosine and inner product, serialization
+- **Cosine:** vectors (and the training sample) are normalized on insert,
+  queries on search, then everything runs as L2. On unit vectors
+  `|q - x|² = 2 (1 - cos)`, so returned distances are halved and match
+  `Metric::Cosine`'s `1 - cos` (exactly for exact vectors; for the int8
+  reconstruction, up to its error).
+- **Inner product:** cells and PQ are still trained and assigned with L2
+  (small residuals keep PQ accurate). Lists are probed by largest
+  `<q, c>`, and a candidate scores `-(<q, c> + Σ_j <q_j, r̂_j>)`: one
+  table of sub-vector dot products per query (`Pq::dot_table`, shared by
+  every list) plus the list's `<q, c>`. Re-rank uses
+  `<q, decode(c)> = scale·<q, c> + 128·scale·Σq + <q, min>`, so each
+  candidate is one widening and one `dot`. Fast-scan quantizes the dot
+  table like the L2 one.
+- **Recall, SIFT1M treated as each metric** (nlist 1024, 10k queries,
+  ground truth by brute force with `Flat`, tie-aware recall@10):
+
+  | Config | nprobe / rerank | L2 | cosine | inner product |
+  |--------|-----------------|---:|-------:|--------------:|
+  | m=16 8-bit | 16 / 100 | 0.9167 | 0.9171 | 0.7161 |
+  | m=16 8-bit | 32 / 200 | 0.9657 | 0.9668 | 0.8301 |
+  | m=16 8-bit | 64 / 200 | 0.9797 | 0.9806 | 0.8410 |
+  | m=32 4-bit | 32 / 200 | 0.9540 | 0.9547 | 0.7183 |
+  | m=16 8-bit, 1k queries | 64 / 1000 | – | – | 0.9247 |
+  | m=16 8-bit, 1k queries | 1024 / 5000 | – | – | 0.9427 |
+
+  SIFT norms are nearly constant (506–511 on a 20k sample), so all three
+  ground truths are almost the same ranking, and cosine matches L2. Inner
+  product is much harder with the same codes: its score error is
+  `<q, x - x̂>`, which grows with `|q|`, while L2's distance to the
+  reconstruction also carries `|x̂|²`, which cancels most of that and
+  leaves an error growing with `|q - x|`, small for near neighbours.
+  More probes barely help (0.831 → 0.833 at rerank 200, nprobe 64 →
+  1024); more re-rank candidates do (0.92 at 1000), and int8 itself caps
+  at ≈ 0.94 (all lists, 5000 candidates). For MIPS
+  workloads at ≥ 0.95, re-rank from f32 (on disk, Phase 8) is the fix,
+  not more probing. Normalized embeddings (the common case) should use
+  cosine.
+- **Serialization:** `IvfPq::to_bytes`/`from_bytes`, blob `NPIV` v1
+  (docs/formats/segment.md): config, quantizers, lists and SQ codes. It
+  is the whole index, so an IVF-PQ segment needs no f32 vector section
+  (segment v2, ADR 0006 addendum). Loading copies into owned `Vec`s
+  (≈ 1.48 GB at SIFT10M), keeping one representation that accepts `add`;
+  serving lists straight from the map is the Phase 8 option.

@@ -1,11 +1,16 @@
 //! Filtered-search harness (tasks 7.3/7.4): builds HNSW once, then for each
-//! filter selectivity draws a seeded uniform random subset of the base ids,
-//! computes exact filtered ground truth by brute force over it, and runs the
-//! queries one at a time with that filter. Reports recall, the distances
-//! each search computed and which plan ran, per (selectivity, ef, plan).
+//! filter kind and selectivity picks a subset of the base ids, computes
+//! exact filtered ground truth by brute force over it, and runs the queries
+//! one at a time with that filter. Reports recall, the distances each
+//! search computed and which plan ran, per (filter, selectivity, ef, plan).
+//!
+//! Filter kinds: `random` keeps a seeded uniform random subset; `far` keeps
+//! the base vectors farthest from the queries' centroid, so the matches are
+//! correlated with each other and far from most queries (the hard case for
+//! a filtered graph walk).
 //!
 //! `cargo run --release -p bench --bin filtered -- --dataset sift1m \
-//!     --selectivity 0.01,0.1,0.5 --ef 64,128 --plan auto,graph`
+//!     --selectivity 0.01,0.1,0.5 --ef 64,128 --plan auto,graph --filter random,far`
 
 use std::fs::File;
 use std::io::Write;
@@ -38,6 +43,10 @@ struct Args {
     /// force one side of the planner's threshold.
     #[arg(long, value_delimiter = ',', default_value = "auto")]
     plan: Vec<PlanArg>,
+    /// Filter kinds, comma-separated: `random` (uniform) and/or `far`
+    /// (the base vectors farthest from the queries' centroid).
+    #[arg(long, value_delimiter = ',', default_value = "random")]
+    filter: Vec<FilterKind>,
     /// Neighbours per query; recall is measured at this k.
     #[arg(long, default_value_t = 10)]
     k: usize,
@@ -64,6 +73,12 @@ struct Args {
 enum Dataset {
     Siftsmall,
     Sift1m,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum FilterKind {
+    Random,
+    Far,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -122,8 +137,24 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    for &s in &args.selectivity {
-        let filter = random_filter(base.len(), s, args.seed);
+    // Base ids from farthest to nearest the queries' centroid.
+    let by_far = args
+        .filter
+        .iter()
+        .any(|f| matches!(f, FilterKind::Far))
+        .then(|| farthest_first(&base, &query));
+    for (&kind, &s) in args
+        .filter
+        .iter()
+        .flat_map(|k| args.selectivity.iter().map(move |s| (k, s)))
+    {
+        let (filter, tag) = match (kind, &by_far) {
+            (FilterKind::Far, Some(ids)) => {
+                let keep = (s.clamp(0.0, 1.0) * ids.len() as f64).round() as usize;
+                (ids[..keep].iter().copied().collect(), "far")
+            }
+            _ => (random_filter(base.len(), s, args.seed), "random"),
+        };
         let truth = ground_truth(&base, &query, &filter, args.k);
         for &ef in &args.ef {
             let params = SearchParams {
@@ -143,7 +174,7 @@ fn main() -> Result<()> {
                     Plan::BruteForce => "brute",
                 };
                 println!(
-                    "sel={s:<6} n={:<7} ef={ef:<4} {label:<5} recall@{k}={:.4} (id {:.4}) \
+                    "{tag:<6} sel={s:<6} n={:<7} ef={ef:<4} {label:<5} recall@{k}={:.4} (id {:.4}) \
                      dists={:<8.0} p50={:.3}ms p99={:.3}ms qps={:.0}",
                     filter.len(),
                     r.recall,
@@ -157,7 +188,9 @@ fn main() -> Result<()> {
                 if let Some(f) = &mut csv {
                     writeln!(
                         f,
-                        "{name},{},{},{},{s},{},{ef},{},{label},{:.4},{:.4},{:.0},{:.4},{:.4},{:.1}",
+                        // Same columns as before: `far` tags the dataset.
+                        "{name}{},{},{},{},{s},{},{ef},{},{label},{:.4},{:.4},{:.0},{:.4},{:.4},{:.1}",
+                        if tag == "far" { "/far" } else { "" },
                         args.m,
                         args.ef_construction,
                         args.seed,
@@ -189,6 +222,30 @@ fn random_filter(n: usize, s: f64, seed: u64) -> RoaringBitmap {
     (0..n as u32)
         .filter(|&id| splitmix64(seed ^ u64::from(id).wrapping_mul(0x9E37_79B9)) < cut)
         .collect()
+}
+
+/// Base ids sorted by L2 distance to the mean of the queries, farthest
+/// first (ties by id).
+fn farthest_first(base: &Vectors<f32>, query: &Vectors<f32>) -> Vec<u32> {
+    let mut centroid = vec![0f64; query.dim()];
+    for i in 0..query.len() {
+        for (c, &x) in centroid.iter_mut().zip(query.row(i)) {
+            *c += f64::from(x);
+        }
+    }
+    let centroid: Vec<f32> = centroid
+        .iter()
+        .map(|c| (c / query.len().max(1) as f64) as f32)
+        .collect();
+    let mut far: Vec<Hit> = (0..base.len())
+        .into_par_iter()
+        .map(|i| Hit {
+            id: i as u32,
+            dist: -kernels::scalar::l2_sq(&centroid, base.row(i)),
+        })
+        .collect();
+    far.par_sort_unstable();
+    far.iter().map(|h| h.id).collect()
 }
 
 fn splitmix64(x: u64) -> u64 {

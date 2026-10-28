@@ -6,6 +6,9 @@
 //!
 //! `cargo run --release -p bench -- --dataset sift1m --index hnsw --ef 16,32,64,128`
 //! `cargo run --release -p bench -- --dataset sift1m --index ivfpq --nprobe 8,16,32 --rerank 0,100`
+//!
+//! `--metric ip|cosine` treats the dataset as that metric: ground truth is
+//! then computed by brute force (`Flat`) instead of read from disk.
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -29,6 +32,10 @@ struct Args {
     dataset: Dataset,
     #[arg(long, default_value = "hnsw")]
     index: IndexKind,
+    /// Distance metric. The datasets' ground truth is L2; for the others
+    /// it's computed here (f32 datasets only).
+    #[arg(long, default_value = "l2")]
+    metric: MetricArg,
     /// Neighbours per query; recall is measured at this k.
     #[arg(long, default_value_t = 10)]
     k: usize,
@@ -79,6 +86,13 @@ enum Dataset {
     Sift1m,
     /// The first 10M BIGANN vectors (u8), from big-ann-benchmarks.
     Bigann10m,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MetricArg {
+    L2,
+    Ip,
+    Cosine,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -179,12 +193,42 @@ fn main() -> Result<()> {
         base.dim(),
         t.elapsed()
     );
+    let metric = match args.metric {
+        MetricArg::L2 => Metric::L2,
+        MetricArg::Ip => Metric::InnerProduct,
+        MetricArg::Cosine => Metric::Cosine,
+    };
+    let truth: Vec<Vec<u32>> = if metric == Metric::L2 {
+        (0..query.len())
+            .map(|i| gt.row(i)[..args.k].to_vec())
+            .collect()
+    } else {
+        // Brute force; the f32 copy in `Flat` is freed before the build,
+        // but it is in the peak below, so ignore memory figures here.
+        let Rows::F32(b) = &base else {
+            anyhow::bail!("--metric {metric:?} needs an f32 dataset");
+        };
+        let mut exact = Flat::new(base.dim(), metric);
+        exact.add(b.as_flat())?;
+        let p = SearchParams::default();
+        let truth = (0..query.len())
+            .map(|i| {
+                Ok(exact
+                    .search(&query.row(i), args.k, &p)?
+                    .iter()
+                    .map(|h| h.id)
+                    .collect())
+            })
+            .collect::<Result<_>>()?;
+        println!("{metric:?} ground truth by brute force (memory figures include it)");
+        truth
+    };
     // The peak so far is the harness's own data; the build adds the index.
     let loaded = storage::sys::peak_memory()?.phys_footprint;
 
     let t = Instant::now();
     let (mut index, label): (Box<dyn Index>, String) = match args.index {
-        IndexKind::Flat => (Box::new(Flat::new(base.dim(), Metric::L2)), "flat".into()),
+        IndexKind::Flat => (Box::new(Flat::new(base.dim(), metric)), "flat".into()),
         IndexKind::Hnsw => {
             let cfg = hnsw::Config {
                 m: args.m,
@@ -192,7 +236,10 @@ fn main() -> Result<()> {
                 seed: args.seed,
             };
             let label = format!("hnsw m={} efc={}", cfg.m, cfg.ef_construction);
-            (Box::new(Hnsw::new(base.dim(), Metric::L2, cfg)), label)
+            let mut h = Hnsw::new(base.dim(), metric, cfg);
+            // The total is known: reserve it so batched adds never regrow.
+            h.reserve(base.len());
+            (Box::new(h), label)
         }
         IndexKind::Ivfpq => {
             let cfg = ivfpq::Config {
@@ -202,7 +249,7 @@ fn main() -> Result<()> {
                 max_train: args.max_train,
                 seed: args.seed,
             };
-            let mut ivf = IvfPq::new(base.dim(), Metric::L2, cfg)?;
+            let mut ivf = IvfPq::new(base.dim(), metric, cfg)?;
             // Train on rows spread over the whole base, not the first batch.
             let (n, t) = (base.len(), base.len().min(cfg.max_train));
             let mut sample = Vec::with_capacity(t * base.dim());
@@ -263,8 +310,20 @@ fn main() -> Result<()> {
     let opt = |on: bool, v: &dyn std::fmt::Display| {
         if on { v.to_string() } else { String::new() }
     };
+    // Same CSV columns as before: a non-L2 metric tags the index name.
+    let kind = format!(
+        "{}{}",
+        args.index
+            .to_possible_value()
+            .map_or(String::new(), |v| v.get_name().to_owned()),
+        match args.metric {
+            MetricArg::L2 => "",
+            MetricArg::Ip => "/ip",
+            MetricArg::Cosine => "/cosine",
+        }
+    );
     for params in runs {
-        let r = run_queries(&*index, &base, &query, &gt, args.k, &params)?;
+        let r = run_queries(&*index, &base, &query, &truth, &params)?;
         let what = match args.index {
             IndexKind::Flat => String::new(),
             IndexKind::Hnsw => format!("ef={:<4} ", params.ef),
@@ -294,10 +353,6 @@ fn main() -> Result<()> {
                 r.qps,
                 build.as_secs_f64(),
                 rayon::current_num_threads(),
-                kind = args
-                    .index
-                    .to_possible_value()
-                    .map_or(String::new(), |v| v.get_name().to_owned()),
                 m = opt(hnsw, &args.m),
                 efc = opt(hnsw, &args.ef_construction),
                 seed = opt(hnsw || ivf, &args.seed),
@@ -339,14 +394,16 @@ struct Run {
     qps: f64,
 }
 
+/// `truth[i]`: the exact top-k ids of query `i`, nearest first.
 fn run_queries(
     index: &dyn Index,
     base: &Rows,
     query: &Rows,
-    gt: &Vectors<u32>,
-    k: usize,
+    truth: &[Vec<u32>],
     params: &SearchParams,
 ) -> Result<Run> {
+    let k = truth.first().map_or(0, Vec::len);
+    let metric = index.metric();
     let mut latencies = Vec::with_capacity(query.len());
     // Two recalls. `id_hits`: result ids found in the ground-truth top-k.
     // `tie_hits`: results whose true distance is <= the k-th ground-truth
@@ -362,8 +419,15 @@ fn run_queries(
         let result = index.search(&q, k, params)?;
         latencies.push(t.elapsed());
 
-        let truth = &gt.row(i)[..k];
-        let true_dist = |id: usize| kernels::scalar::l2_sq(&q, &base.row(id));
+        let truth = &truth[i];
+        let true_dist = |id: usize| {
+            let v = base.row(id);
+            match metric {
+                Metric::L2 => kernels::scalar::l2_sq(&q, &v),
+                Metric::InnerProduct => -kernels::scalar::dot(&q, &v),
+                Metric::Cosine => kernels::scalar::cosine_distance(&q, &v),
+            }
+        };
         let kth = true_dist(truth[k - 1] as usize);
         for h in &result {
             id_hits += usize::from(truth.contains(&h.id));

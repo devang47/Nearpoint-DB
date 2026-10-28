@@ -9,7 +9,10 @@
 //! has them, so the ~94% of nodes living only on layer 0 cost nothing extra.
 //!
 //! Concurrency. `add` inserts a batch in parallel. A writer locks the one
-//! node whose list it is changing (never two at once, so no deadlock).
+//! node whose list it is changing (never two at once, so no deadlock). The
+//! locks are striped (`LOCK_STRIPES` mutexes, node `i` uses `i % stripes`):
+//! a `Mutex` per node would cost 16 B plus a 64 B pthread mutex boxed on
+//! first use, ~80 B per vector.
 //! Readers don't lock: every slot is atomic, so a read racing a write sees a
 //! slightly stale list, which costs a little graph quality during build but
 //! is never unsafe. `search` takes `&self` and `add` takes `&mut self`, so
@@ -58,6 +61,10 @@ impl Default for Config {
 const MAX_LEVEL: u8 = 16;
 const NO_ENTRY: u64 = u64::MAX;
 const MAGIC: &[u8; 4] = b"NPHW";
+/// Node locks, shared by `id % LOCK_STRIPES`. With ~10 writers two rarely
+/// want the same stripe at once, and it's a fixed 64 KiB (plus 64 B per
+/// stripe ever locked) whatever the index size.
+const LOCK_STRIPES: usize = 4096;
 
 pub struct Hnsw {
     dim: usize,
@@ -69,7 +76,7 @@ pub struct Hnsw {
     layer0: Vec<AtomicU32>,
     /// Per node: `level * (1 + m)` slots for layers `1..=level`.
     upper: Vec<Box<[AtomicU32]>>,
-    locks: Vec<Mutex<()>>,
+    locks: Box<[Mutex<()>]>,
     /// `level << 32 | id` of the entry point (a node on the top layer).
     /// Read lock-free; only changed by a holder of `grow`.
     entry: AtomicU64,
@@ -87,7 +94,7 @@ impl Hnsw {
             levels: Vec::new(),
             layer0: Vec::new(),
             upper: Vec::new(),
-            locks: Vec::new(),
+            locks: stripes(),
             entry: AtomicU64::new(NO_ENTRY),
             grow: Mutex::new(()),
         }
@@ -95,6 +102,18 @@ impl Hnsw {
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// Makes room for `additional` more vectors, exactly. `add` grows its
+    /// arrays like any `Vec` (doubling, then copying), so a build fed in
+    /// batches peaks at old + new copies of every array and keeps up to 2x
+    /// slack; a caller that knows the total reserves it once instead.
+    pub fn reserve(&mut self, additional: usize) {
+        let m = self.cfg.m;
+        self.vectors.reserve_exact(additional * self.dim);
+        self.levels.reserve_exact(additional);
+        self.layer0.reserve_exact(additional * (1 + 2 * m));
+        self.upper.reserve_exact(additional);
     }
 
     /// The stored vectors, row-major, in stored form (unit length for
@@ -183,7 +202,7 @@ impl Hnsw {
             levels,
             layer0,
             upper,
-            locks: (0..n).map(|_| Mutex::new(())).collect(),
+            locks: stripes(),
             entry: AtomicU64::new(entry),
             grow: Mutex::new(()),
         };
@@ -357,7 +376,7 @@ impl Hnsw {
     }
 
     fn lock(&self, node: u32) -> MutexGuard<'_, ()> {
-        lock(&self.locks[node as usize])
+        lock(&self.locks[node as usize % LOCK_STRIPES])
     }
 
     /// Adds `new` to `node`'s list on `layer`, re-selecting the list with
@@ -500,6 +519,10 @@ pub fn distances() -> u64 {
     VISITED.with_borrow(|v| v.distances)
 }
 
+fn stripes() -> Box<[Mutex<()>]> {
+    (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect()
+}
+
 /// The mutexes guard no data, so a poisoned one is still fine to use.
 fn lock(m: &Mutex<()>) -> MutexGuard<'_, ()> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -552,7 +575,6 @@ impl Index for Hnsw {
         }
         self.layer0
             .extend((0..n_new * (1 + 2 * m)).map(|_| AtomicU32::new(0)));
-        self.locks.extend((0..n_new).map(|_| Mutex::new(())));
 
         let this = &*self;
         ids.clone().into_par_iter().for_each(|id| this.insert(id));
@@ -624,6 +646,22 @@ mod tests {
         assert_eq!(h.len(), 3_000);
         let r = recall(&h, &f, 12, 64);
         assert!(r >= 0.95, "recall {r}");
+    }
+
+    #[test]
+    fn reserve_then_batches_never_regrow() {
+        let (n, dim) = (1_000, 8);
+        let data = test_data::vectors(n, dim, 3);
+        let mut h = Hnsw::new(dim, Metric::L2, Config::default());
+        h.reserve(n);
+        let ptrs = |h: &Hnsw| (h.vectors.as_ptr(), h.layer0.as_ptr(), h.upper.as_ptr());
+        let before = ptrs(&h);
+        for batch in data.chunks(dim * 300) {
+            h.add(batch).unwrap();
+        }
+        assert_eq!(ptrs(&h), before);
+        assert_eq!(h.vectors.capacity(), n * dim);
+        assert_eq!(h.layer0.capacity(), h.layer0.len());
     }
 
     #[test]
