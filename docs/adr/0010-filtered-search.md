@@ -1,6 +1,6 @@
 # 0010: Filtered search in HNSW and Flat
 
-Date: 2026-10-28. Status: draft.
+Date: 2026-10-28. Status: accepted.
 
 ## Context
 Tasks 7.3 and 7.4 apply a filter bitmap (ADR 0005) during search. The
@@ -52,13 +52,14 @@ The √len form also gives sensible small segments: below ~√(8·ef·len)
 ids, scanning is cheaper than any walk, and a segment of a few hundred
 vectors always scans.
 
-Distance counts favour the walk: a brute-force distance is a sequential
-read with no heap or bitmap work, while a walk does random reads, heap
-pushes and a bitmap lookup per candidate. Wall-clock timings (on a busy
-CPU, so only indicative) put a walk distance at several times the cost
-of a scan distance, which would move the time crossover up to a few
-percent more. Re-check with `filtered --plan graph,brute` on a quiet
-machine and raise `WALK_COST` if scanning still wins at the threshold.
+Wall-clock check after the merge (quiet machine, `filtered --plan
+auto,graph,brute`, p50 at ef 64): at 2% brute force 0.39 ms vs walk
+2.71 ms; at 5% brute force 3.50 ms vs walk 1.32 ms. The time crossover
+is between 2% and 5%, so the distance-count threshold stands
+(`WALK_COST` = 8). Caveat: the bench uses one filter for every query, so
+a small filter's vectors stay in cache (2%: 20 ns per scanned distance;
+5%: 70 ns). With a different filter per query, brute force would be
+slower and the crossover lower.
 
 ## Recall (SIFT1M, same setup, tie-aware recall@10 as in ADR 0002)
 Walk recall is 0.998–0.999 from 0.1% to 10% and 0.981 (ef 64) /

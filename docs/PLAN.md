@@ -78,9 +78,12 @@ p50 0.106 ms; build 44.4 s on 10 threads.
 - [x] 3.2 Segment file format v1: header, vectors, ids, index blob,
       footer with checksums. Document in docs/formats/segment.md.
       Plus `Hnsw`/`Flat` `to_bytes`/`from_bytes` for the index blob (ADR 0006).
-- [ ] 3.3 Recovery: on startup, load sealed segments, replay WAL,
-      truncate torn tail records.
-- [ ] 3.4 Crash tests, two layers: (a) hand-rolled fail points behind a
+- [x] 3.3 Recovery: on startup, load sealed segments, replay WAL,
+      truncate torn tail records. As built: `engine::Collection`
+      (WAL + mutable HNSW + sealed segments + tombstones); a versioned
+      MANIFEST is the seal's commit point; payloads in a per-segment
+      sidecar (ADR 0008, docs/formats/manifest.md, payloads.md).
+- [x] 3.4 Crash tests, two layers: (a) hand-rolled fail points behind a
       `failpoints` cargo feature that abort or tear writes mid-record;
       (b) a harness that SIGKILLs a child server mid-load, restarts it,
       and checks every acknowledged write. (SIGKILL keeps the OS page
@@ -88,6 +91,9 @@ p50 0.106 ms; build 44.4 s on 10 threads.
       rests on 3.1's `F_FULLFSYNC`.)
 **Acceptance:** 1,000 randomized crash/restart cycles with zero lost
 acknowledged writes.
+**Status (2026-10-28): met.** 1,000 SIGKILL cycles in release, 0 lost
+acknowledged writes, 0 failures (138 s); plus fail points after every
+seal step and on torn WAL appends.
 
 ## Phase 4: Server and CRUD
 Runs on one mutable segment + WAL per collection; Phase 6 generalizes to
@@ -114,12 +120,18 @@ no errors; deleted ids never appear in results.
       Quality on SIFT1M (ADR 0004, RESULTS.md): PQ ADC alone tops out at
       0.53 (m=16) / 0.73 (m=32) recall@10, so 5.4 must re-rank. PQ m=16 +
       top-1000 + SQ int8 re-rank reaches 0.98.
-- [ ] 5.4 IVF-PQ index: coarse quantizer, inverted lists, ADC with
+- [x] 5.4 IVF-PQ index: coarse quantizer, inverted lists, ADC with
       lookup tables, nprobe parameter.
-- [ ] 5.5 4-bit fast-scan PQ kernel with NEON table lookups (`vqtbl1q_u8`).
-- [ ] 5.6 Re-ranking top candidates with full or int8 vectors.
+- [x] 5.5 4-bit fast-scan PQ kernel with NEON table lookups (`vqtbl1q_u8`).
+- [x] 5.6 Re-ranking top candidates with full or int8 vectors (int8,
+      ADR 0009).
 **Acceptance:** SIFT10M via IVF-PQ+rerank at recall@10 ≥ 0.9 using
 <25% of HNSW's RAM (phys_footprint).
+**Status (2026-10-28): met, the RAM half narrowly.** BIGANN 10M, nlist
+4096: 8-bit m=16 nprobe 32 rerank 100 → 0.9175 at p50 0.59 ms; 4-bit
+m=32 nprobe 32 rerank 200 → 0.9155 at p50 0.21 ms. IVF-PQ build + index
+1,559 MiB vs HNSW's 9,438 MiB measured peak (16.5%) or ~6.6 GB
+steady-state size (~24%); see RESULTS.md for why both are given.
 
 ## Phase 6: Segments and compaction
 - [ ] 6.1 Mutable segment (HNSW in RAM) sealing at configurable size.
@@ -134,9 +146,12 @@ and p99 latency stay within 10% of the start.
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).
 - [x] 7.2 Filter expressions (eq, in, range, and/or/not) → roaring bitmaps.
       JSON shape and semantics in docs/filters.md (ADR 0005).
-- [ ] 7.3 Filter applied during graph traversal and IVF scanning.
-- [ ] 7.4 Planner: brute-force over the bitmap when selectivity is very low.
+- [x] 7.3 Filter applied during graph traversal and IVF scanning.
+- [x] 7.4 Planner: brute-force over the bitmap when selectivity is very low
+      (`filtered² ≤ 8·ef·len`, ADR 0010).
 **Acceptance:** recall@10 ≥ 0.9 at filter selectivity 1%, 10%, and 50%.
+**Status (2026-10-28): met for HNSW on SIFT1M** (uniform random filters):
+1.0000 / 0.9973 / 0.9810 at ef 64. Correlated filters not yet measured.
 
 ## Phase 8: Scale to 100M
 - [ ] 8.1 Memory budget per component; enforce limits and expose metrics

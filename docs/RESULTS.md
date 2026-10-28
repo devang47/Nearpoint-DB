@@ -9,6 +9,16 @@ id-match figure is always recorded beside it. Warm cache unless noted.
 
 | Date | Task | Dataset | Index + params | Seed | recall@10 | p50 | p99 | QPS | Peak RSS | Peak phys_footprint | Disk | Build time | Commit |
 |------|------|---------|----------------|------|-----------|-----|-----|-----|----------|---------------------|------|------------|--------|
+| 2026-10-28 | 5.4–5.6 | BIGANN 10M (10k queries) | ivfpq nlist=4096 m=16 8-bit **nprobe=32 rerank=100** | 42 | **0.9175** (0.9175) | **0.593 ms** | 1.520 ms | 1486 | 2822 MiB | 2791 MiB | – | 159.9 s | dcabd5e |
+| 2026-10-28 | 5.4–5.6 | BIGANN 10M | ivfpq nlist=4096 m=16 8-bit nprobe=64 rerank=200 | 42 | 0.9631 (0.9631) | 1.110 ms | 2.607 ms | 807 | 2822 MiB | 2791 MiB | – | 159.9 s | dcabd5e |
+| 2026-10-28 | 5.5 | BIGANN 10M | ivfpq nlist=4096 m=32 **4-bit** nprobe=32 rerank=200 | 42 | **0.9155** (0.9154) | **0.214 ms** | 0.410 ms | 4286 | 2832 MiB | 2813 MiB | – | 131.0 s | dcabd5e |
+| 2026-10-28 | 5.5 | BIGANN 10M | ivfpq nlist=4096 m=32 4-bit nprobe=64 rerank=200 | 42 | 0.9414 (0.9414) | 0.332 ms | 0.643 ms | 2773 | 2832 MiB | 2813 MiB | – | 131.0 s | dcabd5e |
+| 2026-10-28 | 5 (baseline) | BIGANN 10M | hnsw M=16 efc=200 ef=64 (**swapped**, latency invalid) | 42 | 0.9163 (0.9162) | *1.038 ms* | *43.0 ms* | *261* | 7485 MiB | **10670 MiB** | – | 879.1 s | dcabd5e |
+| 2026-10-28 | 5 (baseline) | BIGANN 10M | hnsw M=16 efc=200 ef=128 (swapped) | 42 | 0.9664 (0.9663) | *0.358 ms* | *7.65 ms* | *1164* | 7485 MiB | 10670 MiB | – | 879.1 s | dcabd5e |
+| 2026-10-28 | 5.4–5.6 | SIFT1M | ivfpq nlist=1024 m=16 8-bit nprobe=16 rerank=100 | 42 | 0.9167 (0.9159) | 0.170 ms | 0.234 ms | 5720 | 969 MiB | 968 MiB | – | 25.8 s | dcabd5e |
+| 2026-10-28 | 5.5 | SIFT1M | ivfpq nlist=1024 m=32 4-bit nprobe=32 rerank=200 | 42 | 0.9540 (0.9532) | 0.127 ms | 0.164 ms | 7738 | 970 MiB | 970 MiB | – | 17.1 s | dcabd5e |
+| 2026-10-28 | 7.3 regression | SIFT1M | hnsw M=16 efc=200 ef=64, unfiltered | 42 | 0.9608 (0.9602) | 0.108 ms | 0.195 ms | 8934 | 1922 MiB | 1922 MiB | – | 42.8 s | dcabd5e |
+| 2026-10-28 | 7.3 regression | SIFT1M | same, pre-round build (35e7c82), run back to back | 42 | 0.9634 (0.9627) | 0.109 ms | 0.165 ms | 8932 | 1257 MiB | 1256 MiB | – | 44.1 s | 35e7c82 |
 | 2026-10-28 | 2.3 (rebuild) | SIFT1M | hnsw M=16 efc=200 ef=64 | 42 | 0.9602 (0.9595) | 0.108 ms | 0.145 ms | 9310 | 1257 MiB | 1256 MiB | – | 43.5 s | e96bb03 |
 | 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 **ef=64** | 42 | **0.9632** (0.9625) | **0.106 ms** | 0.138 ms | 9512 | 1257 MiB | 1256 MiB | – | **44.4 s** | 5839104 |
 | 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 ef=128 | 42 | 0.9894 (0.9888) | 0.192 ms | 0.244 ms | 5367 | 1257 MiB | 1256 MiB | – | 44.4 s | 5839104 |
@@ -38,6 +48,32 @@ id-match figure is always recorded beside it. Warm cache unless noted.
   the ground truth's 10 distances; the two just break equal-distance ties
   differently. Also validates the HF mirror (`qbo-odp/sift1m`): its base,
   query and ground truth agree for all 10k queries. Mac mini M4, 16 GB.
+
+- **2026-10-28 Phase 5 (IVF-PQ):** target "SIFT10M recall@10 ≥ 0.9 at
+  < 25% of HNSW's phys_footprint" **met, the RAM half narrowly**. SIFT10M
+  is the first 10M of BIGANN (u8) with big-ann-benchmarks' 10M ground
+  truth. Recall ≥ 0.9 at 0.59 ms (8-bit) or 0.21 ms (4-bit fast-scan).
+  RAM, like for like (peak minus the harness's 1,231 MiB u8 base):
+  IVF-PQ 1,559 MiB vs HNSW 9,438 MiB = **16.5%**. But HNSW's peak is
+  inflated by `Vec` regrowth while the bench adds 100k-vector batches
+  (SIFT1M HNSW: 1,256 → 1,922 MiB peak after batching was introduced);
+  its steady-state size is ~6.6 GB (vectors 5.12 GB + layer-0 links
+  1.32 GB + upper layers and locks), estimated, not measured, giving
+  **~24%**. Whole-process peaks (both include the harness data): 26%.
+  Full sweeps: `docs/results/{sift1m,bigann10m}-ivfpq.csv`.
+- **HNSW at 10M does not fit the budget:** whole-process phys_footprint
+  peaked at 10,670 MiB (> 10 GB) and the machine swapped (6.7 GB swap
+  in use), so its latencies above are invalid; recall stands (0.916 at
+  ef 64, lower than SIFT1M's 0.96). Build 879 s. For ≥ 10M-vector
+  segments IVF-PQ is the index; a `reserve` before batched `add` would
+  remove the regrowth spike (Phase 8).
+- **Unfiltered HNSW after 7.3:** no regression. Back to back with the
+  pre-round build: p50 0.108 vs 0.109 ms, 8,934 vs 8,932 QPS. (An
+  earlier post-merge run showed 0.116 ms under background load.) Peak
+  memory differs only because the bench now adds in batches.
+- The Mac slept during some runs (`pmset` log); `Instant` stops during
+  sleep, so per-query timings are unaffected, but wall times in logs
+  are not comparable.
 
 ## Kernel microbenchmarks
 
@@ -97,6 +133,55 @@ M4, internal SSD (APFS), quiet machine, commit e96bb03.
   linearly with concurrent writers because they share each flush. The
   API should batch (bulk upsert) and accept concurrent requests rather
   than sync per vector.
+
+## Filtered search (tasks 7.3–7.4)
+
+`./target/release/filtered --dataset sift1m --ef 64,128 --plan
+auto,graph,brute`. SIFT1M, HNSW M=16 efc=200 seed 42, first 1,000
+queries, uniform random filters (seeded), exact filtered ground truth by
+brute force over the bitmap. Quiet machine, commit dcabd5e. Full table:
+`docs/results/sift1m-filtered.csv`.
+
+### 2026-10-28
+
+| Selectivity | ids | Plan (auto) | recall@10 ef 64 | p50 ef 64 | walk p50 ef 64 | brute p50 | walk recall ef 128 |
+|-------------|-----|-------------|-----------------|-----------|----------------|-----------|--------------------|
+| 0.1% | 998 | brute | 1.0000 | 0.018 ms | 27.5 ms | 0.018 ms | 0.9990 |
+| 0.5% | 4,933 | brute | 1.0000 | 0.098 ms | 8.13 ms | 0.098 ms | 0.9989 |
+| **1%** | 9,975 | brute | **1.0000** | 0.196 ms | 4.77 ms | 0.196 ms | 0.9986 |
+| 2% | 20,012 | brute | 1.0000 | 0.392 ms | 2.71 ms | 0.392 ms | 0.9985 |
+| 5% | 49,821 | walk | 0.9977 | 1.32 ms | 1.32 ms | 3.50 ms | 0.9987 |
+| **10%** | 99,722 | walk | **0.9973** | 0.739 ms | 0.739 ms | 7.09 ms | 0.9986 |
+| **50%** | 500,179 | walk | **0.9810** | 0.209 ms | 0.209 ms | 14.5 ms | 0.9952 |
+
+- **Phase 7 target "recall@10 ≥ 0.9 at 1%, 10%, 50%": met** (HNSW,
+  uniform filters). Correlated filters (matches far from the query) are
+  not measured yet and are the known risk for the walk.
+- The planner (`filtered² ≤ 8·ef·len`, from distance counts) picks the
+  faster plan at every measured point; the time crossover is between 2%
+  and 5% (ADR 0010). Without it, a 0.1% filter walks 205k nodes (27 ms).
+- One filter serves every query, so small filters stay cache-resident
+  and flatter brute force (20 ns per distance at 2%, 70 ns at 5%).
+- First run of the 0.5 / ef 64 walk had p99 3.85 ms vs 0.27 ms on the
+  repeat: a one-off stall, not reproducible.
+
+## Crash recovery (tasks 3.3–3.4)
+
+`cargo test --release -p engine --test crash -- --ignored --nocapture`,
+commit dcabd5e. A child process runs random upserts/deletes/seals over 64
+ids under `SyncPolicy::Batch`, printing each op once acknowledged; the
+parent SIGKILLs it at a random point, reopens, and checks every acked
+write. Fresh collection every 25 cycles.
+
+### 2026-10-28
+
+| Cycles | Failures | Lost acked writes | Time | Seed |
+|--------|----------|-------------------|------|------|
+| 1,000 | 0 | 0 | 138 s | 1793188713750980000 |
+
+- **Phase 3 target "1,000 randomized crash/restart cycles, zero lost
+  acknowledged writes": met.** SIGKILL keeps the page cache, so this
+  tests the process; power-loss safety rests on F_FULLFSYNC (3.1).
 
 ## Quantization quality (tasks 5.1–5.3)
 

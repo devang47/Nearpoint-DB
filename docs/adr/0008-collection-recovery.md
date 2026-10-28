@@ -1,6 +1,6 @@
 # 0008: Collection directory, LSN coverage and the seal protocol
 
-Date: 2026-10-28. Status: proposed.
+Date: 2026-10-28. Status: accepted.
 
 ## Context
 Task 3.3 recovers a collection from sealed segments plus the WAL; 3.4

@@ -1,12 +1,14 @@
 # 0009: IVF-PQ index, 4-bit fast-scan and re-ranking
 
-Date: 2026-10-28. Status: draft (tasks 5.4–5.6).
+Date: 2026-10-28. Status: accepted (tasks 5.4–5.6).
 
 ## Context
 Phase 5 acceptance: SIFT10M at recall@10 ≥ 0.9 with < 25% of HNSW's
 phys_footprint. HNSW at 10M is about 6.5 GB (f32 vectors 5.12 GB,
 layer-0 links 10M × 33 × 4 B = 1.32 GB, plus upper layers and locks), so
-the budget is about 1.6 GB. Phases 8 (100M) and 9 (1B, compressed only)
+the budget is about 1.6 GB. (Measured after the merge: the HNSW 10M build
+peaks at 9.4 GB beyond the harness's data, from `Vec` regrowth while adding
+in batches, and swapped; RESULTS.md.) Phases 8 (100M) and 9 (1B, compressed only)
 reuse this index, and 7.3 needs filters applied while scanning lists.
 ADR 0004 measured on SIFT1M that PQ ADC alone tops out at 0.53 (m=16) /
 0.73 (m=32) recall@10, so re-ranking is required.

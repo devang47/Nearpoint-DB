@@ -15,6 +15,67 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Parallel round 2: recovery, IVF-PQ, filtered search
+- **What:** scaffold commit (`SearchParams` gains `filter`, `nprobe`,
+  `rerank`; `ivfpq`/`collection` stubs; `index` → `quant`/`roaring`,
+  `engine` → `index`/`storage`), then three tasks built in parallel
+  worktrees and merged: 3.3–3.4, 5.4–5.6, 7.3–7.4 (entries below).
+  SIFT10M (BIGANN 10M prefix, 1.29 GB) fetched from the big-ann-benchmarks
+  mirror. After the merge, on a quiet machine: SIFT1M/10M IVF-PQ sweeps,
+  the HNSW 10M baseline, filtered sweeps, an unfiltered HNSW A/B against
+  the pre-round build, and the 1,000-cycle crash run. PLAN ticks, RESULTS
+  rows and CSVs in `docs/results/`; ADRs 0008–0010 accepted.
+- **Why:** the tasks touch disjoint modules, so they ran side by side;
+  the shared API change was committed first so the branches merged
+  without conflicts. Timings were taken only after the merge.
+
+## 2026-10-28 — Filtered search and brute-force planner (tasks 7.3 HNSW/Flat, 7.4)
+- **What:** `SearchParams::filter` is honoured by Flat (scans only the
+  bitmap's ids) and HNSW (the layer-0 walk expands non-matching nodes but
+  keeps only matches; `Hnsw::search` brute-forces the bitmap when
+  `filtered² <= 8·max(ef,k)·len`). `Hnsw::plan`/`search_with` and a
+  per-thread `hnsw::distances()` counter expose the choice; new
+  `bench --bin filtered` reports filtered recall, distances and plan per
+  selectivity. Proptests: results never leave the filter; filtered Flat
+  equals brute force over the bitmap.
+- **Why:** Phase 7 acceptance (recall@10 ≥ 0.9 at 1/10/50%): measured
+  1.0000 / 0.9973 / 0.9810 at ef 64 on SIFT1M. The threshold is the
+  distance-count crossover, confirmed by wall-clock (crossover between 2%
+  and 5%); unfiltered latency unchanged. `docs/adr/0010-filtered-search.md`.
+
+## 2026-10-28 — IVF-PQ index, 4-bit fast-scan, SQ re-rank (tasks 5.4–5.6)
+- **What:** `index::IvfPq`: seeded k-means coarse quantizer, PQ on
+  residuals, inverted lists, per-list ADC tables, `nprobe`, filter checked
+  while scanning (IVF half of 7.3); L2 only. `nbits = 4` stores fast-scan
+  blocks (32 vectors, nibble-interleaved) scanned by `kernels::pq4_scan`
+  (scalar + NEON `vqtbl1q_u8`, bit-exact proptest) with u8-quantized
+  tables. `rerank` re-scores the best candidates against int8 SQ codes and
+  returns those distances. `quant::PqConfig.nbits`, transposed codebooks.
+  Bench: `--index ivfpq` with `--nlist`, `--pq-m`, `--nbits`, `--nprobe`
+  / `--rerank` sweeps and a `bigann10m` dataset; `fetch-dataset.sh
+  bigann10m` range-fetches the 10M prefix.
+- **Why:** Phase 5 acceptance: SIFT10M recall@10 0.9175 at p50 0.59 ms
+  (8-bit) / 0.9155 at 0.21 ms (4-bit), using 16.5% of HNSW's measured
+  peak (~24% of its steady-state size). PQ alone tops out near 0.57, so
+  re-rank is required; int8 re-rank vectors (1.28 GB at 10M) fit where
+  f32 (5.1 GB) can't. `docs/adr/0009-ivf-pq.md`.
+
+## 2026-10-28 — Collection recovery and crash tests (tasks 3.3–3.4)
+- **What:** `engine::collection::Collection` (WAL + mutable HNSW + sealed
+  segments + id map + tombstones) with open/upsert/delete/get/search/seal.
+  A versioned MANIFEST is the seal's commit point (covered LSN, live
+  segments, per-segment tombstones); payloads go in a `<lsn>.payloads`
+  sidecar; open replays only WAL records above the covered LSN and removes
+  a crashed seal's leftovers. New `storage::framed` (magic/version/len/
+  body/CRC32, atomic write) and `PayloadStore::check`. A WAL failure
+  mid-write is reported as `Error::Unknown`. Crash tests: fail points
+  after each seal step and on torn WAL appends, plus a SIGKILL harness
+  (`crash-child` bin + `tests/crash.rs`).
+- **Why:** Phase 3 acceptance: 1,000 SIGKILL cycles in release, 0 lost
+  acknowledged writes (138 s). Writes survive crashes at any point,
+  including mid-seal, without being lost or applied twice.
+  `docs/adr/0008-collection-recovery.md`; formats manifest.md, payloads.md.
+
 ## 2026-10-28 — Parallel round: WAL, segments, quantization, filters
 - **What:** four independent tasks built in parallel worktrees and merged:
   3.1 WAL, 3.2 segment format + index serialization, 5.1–5.3 quantization,
