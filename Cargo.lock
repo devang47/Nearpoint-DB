@@ -462,6 +462,7 @@ version = "0.1.0"
 dependencies = [
  "index",
  "proptest",
+ "rayon",
  "roaring",
  "serde",
  "serde_json",
