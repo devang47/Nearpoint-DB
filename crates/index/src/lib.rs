@@ -29,6 +29,10 @@ pub enum Error {
     Corrupt(&'static str),
     #[error("index blob version {0} is not supported (this build reads up to {v})", v = blob::VERSION)]
     UnsupportedBlobVersion(u32),
+    #[error("invalid index config: {0}")]
+    InvalidConfig(&'static str),
+    #[error(transparent)]
+    Quant(#[from] quant::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

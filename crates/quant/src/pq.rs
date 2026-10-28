@@ -1,12 +1,13 @@
-//! Product quantization (Jégou et al., 2011), 8-bit codes.
+//! Product quantization (Jégou et al., 2011), 8-bit or 4-bit codes.
 //!
 //! The vector is split into `m` contiguous sub-vectors of `dim / m` floats;
-//! each is replaced by the id of its nearest of 256 centroids, trained by
-//! k-means per subspace. A code is `m` bytes, and `encode_all` stores codes
-//! back to back (`n * m` bytes), which a later 4-bit fast-scan can repack.
+//! each is replaced by the id of its nearest of `ksub = 2^nbits` centroids,
+//! trained by k-means per subspace. A code is `m` bytes (one per subspace,
+//! even for 4-bit codes), and `encode_all` stores codes back to back
+//! (`n * m` bytes); the 4-bit fast-scan layout is a repack of these.
 //!
 //! ADC (asymmetric distance): for a query, `distance_table` holds the
-//! squared L2 from each query sub-vector to each centroid (`m * 256`
+//! squared L2 from each query sub-vector to each centroid (`m * ksub`
 //! floats, subspace-major); the distance to a code is then `m` lookups.
 
 use rand::SeedableRng;
@@ -16,25 +17,25 @@ use rayon::prelude::*;
 use crate::kmeans::sample_rows;
 use crate::{Centroids, Error, KMeans, Result, rows};
 
-/// Centroids per subspace (8-bit codes).
-pub const KSUB: usize = 256;
-
 #[derive(Debug, Clone, Copy)]
 pub struct PqConfig {
     pub dim: usize,
     /// Number of subspaces = bytes per code. Must divide `dim`.
     pub m: usize,
+    /// Bits per sub-code, 1..=8: `2^nbits` centroids per subspace.
+    pub nbits: u32,
     pub max_iter: usize,
     pub max_train: usize,
     pub seed: u64,
 }
 
 impl PqConfig {
-    /// 25 k-means iterations on up to 100k points, seed 42.
+    /// 8-bit codes, 25 k-means iterations on up to 100k points, seed 42.
     pub fn new(dim: usize, m: usize) -> Self {
         PqConfig {
             dim,
             m,
+            nbits: 8,
             max_iter: 25,
             max_train: 100_000,
             seed: 42,
@@ -49,6 +50,9 @@ impl PqConfig {
                 m: self.m,
             });
         }
+        if !(1..=8).contains(&self.nbits) {
+            return Err(Error::Invalid("nbits must be in 1..=8"));
+        }
         let dsub = self.dim / self.m;
         // One sample shared by all subspaces.
         let mut rng = StdRng::seed_from_u64(self.seed);
@@ -61,7 +65,7 @@ impl PqConfig {
                     .copied()
                     .collect();
                 KMeans {
-                    k: KSUB,
+                    k: 1 << self.nbits,
                     dim: dsub,
                     max_iter: self.max_iter,
                     max_train: usize::MAX,
@@ -70,18 +74,20 @@ impl PqConfig {
                 .train(&sub)
             })
             .collect::<Result<_>>()?;
-        Ok(Pq {
-            dim: self.dim,
-            books,
-        })
+        Pq::from_codebooks(books)
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pq {
     dim: usize,
-    /// One codebook of `KSUB` centroids per subspace.
+    /// One codebook of `ksub` centroids per subspace.
     books: Vec<Centroids>,
+    /// The codebooks transposed, `[subspace][component][centroid]`, so
+    /// `distance_table` is element-wise loops the compiler vectorizes
+    /// (with `dim / m` as small as 2–8, a per-centroid `l2_sq` call is
+    /// mostly overhead).
+    books_t: Vec<f32>,
 }
 
 impl Pq {
@@ -90,13 +96,25 @@ impl Pq {
         let Some(first) = books.first() else {
             return Err(Error::Invalid("need at least one codebook"));
         };
-        let dsub = first.dim();
-        if books.iter().any(|b| b.dim() != dsub || b.k() != KSUB) {
-            return Err(Error::Invalid("codebooks must all be 256 x dim/m"));
+        let (dsub, ksub) = (first.dim(), first.k());
+        if !ksub.is_power_of_two() || ksub > 256 {
+            return Err(Error::Invalid(
+                "codebooks need 2^nbits centroids, nbits <= 8",
+            ));
+        }
+        if books.iter().any(|b| b.dim() != dsub || b.k() != ksub) {
+            return Err(Error::Invalid("codebooks must all be ksub x dim/m"));
+        }
+        let mut books_t = Vec::with_capacity(books.len() * dsub * ksub);
+        for b in &books {
+            for t in 0..dsub {
+                books_t.extend((0..ksub).map(|c| b.get(c)[t]));
+            }
         }
         Ok(Pq {
             dim: dsub * books.len(),
             books,
+            books_t,
         })
     }
 
@@ -107,6 +125,11 @@ impl Pq {
     /// Bytes per code.
     pub fn m(&self) -> usize {
         self.books.len()
+    }
+
+    /// Centroids per subspace, `2^nbits`.
+    pub fn ksub(&self) -> usize {
+        self.books[0].k()
     }
 
     pub fn codebooks(&self) -> &[Centroids] {
@@ -153,17 +176,23 @@ impl Pq {
             .collect()
     }
 
-    /// `m * 256` squared L2 distances from each query sub-vector to each
-    /// centroid of its subspace; entry `j * 256 + c` is subspace j, code c.
+    /// `m * ksub` squared L2 distances from each query sub-vector to each
+    /// centroid of its subspace; entry `j * ksub + c` is subspace j, code c.
     pub fn distance_table(&self, query: &[f32]) -> Vec<f32> {
         assert_eq!(query.len(), self.dim);
-        let mut t = Vec::with_capacity(self.m() * KSUB);
-        for (b, q) in self.books.iter().zip(query.chunks_exact(self.dsub())) {
-            t.extend(
-                b.as_slice()
-                    .chunks_exact(b.dim())
-                    .map(|c| kernels::l2_sq(q, c)),
-            );
+        let (dsub, ksub) = (self.dsub(), self.ksub());
+        let mut t = vec![0f32; self.m() * ksub];
+        for ((tj, bt), q) in t
+            .chunks_exact_mut(ksub)
+            .zip(self.books_t.chunks_exact(dsub * ksub))
+            .zip(query.chunks_exact(dsub))
+        {
+            for (col, &x) in bt.chunks_exact(ksub).zip(q) {
+                for (o, &c) in tj.iter_mut().zip(col) {
+                    let d = x - c;
+                    *o += d * d;
+                }
+            }
         }
         t
     }
@@ -171,11 +200,10 @@ impl Pq {
 
 /// ADC: squared L2 from the table's query to `decode(code)`.
 pub fn adc_distance(table: &[f32], code: &[u8]) -> f32 {
-    debug_assert_eq!(table.len(), code.len() * KSUB);
+    let ksub = table.len() / code.len();
+    debug_assert_eq!(table.len(), code.len() * ksub);
     table
-        .as_chunks::<KSUB>()
-        .0
-        .iter()
+        .chunks_exact(ksub)
         .zip(code)
         .map(|(t, &c)| t[c as usize])
         .sum()
@@ -241,6 +269,25 @@ mod tests {
             PqConfig::new(10, 4).train(&x),
             Err(Error::NotDivisible { dim: 10, m: 4 })
         );
+    }
+
+    #[test]
+    fn four_bit_codes_use_16_centroids() {
+        let (x, _) = &*FIXTURE;
+        let pq = PqConfig {
+            nbits: 4,
+            max_iter: 10,
+            ..PqConfig::new(16, 8)
+        }
+        .train(x)
+        .unwrap();
+        assert_eq!(pq.ksub(), 16);
+        let code = pq.encode(&x[..16]);
+        assert!(code.iter().all(|&c| c < 16));
+        let q = &x[16..32];
+        let adc = adc_distance(&pq.distance_table(q), &code);
+        let exact = kernels::l2_sq(q, &pq.decode(&code));
+        assert!((adc - exact).abs() <= 1e-4 * exact.max(1.0));
     }
 
     #[test]

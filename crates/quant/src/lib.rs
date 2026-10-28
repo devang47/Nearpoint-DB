@@ -8,6 +8,11 @@ pub mod kmeans;
 pub mod pq;
 pub mod sq;
 
+use std::borrow::Cow;
+
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
 pub use kmeans::{Centroids, KMeans};
 pub use pq::{Pq, PqConfig, adc_distance};
 pub use sq::Sq;
@@ -25,6 +30,12 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `data` itself if it has at most `max` rows, else `max` rows drawn
+/// uniformly without replacement (seeded), in their original order.
+pub fn sample(data: &[f32], dim: usize, max: usize, seed: u64) -> Cow<'_, [f32]> {
+    kmeans::sample_rows(data, dim, max, &mut StdRng::seed_from_u64(seed))
+}
 
 /// Number of rows in `data`, or an error if it isn't whole rows.
 pub(crate) fn rows(data: &[f32], dim: usize) -> Result<usize> {
