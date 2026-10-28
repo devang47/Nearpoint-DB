@@ -29,7 +29,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use rayon::prelude::*;
 
 use crate::visited::VISITED;
-use crate::{Hit, Index, Metric, Result, SearchParams, batch_ids, check_dim};
+use crate::{Error, Hit, Index, Metric, Result, SearchParams, batch_ids, blob, check_dim};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -56,6 +56,7 @@ impl Default for Config {
 /// would need ~16^16 vectors.
 const MAX_LEVEL: u8 = 16;
 const NO_ENTRY: u64 = u64::MAX;
+const MAGIC: &[u8; 4] = b"NPHW";
 
 pub struct Hnsw {
     dim: usize,
@@ -93,6 +94,136 @@ impl Hnsw {
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// The stored vectors, row-major, in stored form (unit length for
+    /// cosine). This is what a segment's vector section holds.
+    pub fn vectors(&self) -> &[f32] {
+        &self.vectors
+    }
+
+    /// The index blob: config, levels, every neighbour list and the entry
+    /// point, but not the vectors (they live in the segment's vector
+    /// section). Lists are written at full capacity, `[count, ids...]`
+    /// exactly as in memory. Layout in docs/formats/segment.md.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let slots = self.layer0.len() + self.upper.iter().map(|u| u.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(48 + self.levels.len() + 4 * slots);
+        blob::put_header(&mut out, MAGIC, self.dim, self.metric);
+        blob::put_u32(&mut out, self.cfg.m as u32);
+        blob::put_u32(&mut out, self.cfg.ef_construction as u32);
+        blob::put_u64(&mut out, self.cfg.seed);
+        blob::put_u64(&mut out, self.levels.len() as u64);
+        blob::put_u64(&mut out, self.entry.load(Acquire));
+        out.extend_from_slice(&self.levels);
+        for s in self
+            .layer0
+            .iter()
+            .chain(self.upper.iter().flat_map(|u| u.iter()))
+        {
+            blob::put_u32(&mut out, s.load(Relaxed));
+        }
+        out
+    }
+
+    /// Rebuilds an index from `to_bytes` output and its vectors (in stored
+    /// form, as `vectors()` returned them; they are not normalized again).
+    /// Takes ownership of the vectors, so loading from a mapped segment
+    /// costs one copy in RAM (v1 keeps `Hnsw` owning a `Vec<f32>`).
+    ///
+    /// Everything is validated, so a corrupt blob is an error here rather
+    /// than a panic or an out-of-bounds read during a later search.
+    pub fn from_bytes(bytes: &[u8], vectors: Vec<f32>) -> Result<Hnsw> {
+        let mut r = blob::Reader::new(bytes);
+        let (dim, metric) = r.header(MAGIC)?;
+        let m = r.u32()? as usize;
+        let ef_construction = r.u32()? as usize;
+        let seed = r.u64()?;
+        let n = r.u64()?;
+        let entry = r.u64()?;
+        if m < 2 || ef_construction == 0 {
+            return Err(Error::Corrupt("bad config"));
+        }
+        if n > u64::from(u32::MAX) {
+            return Err(Error::Corrupt("more nodes than u32 ids"));
+        }
+        blob::check_vectors(&vectors, n, dim)?;
+        let n = n as usize;
+
+        let levels = r.take(n)?.to_vec();
+        if levels.iter().any(|&l| l > MAX_LEVEL) {
+            return Err(Error::Corrupt("level above MAX_LEVEL"));
+        }
+        // Sizes come from the blob, so every allocation below is bounded
+        // by bytes actually present.
+        let atomics = |b: &[u8]| -> Box<[AtomicU32]> {
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| AtomicU32::new(u32::from_le_bytes(c)))
+                .collect()
+        };
+        let layer0 = atomics(r.take_n(n, 4 * (1 + 2 * m))?).into_vec();
+        let upper = levels
+            .iter()
+            .map(|&l| Ok(atomics(r.take_n(l as usize, 4 * (1 + m))?)))
+            .collect::<Result<Vec<_>>>()?;
+        r.finish()?;
+
+        let h = Hnsw {
+            dim,
+            metric,
+            cfg: Config {
+                m,
+                ef_construction,
+                seed,
+            },
+            vectors,
+            levels,
+            layer0,
+            upper,
+            locks: (0..n).map(|_| Mutex::new(())).collect(),
+            entry: AtomicU64::new(entry),
+            grow: Mutex::new(()),
+        };
+        h.validate()?;
+        Ok(h)
+    }
+
+    /// What search and insert rely on: every list's count fits its
+    /// capacity, every link is a node that exists on that layer, and the
+    /// entry point is a node on the top layer (or absent iff empty).
+    fn validate(&self) -> Result<()> {
+        let n = self.levels.len();
+        for node in 0..n as u32 {
+            for layer in 0..=self.levels[node as usize] {
+                let slots = self.slots(node, layer);
+                let count = slots[0].load(Relaxed) as usize;
+                if count >= slots.len() {
+                    return Err(Error::Corrupt("list count over capacity"));
+                }
+                for s in &slots[1..=count] {
+                    let id = s.load(Relaxed) as usize;
+                    if id >= n || self.levels[id] < layer {
+                        return Err(Error::Corrupt("link to a node not on its layer"));
+                    }
+                }
+            }
+        }
+        let top = self.levels.iter().max().copied();
+        let ok = match self.entry() {
+            None => n == 0,
+            Some((id, level)) => {
+                self.entry.load(Relaxed) == (u64::from(level) << 32 | u64::from(id))
+                    && (id as usize) < n
+                    && self.levels[id as usize] == level
+                    && top == Some(level)
+            }
+        };
+        if !ok {
+            return Err(Error::Corrupt("bad entry point"));
+        }
+        Ok(())
     }
 
     fn vector(&self, id: u32) -> &[f32] {
@@ -436,6 +567,141 @@ mod tests {
         let above0 = levels.iter().filter(|&&l| l > 0).count() as f64 / 1e5;
         assert!((above0 - 1.0 / 16.0).abs() < 0.005, "{above0}");
         assert_eq!(levels[123], level_for(42, 123, 16));
+    }
+
+    fn search_all(h: &Hnsw, dim: usize) -> Vec<Vec<Hit>> {
+        let p = SearchParams { ef: 48 };
+        test_data::vectors(300, dim, 5)
+            .chunks_exact(dim)
+            .map(|q| h.search(q, 10, &p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn blob_round_trip_searches_identically() {
+        for metric in [Metric::L2, Metric::Cosine] {
+            let (h, _, _) = build(2_000, 16, metric, 2);
+            let bytes = h.to_bytes();
+            let mut h2 = Hnsw::from_bytes(&bytes, h.vectors().to_vec()).unwrap();
+            assert_eq!(h2.to_bytes(), bytes);
+            assert_eq!((h2.len(), h2.dim(), h2.metric()), (h.len(), 16, metric));
+            assert_eq!(search_all(&h2, 16), search_all(&h, 16));
+            // A loaded index keeps accepting inserts.
+            h2.add(&test_data::vectors(100, 16, 8)).unwrap();
+            assert_eq!(h2.len(), 2_100);
+        }
+        let empty = Hnsw::new(3, Metric::L2, Config::default());
+        let e2 = Hnsw::from_bytes(&empty.to_bytes(), Vec::new()).unwrap();
+        assert!(e2.is_empty());
+    }
+
+    #[test]
+    fn end_to_end_through_a_segment_file() {
+        use storage::segment::{self, BlobKind, Segment, SegmentData};
+        let (h, _, _) = build(1_500, 16, Metric::L2, 1);
+        let ids: Vec<u64> = (0..h.len() as u64).map(|i| 1_000_000 + i).collect();
+        let dir = std::env::temp_dir().join(format!("nearpoint-hnsw-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hnsw.seg");
+        segment::write(
+            &path,
+            &SegmentData {
+                dim: h.dim(),
+                metric: h.metric().code(),
+                vectors: h.vectors(),
+                ids: &ids,
+                blob_kind: BlobKind::Hnsw,
+                blob: &h.to_bytes(),
+            },
+        )
+        .unwrap();
+
+        let seg = Segment::open(&path).unwrap();
+        assert_eq!(seg.blob_kind(), BlobKind::Hnsw);
+        let metric = Metric::from_code(seg.metric()).unwrap();
+        assert_eq!((seg.dim(), metric), (16, Metric::L2));
+        let h2 = Hnsw::from_bytes(seg.index_blob(), seg.vectors().to_vec()).unwrap();
+        assert_eq!(search_all(&h2, 16), search_all(&h, 16));
+        let hit = h2
+            .search(h.vector(42), 1, &SearchParams::default())
+            .unwrap()[0];
+        assert_eq!(seg.ids()[hit.id as usize], 1_000_042);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn small_blob() -> (Vec<u8>, Vec<f32>) {
+        let (h, _, _) = build(200, 4, Metric::L2, 1);
+        (h.to_bytes(), h.vectors().to_vec())
+    }
+
+    #[test]
+    fn corrupt_blobs_are_errors() {
+        let (bytes, vecs) = small_blob();
+        let load = |b: &[u8]| Hnsw::from_bytes(b, vecs.clone());
+        for len in 0..bytes.len() {
+            assert!(load(&bytes[..len]).is_err(), "truncated to {len}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(load(&longer).is_err());
+        assert!(Hnsw::from_bytes(&bytes, vecs[4..].to_vec()).is_err());
+
+        let at = |b: &mut Vec<u8>, off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
+        let mut v2 = bytes.clone();
+        at(&mut v2, 4, &2u32.to_le_bytes());
+        assert_eq!(load(&v2).err(), Some(Error::UnsupportedBlobVersion(2)));
+
+        let (m, n) = (8, 200);
+        let layer0 = 48 + n;
+        let w0 = 4 * (1 + 2 * m);
+        for (off, val, what) in [
+            (layer0, 2 * m as u32 + 1, "list count over capacity"),
+            (layer0 + 4, n as u32, "link to a node not on its layer"),
+            (40, 7, "bad entry point"), // entry level 0, but higher layers exist
+        ] {
+            let mut b = bytes.clone();
+            at(&mut b, off, &val.to_le_bytes());
+            if off == 40 {
+                at(&mut b, 44, &0u32.to_le_bytes());
+            }
+            assert_eq!(load(&b).err(), Some(Error::Corrupt(what)));
+        }
+        // A layer-0 node linked from an upper layer.
+        let low = bytes[48..48 + n].iter().position(|&l| l == 0).unwrap() as u32;
+        let first_upper = layer0 + n * w0;
+        let mut b = bytes.clone();
+        at(&mut b, first_upper, &1u32.to_le_bytes());
+        at(&mut b, first_upper + 4, &low.to_le_bytes());
+        assert_eq!(
+            load(&b).err(),
+            Some(Error::Corrupt("link to a node not on its layer"))
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn random_corruption_never_panics(
+            flips in proptest::collection::vec((0usize..1 << 20, 1u8..=255), 1..8),
+            cut in 0usize..1 << 20,
+        ) {
+            static BLOB: std::sync::LazyLock<(Vec<u8>, Vec<f32>)> =
+                std::sync::LazyLock::new(small_blob);
+            let (bytes, vecs) = &*BLOB;
+            let mut b = bytes.clone();
+            for (pos, x) in flips {
+                let i = pos % b.len();
+                b[i] ^= x;
+            }
+            if cut % 4 == 0 {
+                b.truncate(cut % b.len());
+            }
+            if let Ok(h) = Hnsw::from_bytes(&b, vecs.clone()) {
+                // Whatever loads must be searchable without panicking.
+                for q in test_data::vectors(5, 4, 3).as_chunks::<4>().0 {
+                    let _ = h.search(q, 10, &SearchParams { ef: 32 });
+                }
+            }
+        }
     }
 
     #[test]
