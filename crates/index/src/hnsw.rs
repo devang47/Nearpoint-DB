@@ -28,6 +28,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rayon::prelude::*;
 
+use crate::flat::top_k;
 use crate::visited::VISITED;
 use crate::{Error, Hit, Index, Metric, Result, SearchParams, batch_ids, blob, check_dim};
 
@@ -260,15 +261,30 @@ impl Hnsw {
     }
 
     /// Best-first search of one layer from `entries`; returns up to `ef`
-    /// nearest found, as a max-heap (farthest on top).
-    fn search_layer(&self, q: &[f32], entries: &[Hit], ef: usize, layer: u8) -> BinaryHeap<Hit> {
+    /// nearest found that `keep` accepts, as a max-heap (farthest on top).
+    ///
+    /// Rejected nodes are still expanded like any other, so a filtered
+    /// search walks through them; only the result set is filtered. It stops
+    /// once it holds `ef` nodes all nearer than the nearest unexpanded one,
+    /// or nothing is left to expand. Unfiltered callers pass `|_| true`,
+    /// which compiles away.
+    fn search_layer(
+        &self,
+        q: &[f32],
+        entries: &[Hit],
+        ef: usize,
+        layer: u8,
+        keep: impl Fn(u32) -> bool,
+    ) -> BinaryHeap<Hit> {
         VISITED.with_borrow_mut(|visited| {
             visited.reset(self.levels.len());
             let mut best = BinaryHeap::with_capacity(ef + 1);
             let mut todo = BinaryHeap::new();
             for &e in entries {
                 visited.insert(e.id);
-                best.push(e);
+                if keep(e.id) {
+                    best.push(e);
+                }
                 todo.push(Reverse(e));
             }
             while best.len() > ef {
@@ -285,12 +301,15 @@ impl Hnsw {
                     if !visited.insert(id) {
                         continue;
                     }
+                    visited.distances += 1;
                     let h = self.hit(q, id);
                     if best.len() < ef || best.peek().is_some_and(|far| h < *far) {
                         todo.push(Reverse(h));
-                        best.push(h);
-                        if best.len() > ef {
-                            best.pop();
+                        if keep(id) {
+                            best.push(h);
+                            if best.len() > ef {
+                                best.pop();
+                            }
                         }
                     }
                 }
@@ -304,7 +323,7 @@ impl Hnsw {
     fn descend(&self, q: &[f32], entry: (u32, u8), stop: u8) -> Hit {
         let mut cur = self.hit(q, entry.0);
         for layer in (stop + 1..=entry.1).rev() {
-            if let Some(h) = self.search_layer(q, &[cur], 1, layer).pop() {
+            if let Some(h) = self.search_layer(q, &[cur], 1, layer, |_| true).pop() {
                 cur = h;
             }
         }
@@ -382,7 +401,7 @@ impl Hnsw {
         let mut cur = vec![self.descend(q, entry, level)];
         for layer in (0..=level.min(entry.1)).rev() {
             let mut found = self
-                .search_layer(q, &cur, self.cfg.ef_construction, layer)
+                .search_layer(q, &cur, self.cfg.ef_construction, layer, |_| true)
                 .into_sorted_vec();
             found.retain(|h| h.id != node);
             // m links out on every layer; layer 0's 2m capacity is headroom
@@ -402,6 +421,83 @@ impl Hnsw {
             self.entry.store(packed, Release); // we hold `grow`
         }
     }
+
+    /// The plan `search` picks: brute force when the filter is small
+    /// enough that scanning it computes fewer distances than a graph walk
+    /// would (ADR 0010).
+    pub fn plan(&self, k: usize, params: &SearchParams) -> Plan {
+        match params.filter {
+            Some(f) if brute_force_wins(f.len(), params.ef.max(k), self.len()) => Plan::BruteForce,
+            _ => Plan::Graph,
+        }
+    }
+
+    /// `search` with the plan given rather than picked (benchmarks use it
+    /// to measure both sides of the planner's threshold).
+    pub fn search_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        params: &SearchParams,
+        plan: Plan,
+    ) -> Result<Vec<Hit>> {
+        check_dim(self.dim, query.len())?;
+        let Some(entry) = self.entry().filter(|_| k > 0) else {
+            return Ok(Vec::new());
+        };
+        let q = self.metric.prepare(query);
+        let n = self.len() as u32;
+        if plan == Plan::BruteForce {
+            let hits = match params.filter {
+                Some(f) => top_k(f.range(..n).map(|id| self.hit(&q, id)), k),
+                None => top_k((0..n).map(|id| self.hit(&q, id)), k),
+            };
+            let count = params
+                .filter
+                .map_or(u64::from(n), |f| f.range_cardinality(..n));
+            VISITED.with_borrow_mut(|v| v.distances += count);
+            return Ok(hits);
+        }
+        let start = self.descend(&q, entry, 0);
+        let ef = params.ef.max(k);
+        let mut hits = match params.filter {
+            None => self.search_layer(&q, &[start], ef, 0, |_| true),
+            Some(f) => self.search_layer(&q, &[start], ef, 0, |id| f.contains(id)),
+        }
+        .into_sorted_vec();
+        hits.truncate(k);
+        Ok(hits)
+    }
+}
+
+/// How a search finds its results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Walk the graph, keeping only nodes in the filter (if any).
+    Graph,
+    /// Exact: the distance to every id in the filter (or every id).
+    BruteForce,
+}
+
+/// Brute force over a filter costs one distance per id; a filtered walk
+/// costs more the fewer ids match. Brute force runs when
+/// `filtered² <= WALK_COST * ef * len`. On SIFT1M (M=16) the distance
+/// counts of the two cross at ~2.4% (ef 64) and ~3.2% (ef 128), which
+/// this fits with 8 at both widths (ADR 0010).
+const WALK_COST: f64 = 8.0;
+
+/// Whether brute force over `filtered` of `len` ids computes fewer
+/// distances than a walk of width `ef`.
+fn brute_force_wins(filtered: u64, ef: usize, len: usize) -> bool {
+    let f = filtered as f64;
+    f * f <= WALK_COST * ef as f64 * len as f64
+}
+
+/// Distances computed by `Hnsw` searches (and inserts) on this thread so
+/// far; brute-force plans count one per filtered id. Benchmarks diff it
+/// around a search.
+pub fn distances() -> u64 {
+    VISITED.with_borrow(|v| v.distances)
 }
 
 /// The mutexes guard no data, so a poisoned one is still fine to use.
@@ -464,17 +560,7 @@ impl Index for Hnsw {
     }
 
     fn search(&self, query: &[f32], k: usize, params: &SearchParams) -> Result<Vec<Hit>> {
-        check_dim(self.dim, query.len())?;
-        let Some(entry) = self.entry().filter(|_| k > 0) else {
-            return Ok(Vec::new());
-        };
-        let q = self.metric.prepare(query);
-        let start = self.descend(&q, entry, 0);
-        let mut hits = self
-            .search_layer(&q, &[start], params.ef.max(k), 0)
-            .into_sorted_vec();
-        hits.truncate(k);
-        Ok(hits)
+        self.search_with(query, k, params, self.plan(k, params))
     }
 }
 
@@ -482,6 +568,7 @@ impl Index for Hnsw {
 mod tests {
     use super::*;
     use crate::{Flat, test_data};
+    use roaring::RoaringBitmap;
 
     fn build(n: usize, dim: usize, metric: Metric, batches: usize) -> (Hnsw, Flat, Vec<f32>) {
         let data = test_data::vectors(n, dim, 7);
@@ -710,6 +797,88 @@ mod tests {
                     });
                 }
             }
+        }
+    }
+
+    /// Every `step`-th id (offset by `offset`), plus ids past the end.
+    fn every(step: u32, offset: u32, n: usize) -> RoaringBitmap {
+        (0..n as u32 + 100)
+            .filter(|i| (i + offset).is_multiple_of(step))
+            .collect()
+    }
+
+    #[test]
+    fn filtered_recall_both_plans() {
+        let (h, f, _) = build(5_000, 16, Metric::L2, 1);
+        let qs = test_data::vectors(50, 16, 99);
+        // 1%, 10%, 50%.
+        for step in [100, 10, 2] {
+            let filter = every(step, 3, h.len());
+            let p = SearchParams {
+                ef: 64,
+                filter: Some(&filter),
+                ..SearchParams::default()
+            };
+            for plan in [Plan::Graph, Plan::BruteForce] {
+                let mut hits = 0;
+                for q in qs.as_chunks::<16>().0 {
+                    let truth = f.search(q, 10, &p).unwrap();
+                    let got = h.search_with(q, 10, &p, plan).unwrap();
+                    assert!(got.iter().all(|g| filter.contains(g.id)));
+                    if plan == Plan::BruteForce {
+                        assert_eq!(got, truth);
+                    }
+                    hits += got.iter().filter(|g| truth.contains(g)).count();
+                }
+                let r = hits as f64 / 500.0;
+                assert!(r >= 0.95, "step {step} {plan:?}: recall {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn planner_and_distance_counter() {
+        let (h, _, _) = build(5_000, 16, Metric::L2, 1);
+        let q = test_data::vectors(1, 16, 9);
+        let p = |filter| SearchParams {
+            ef: 64,
+            filter,
+            ..SearchParams::default()
+        };
+        assert_eq!(h.plan(10, &p(None)), Plan::Graph);
+        let (small, big) = (every(100, 0, h.len()), every(2, 0, h.len()));
+        assert_eq!(h.plan(10, &p(Some(&small))), Plan::BruteForce);
+        assert_eq!(h.plan(10, &p(Some(&big))), Plan::Graph);
+        // A bigger k widens the walk, so brute force wins for longer.
+        assert_eq!(h.plan(2_500, &p(Some(&big))), Plan::BruteForce);
+
+        let before = distances();
+        h.search(&q, 10, &p(Some(&small))).unwrap();
+        assert_eq!(distances() - before, 50); // ids past the end don't count
+        let before = distances();
+        h.search(&q, 10, &p(None)).unwrap();
+        assert!((64..5_000).contains(&(distances() - before)));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn filtered_search_stays_in_the_filter(
+            picks in proptest::collection::vec(0u32..2_100, 0..300),
+            k in 0usize..30,
+            seed in 0u64..1000,
+        ) {
+            static INDEX: std::sync::LazyLock<(Hnsw, Flat, Vec<f32>)> =
+                std::sync::LazyLock::new(|| build(2_000, 8, Metric::L2, 1));
+            let (h, f, _) = &*INDEX;
+            let filter: RoaringBitmap = picks.into_iter().collect();
+            let q = test_data::vectors(1, 8, seed);
+            let p = SearchParams { ef: 32, filter: Some(&filter), ..SearchParams::default() };
+            let exact = f.search(&q, k, &p).unwrap();
+            proptest::prop_assert_eq!(&h.search_with(&q, k, &p, Plan::BruteForce).unwrap(), &exact);
+            let walk = h.search_with(&q, k, &p, Plan::Graph).unwrap();
+            proptest::prop_assert!(walk.len() <= exact.len());
+            proptest::prop_assert!(walk.iter().all(|g| filter.contains(g.id)));
+            proptest::prop_assert!(walk.is_sorted());
         }
     }
 

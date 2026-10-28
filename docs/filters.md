@@ -112,3 +112,19 @@ Everything without the `archived` tag (including rows with no tags):
 ```json
 {"not": {"eq": {"tags": "archived"}}}
 ```
+
+## Filtered search
+
+A filter is applied during the search, not to its results, so a search
+returns `k` matches whenever the segment has `k` matching rows (task 7.3,
+`docs/adr/0010-filtered-search.md`):
+
+- **HNSW** walks the graph as usual, including through rows that don't
+  match, but only matching rows enter the result set; it keeps going until
+  it holds `ef` matches nearer than anything left to explore.
+- **When few rows match**, HNSW computes the exact distance to every
+  matching row instead of walking (task 7.4). It does this when
+  `matches² <= 8 · max(ef, k) · rows`: on 1M vectors at `ef` 64 that is
+  under ~22,600 matches (~2.3%), and a segment of a few hundred rows always
+  scans. Those results are exact.
+- **Flat** visits only the matching rows.
