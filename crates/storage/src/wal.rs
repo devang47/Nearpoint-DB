@@ -231,11 +231,27 @@ impl Wal {
     /// Appends one record and returns its LSN. Durable on return under
     /// `Always` and `Batch`; see `SyncPolicy::Interval` for the exception.
     pub fn append(&self, record: &Record) -> Result<Lsn> {
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Appends `records` with consecutive LSNs in one write and one sync
+    /// (per the policy) and returns the last LSN (`next_lsn() - 1` if
+    /// `records` is empty). Every record is encoded before anything is
+    /// written, so `RecordTooLarge` writes nothing; after any other error
+    /// a prefix of the batch may be durable.
+    pub fn append_batch(&self, records: &[Record]) -> Result<Lsn> {
         let s = &*self.shared;
         let mut inner = lock(&s.inner);
         s.check_poisoned()?;
-        let lsn = inner.next_lsn;
-        let buf = encode(lsn, record)?;
+        let first = inner.next_lsn;
+        let mut buf = Vec::new();
+        for (lsn, r) in (first..).zip(records) {
+            buf.extend_from_slice(&encode(lsn, r)?);
+        }
+        let lsn = first + records.len() as u64 - 1;
+        if records.is_empty() {
+            return Ok(lsn);
+        }
         #[cfg(feature = "failpoints")]
         if let Some(n) = failpoint::take() {
             let _ = (&*inner.file).write_all(&buf[..n.min(buf.len())]);
@@ -246,7 +262,7 @@ impl Wal {
             s.poisoned.store(true, Ordering::SeqCst);
             return Err(e.into());
         }
-        inner.next_lsn += 1;
+        inner.next_lsn = lsn + 1;
         match s.policy {
             SyncPolicy::Always => {
                 if let Err(e) = inner.file.sync_data() {
@@ -644,6 +660,27 @@ mod tests {
         let (wal, rec) = Wal::open(&d.0, SyncPolicy::Always).unwrap();
         assert_eq!(rec.records.len(), 501);
         assert_eq!(wal.next_lsn(), 502);
+    }
+
+    #[test]
+    fn append_batch_is_consecutive_and_all_or_nothing_on_too_large() {
+        let d = TempDir::new("batch");
+        let (wal, _) = Wal::open(&d.0, SyncPolicy::Batch).unwrap();
+        assert_eq!(wal.append_batch(&[]).unwrap(), 0);
+        let batch: Vec<_> = (1..=10).map(sample).collect();
+        assert_eq!(wal.append_batch(&batch).unwrap(), 10);
+        let huge = Record::Upsert {
+            id: 0,
+            vector: Vec::new(),
+            payload: vec![0; MAX_BODY_LEN as usize],
+        };
+        let e = wal.append_batch(&[sample(11), huge]);
+        assert!(matches!(e, Err(WalError::RecordTooLarge(_))));
+        assert_eq!(wal.append(&sample(11)).unwrap(), 11);
+        drop(wal);
+        let (_, rec) = Wal::open(&d.0, SyncPolicy::Batch).unwrap();
+        let want: Vec<_> = (1..=11).map(|i| (i, sample(i))).collect();
+        assert_eq!(rec.records, want);
     }
 
     #[test]

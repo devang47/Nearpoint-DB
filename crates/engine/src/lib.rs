@@ -1,11 +1,13 @@
 //! Collections, segments, compaction, deletes and filters.
 
 pub mod collection;
+pub mod db;
 pub mod filter;
 pub mod payload;
 
+pub use db::Db;
 pub use filter::{Bounds, Filter, Scalar, evaluate, selectivity};
-pub use payload::{Kind, PayloadStore};
+pub use payload::{Kind, PayloadStore, Schema};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {

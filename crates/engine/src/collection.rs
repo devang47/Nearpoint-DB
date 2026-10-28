@@ -1,5 +1,5 @@
-//! A collection (tasks 3.3–3.4): a WAL, one mutable in-RAM HNSW segment,
-//! sealed segments, an external-id map and tombstones, all in one
+//! A collection (tasks 3.3–3.4, 4.2–4.3): a WAL, one mutable in-RAM HNSW
+//! segment, sealed segments, an external-id map and tombstones, all in one
 //! directory. Layout, LSN coverage and the seal protocol are in
 //! docs/adr/0008-collection-recovery.md; file formats in
 //! docs/formats/manifest.md.
@@ -10,35 +10,99 @@
 //! the manifest covers. `open` loads the manifest's segments and replays
 //! only WAL records above the manifest's LSN, so a crash at any step
 //! neither loses nor double-applies a write.
+//!
+//! Concurrency (ADR 0011): one writer at a time (`writer` mutex, held
+//! through the WAL sync), any number of readers. Readers clone the current
+//! `Arc<Snapshot>` and search it without blocking on the writer's fsync.
+//! The writer appends rows to the mutable segment under its `RwLock` (in
+//! chunks, so readers wait at most one chunk), then publishes a new
+//! snapshot whose row count covers them and whose tombstone bitmaps are
+//! copy-on-write clones. Rows past a snapshot's count are invisible to it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use index::{Hnsw, Index, Metric, SearchParams, hnsw};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::framed;
 use storage::segment::{self, BlobKind, Segment, SegmentData};
 use storage::wal::{Lsn, Record, SyncPolicy, Wal, WalError};
 
-use crate::{Filter, PayloadStore, evaluate};
+use crate::{Filter, PayloadStore, Schema, evaluate};
 
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_MAGIC: [u8; 8] = *b"NPMANIFS";
 const MANIFEST_VERSION: u32 = 1;
 const PAYLOADS_MAGIC: [u8; 8] = *b"NPPAYLDS";
 const PAYLOADS_VERSION: u32 = 1;
+/// Rows the writer adds to the mutable segment per write-lock hold.
+const APPLY_CHUNK: usize = 1024;
+/// WAL records replayed per batch on open (bounds the extra copy).
+const REPLAY_CHUNK: usize = 65_536;
 
-#[derive(Debug, Clone, Copy)]
+/// A collection's settings. Everything but `sync` is persisted by
+/// [`crate::Db`] (docs/formats/manifest.md, `CONFIG`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub dim: usize,
+    #[serde(with = "MetricDef")]
     pub metric: Metric,
     /// For new mutable segments; sealed ones keep the config they were
     /// built with (it's in their index blob).
+    #[serde(default, with = "HnswDef")]
     pub hnsw: hnsw::Config,
+    /// Declared payload field types (see `payload.rs`).
+    #[serde(default)]
+    pub schema: Schema,
+    /// Not persisted: the server picks it at startup.
+    #[serde(skip)]
     pub sync: SyncPolicy,
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        if self.dim == 0 || self.hnsw.m < 2 || self.hnsw.ef_construction == 0 {
+            return Err(Error::Invalid("need dim > 0, m >= 2, ef_construction >= 1"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Metric", rename_all = "snake_case")]
+enum MetricDef {
+    L2,
+    InnerProduct,
+    Cosine,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "hnsw::Config", deny_unknown_fields)]
+struct HnswDef {
+    #[serde(default = "default_m")]
+    m: usize,
+    #[serde(default = "default_ef_construction")]
+    ef_construction: usize,
+    #[serde(default = "default_seed")]
+    seed: u64,
+}
+
+fn default_m() -> usize {
+    hnsw::Config::default().m
+}
+
+fn default_ef_construction() -> usize {
+    hnsw::Config::default().ef_construction
+}
+
+fn default_seed() -> u64 {
+    hnsw::Config::default().seed
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +128,16 @@ pub enum Error {
     Invalid(&'static str),
     #[error("corrupt collection: {0}")]
     Corrupt(String),
+    #[error("collection was dropped")]
+    Closed,
+    #[error("collection `{0}` not found")]
+    NotFound(String),
+    #[error("collection `{0}` already exists")]
+    Exists(String),
+    #[error("{0} is locked by another process")]
+    Locked(PathBuf),
+    #[error("collection `{0}`: {1}")]
+    Open(String, Box<Error>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -80,31 +154,81 @@ pub struct Recovery {
     pub dropped_files: usize,
 }
 
-/// One segment in memory. A sealed one only ever changes in `dead`.
+/// Search knobs beyond the query and `k`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions<'a> {
+    /// HNSW beam width (`None`: the index default, 64); raised to `k`.
+    pub ef: Option<usize>,
+    pub filter: Option<&'a Filter>,
+    pub with_payload: bool,
+    pub with_vector: bool,
+}
+
+/// A search result. `payload` (null if it has none) and `vector` (stored
+/// form) are filled only when asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Match {
+    pub id: u64,
+    pub dist: f32,
+    pub payload: Option<Value>,
+    pub vector: Option<Vec<f32>>,
+}
+
+/// One segment's data. A sealed one never changes; the mutable one only
+/// grows, under its write lock, which only the writer takes.
 struct Seg {
-    /// The LSN it was sealed at (its file name); 0 while mutable.
-    lsn: Lsn,
     index: Hnsw,
     /// External id of each row.
     ids: Vec<u64>,
     payloads: PayloadStore,
-    /// Rows deleted or replaced by a later upsert.
-    dead: RoaringBitmap,
 }
 
-// ponytail: single owner, `&mut self` writes. Phase 4.3 puts the segment
-// list behind an `Arc<Snapshot>`; `dead` is the only part of a sealed
-// segment that changes, so it would go copy-on-write there.
+/// A segment as one snapshot sees it.
+#[derive(Clone)]
+struct View {
+    /// The LSN it was sealed at (its file name); 0 while mutable.
+    lsn: Lsn,
+    seg: Arc<RwLock<Seg>>,
+    /// Rows `0..rows` are visible. The mutable segment can hold more:
+    /// applied by the writer but not yet published.
+    rows: u32,
+    /// Rows deleted or replaced by a later upsert. Copy-on-write: the
+    /// writer clones it (`Arc::make_mut`) into the next snapshot.
+    dead: Arc<RoaringBitmap>,
+}
+
+/// What readers search: sealed segments in LSN order, then the mutable one
+/// (always last). Never changed once published; the writer (and, from
+/// Phase 6, a background builder holding the writer lock) swaps in a new
+/// one.
+#[derive(Clone)]
+struct Snapshot {
+    segs: Vec<View>,
+}
+
+/// State only the writer touches.
+struct Writer {
+    /// Every write with LSN <= this is in the manifest.
+    covered: Lsn,
+    /// Set by `close`: later writes fail with `Closed`.
+    closed: bool,
+}
+
 pub struct Collection {
     dir: PathBuf,
     cfg: Config,
     wal: Wal,
-    /// Sealed segments in LSN order, then the mutable one (always last).
-    segs: Vec<Seg>,
-    /// External id → (segment, row) of its one live row.
-    live: HashMap<u64, (u32, u32)>,
-    /// Every write with LSN <= this is in the manifest.
-    covered: Lsn,
+    /// Held by each write and seal for its whole run, WAL sync included.
+    // ponytail: one sync per request, so concurrent single-point writers
+    // don't share a group commit; batch (or bulk) to go faster. Collect
+    // pending requests into one WAL batch if that becomes the bottleneck.
+    writer: Mutex<Writer>,
+    /// External id → (segment, row) of its one live row. Changed only by
+    /// the writer, together with `snap`, under this lock (so a reader
+    /// holding it sees the two agree). Lock order: live, snap, a segment.
+    live: RwLock<HashMap<u64, (u32, u32)>>,
+    /// Held only to clone or swap the `Arc`.
+    snap: RwLock<Arc<Snapshot>>,
 }
 
 impl Collection {
@@ -112,9 +236,7 @@ impl Collection {
     /// segments, deletes files a crashed seal left behind, and replays WAL
     /// records the manifest doesn't cover. One process at a time.
     pub fn open(dir: impl AsRef<Path>, cfg: Config) -> Result<(Collection, Recovery)> {
-        if cfg.dim == 0 || cfg.hnsw.m < 2 || cfg.hnsw.ef_construction == 0 {
-            return Err(Error::Invalid("need dim > 0, m >= 2, ef_construction >= 1"));
-        }
+        cfg.validate()?;
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let mpath = dir.join(MANIFEST);
@@ -126,59 +248,56 @@ impl Collection {
         let keep: Vec<Lsn> = manifest.segs.iter().map(|s| s.0).collect();
         remove_garbage(&dir, &keep)?;
 
-        let (wal, rec) = Wal::open(dir.join("wal"), cfg.sync)?;
-        let mut c = Collection {
-            dir,
-            cfg,
-            wal,
-            segs: Vec::new(),
-            live: HashMap::new(),
-            covered: manifest.covered,
-        };
+        let mut segs = Vec::new();
+        let mut live = HashMap::new();
         for (lsn, dead) in manifest.segs {
-            let seg = c.load_segment(lsn, dead)?;
-            c.segs.push(seg);
-        }
-        for (s, seg) in c.segs.iter().enumerate() {
+            let seg = load_segment(&dir, &cfg, lsn, &dead)?;
             for (row, &id) in seg.ids.iter().enumerate() {
-                if !seg.dead.contains(row as u32)
-                    && c.live.insert(id, (s as u32, row as u32)).is_some()
+                if !dead.contains(row as u32)
+                    && live.insert(id, (segs.len() as u32, row as u32)).is_some()
                 {
                     return Err(Error::Corrupt(format!("id {id} is live in two rows")));
                 }
             }
+            segs.push(View {
+                lsn,
+                rows: seg.ids.len() as u32,
+                seg: Arc::new(RwLock::new(seg)),
+                dead: Arc::new(dead),
+            });
         }
-        c.segs.push(c.new_mutable());
+        segs.push(new_mutable(&cfg));
 
-        let start = rec.records.partition_point(|r| r.0 <= c.covered);
+        let (wal, rec) = Wal::open(dir.join("wal"), cfg.sync)?;
+        let c = Collection {
+            dir,
+            cfg,
+            wal,
+            writer: Mutex::new(Writer {
+                covered: manifest.covered,
+                closed: false,
+            }),
+            live: RwLock::new(live),
+            snap: RwLock::new(Arc::new(Snapshot { segs })),
+        };
+        let covered = manifest.covered;
+        let start = rec.records.partition_point(|r| r.0 <= covered);
         let resume = rec.records.get(start).map_or(c.wal.next_lsn(), |r| r.0);
-        if resume != c.covered + 1 {
+        if resume != covered + 1 {
             return Err(Error::Corrupt(format!(
-                "WAL resumes at LSN {resume}, manifest covers up to {}",
-                c.covered
+                "WAL resumes at LSN {resume}, manifest covers up to {covered}"
             )));
         }
-        for (lsn, r) in &rec.records[start..] {
-            match r {
-                Record::Upsert {
-                    id,
-                    vector,
-                    payload,
-                } => {
-                    let p = match payload.as_slice() {
-                        [] => Value::Null,
-                        b => serde_json::from_slice(b)
-                            .map_err(|e| Error::Corrupt(format!("WAL LSN {lsn} payload: {e}")))?,
-                    };
-                    c.apply_upsert(*id, vector, &p)?;
-                }
-                Record::Delete { id } => c.apply_delete(*id),
+        let is_upsert = |r: &(Lsn, Record)| matches!(r.1, Record::Upsert { .. });
+        for run in rec.records[start..].chunk_by(|a, b| is_upsert(a) == is_upsert(b)) {
+            for batch in run.chunks(REPLAY_CHUNK) {
+                c.replay(batch)?;
             }
         }
         // Finishes a seal that crashed after publishing its manifest.
-        c.wal.remove_before(c.covered + 1)?;
+        c.wal.remove_before(covered + 1)?;
         let report = Recovery {
-            segments: c.segs.len() - 1,
+            segments: c.snapshot().segs.len() - 1,
             replayed: rec.records.len() - start,
             dropped_bytes: rec.dropped_bytes,
             dropped_files: rec.dropped_files,
@@ -186,122 +305,220 @@ impl Collection {
         Ok((c, report))
     }
 
+    /// Applies WAL records that are all upserts or all deletes.
+    fn replay(&self, batch: &[(Lsn, Record)]) -> Result<()> {
+        let (mut ids, mut vectors, mut payloads) = (Vec::new(), Vec::new(), Vec::new());
+        for (lsn, r) in batch {
+            match r {
+                Record::Upsert {
+                    id,
+                    vector,
+                    payload,
+                } => {
+                    self.check_dim(vector)?;
+                    ids.push(*id);
+                    vectors.extend_from_slice(vector);
+                    payloads.push(match payload.as_slice() {
+                        [] => Value::Null,
+                        b => serde_json::from_slice(b)
+                            .map_err(|e| Error::Corrupt(format!("WAL LSN {lsn} payload: {e}")))?,
+                    });
+                }
+                Record::Delete { id } => ids.push(*id),
+            }
+        }
+        if payloads.is_empty() {
+            self.apply_deletes(&ids);
+            Ok(())
+        } else {
+            self.apply_upserts(&ids, &vectors, &payloads)
+        }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
     /// Inserts or replaces `id`. `payload` is a JSON object or null. Durable
     /// on return per the sync policy; `Error::Unknown` means it may or may
     /// not be (ADR 0007).
-    pub fn upsert(&mut self, id: u64, vector: &[f32], payload: &Value) -> Result<()> {
+    pub fn upsert(&self, id: u64, vector: &[f32], payload: &Value) -> Result<()> {
         self.check_dim(vector)?;
-        if !vector.iter().all(|x| x.is_finite()) {
+        self.upsert_batch(&[id], vector, std::slice::from_ref(payload))
+    }
+
+    /// Upserts `ids[i]` with vector `vectors[i * dim..][..dim]` and payload
+    /// `payloads[i]` (`payloads` may be empty: no payloads), in order, so a
+    /// repeated id ends with its last version. The whole batch is checked
+    /// before anything is logged, then logged with one WAL sync. On
+    /// `Error::Unknown` any prefix of it may be durable.
+    pub fn upsert_batch(&self, ids: &[u64], vectors: &[f32], payloads: &[Value]) -> Result<()> {
+        let n = ids.len();
+        if vectors.len() != n * self.cfg.dim {
+            return Err(Error::Invalid("need ids.len() * dim vector components"));
+        }
+        if !payloads.is_empty() && payloads.len() != n {
+            return Err(Error::Invalid("need one payload per id, or none"));
+        }
+        if !vectors.iter().all(|x| x.is_finite()) {
             return Err(Error::Invalid("vector has a NaN or infinite component"));
         }
-        self.mutable().payloads.check(payload)?;
-        let bytes = match payload {
-            Value::Null => Vec::new(),
-            p => p.to_string().into_bytes(),
+        let nulls;
+        let payloads = if payloads.is_empty() {
+            nulls = vec![Value::Null; n];
+            &nulls
+        } else {
+            payloads
         };
-        self.log(&Record::Upsert {
-            id,
-            vector: vector.to_vec(),
-            payload: bytes,
-        })?;
-        self.apply_upsert(id, vector, payload)
+        let _w = self.writer()?;
+        {
+            let snap = self.snapshot();
+            let seg = read(&snap.segs[snap.segs.len() - 1].seg);
+            if seg.ids.len() + n > u32::MAX as usize {
+                return Err(index::Error::Full.into());
+            }
+            seg.payloads.check(payloads)?;
+        }
+        let records: Vec<Record> = ids
+            .iter()
+            .zip(vectors.chunks_exact(self.cfg.dim))
+            .zip(payloads)
+            .map(|((&id, v), p)| Record::Upsert {
+                id,
+                vector: v.to_vec(),
+                payload: match p {
+                    Value::Null => Vec::new(),
+                    p => p.to_string().into_bytes(),
+                },
+            })
+            .collect();
+        self.log(&records)?;
+        self.apply_upserts(ids, vectors, payloads)
     }
 
     /// Deletes `id`; returns whether it existed. Durable on return like
     /// `upsert` (a missing id writes nothing).
-    pub fn delete(&mut self, id: u64) -> Result<bool> {
-        if !self.live.contains_key(&id) {
-            return Ok(false);
+    pub fn delete(&self, id: u64) -> Result<bool> {
+        Ok(self.delete_batch(&[id])? == 1)
+    }
+
+    /// Deletes every live id in `ids` with one WAL sync; returns how many
+    /// existed.
+    pub fn delete_batch(&self, ids: &[u64]) -> Result<usize> {
+        let _w = self.writer()?;
+        let doomed: Vec<u64> = {
+            let live = read(&self.live);
+            let mut seen = HashSet::new();
+            ids.iter()
+                .copied()
+                .filter(|id| live.contains_key(id) && seen.insert(*id))
+                .collect()
+        };
+        if doomed.is_empty() {
+            return Ok(0);
         }
-        self.log(&Record::Delete { id })?;
-        self.apply_delete(id);
-        Ok(true)
+        let records: Vec<_> = doomed.iter().map(|&id| Record::Delete { id }).collect();
+        self.log(&records)?;
+        self.apply_deletes(&doomed);
+        Ok(doomed.len())
     }
 
     /// The vector (in stored form: unit length for cosine) and payload of
     /// `id`. A payload with no fields reads back as null.
-    pub fn get(&self, id: u64) -> Option<(&[f32], Value)> {
-        let &(s, row) = self.live.get(&id)?;
-        let seg = &self.segs[s as usize];
-        let d = self.cfg.dim;
-        let r = row as usize;
-        let v = seg.index.vectors().get(r * d..(r + 1) * d)?;
-        Some((v, seg.payloads.get(row).map_or(Value::Null, Value::Object)))
+    pub fn get(&self, id: u64) -> Option<(Vec<f32>, Value)> {
+        let live = read(&self.live);
+        let &(s, row) = live.get(&id)?;
+        let snap = self.snapshot();
+        let seg = read(&snap.segs[s as usize].seg);
+        Some((self.vector(&seg, row)?, payload(&seg, row)))
     }
 
     /// Live ids.
     pub fn len(&self) -> usize {
-        self.live.len()
+        read(&self.live).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty()
+        self.len() == 0
     }
 
-    /// The `k` nearest live ids matching `filter`, nearest first, with
-    /// their distances.
-    pub fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-        filter: Option<&Filter>,
-    ) -> Result<Vec<(u64, f32)>> {
+    /// The `k` nearest live ids matching `opts.filter`, nearest first.
+    pub fn search(&self, query: &[f32], k: usize, opts: &SearchOptions) -> Result<Vec<Match>> {
         self.check_dim(query)?;
-        let mut hits = Vec::new();
-        for seg in &self.segs {
-            let n = seg.ids.len() as u32;
-            let allowed = match filter {
-                Some(f) => Some(evaluate(f, &seg.payloads, n)? - &seg.dead),
-                None if !seg.dead.is_empty() => {
+        let snap = self.snapshot();
+        let mut hits = Vec::new(); // (dist, segment, row)
+        for (s, view) in snap.segs.iter().enumerate() {
+            let n = view.rows;
+            if n == 0 {
+                continue;
+            }
+            let seg = read(&view.seg);
+            let allowed = match opts.filter {
+                Some(f) => Some(evaluate(f, &seg.payloads, n)? - &*view.dead),
+                None if !view.dead.is_empty() || seg.ids.len() > n as usize => {
                     let mut all = RoaringBitmap::new();
                     all.insert_range(0..n);
-                    Some(all - &seg.dead)
+                    Some(all - &*view.dead)
                 }
                 None => None,
             };
-            if n == 0 || allowed.as_ref().is_some_and(RoaringBitmap::is_empty) {
+            if allowed.as_ref().is_some_and(RoaringBitmap::is_empty) {
                 continue;
             }
-            let params = SearchParams {
+            let mut params = SearchParams {
                 filter: allowed.as_ref(),
                 ..SearchParams::default()
             };
+            params.ef = opts.ef.unwrap_or(params.ef);
             // The re-check guards against an index that ignores the filter:
             // it may then return fewer than k, but never a dead row.
             for h in seg.index.search(query, k, &params)? {
                 if allowed.as_ref().is_none_or(|a| a.contains(h.id)) {
-                    hits.push((seg.ids[h.id as usize], h.dist));
+                    hits.push((h.dist, s, h.id));
                 }
             }
         }
         // ponytail: sequential fan-out; Phase 6.4 parallelizes it.
-        hits.sort_by(|a, b| a.1.total_cmp(&b.1));
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
         hits.truncate(k);
-        Ok(hits)
+        Ok(hits
+            .into_iter()
+            .map(|(dist, s, row)| {
+                let seg = read(&snap.segs[s].seg);
+                Match {
+                    id: seg.ids[row as usize],
+                    dist,
+                    payload: opts.with_payload.then(|| payload(&seg, row)),
+                    vector: opts.with_vector.then(|| self.vector(&seg, row)).flatten(),
+                }
+            })
+            .collect())
     }
 
     /// Writes the mutable segment to disk and truncates the WAL behind it.
     /// Crash-safe at every step: segment files are written first, the new
-    /// manifest is the commit point, and covered WAL files go last.
-    pub fn seal(&mut self) -> Result<()> {
+    /// manifest is the commit point, and covered WAL files go last. Writes
+    /// wait for it; searches don't.
+    pub fn seal(&self) -> Result<()> {
+        let mut w = self.writer()?;
         let last = self.wal.next_lsn() - 1;
-        if last == self.covered {
+        if last == w.covered {
             return Ok(());
         }
         // Syncs the old file and starts LSN last + 1 in a new one, so the
         // files to drop later hold exactly the LSNs <= last.
         self.wal.rotate()?;
         crash_point(1)?;
-        let m = self.segs.len() - 1;
-        let has_rows = !self.segs[m].ids.is_empty();
+        let snap = self.snapshot();
+        let m = snap.segs.len() - 1;
+        let has_rows = snap.segs[m].rows > 0;
         if has_rows {
-            self.write_segment(&self.segs[m], last)?;
+            self.write_segment(&read(&snap.segs[m].seg), last)?;
         }
         crash_point(2)?;
-        let sealed = &self.segs[..m + usize::from(has_rows)];
-        let entries: Vec<_> = sealed
+        let entries: Vec<_> = snap.segs[..m + usize::from(has_rows)]
             .iter()
-            .map(|s| (if s.lsn == 0 { last } else { s.lsn }, &s.dead))
+            .map(|v| (if v.lsn == 0 { last } else { v.lsn }, &*v.dead))
             .collect();
         let path = self.dir.join(MANIFEST);
         framed::write(
@@ -312,28 +529,38 @@ impl Collection {
         )
         .map_err(|e| Error::File(path, e))?;
         crash_point(3)?;
-        self.covered = last;
+        w.covered = last;
         if has_rows {
-            self.segs[m].lsn = last;
-            let fresh = self.new_mutable();
-            self.segs.push(fresh);
+            let mut next = (*snap).clone();
+            next.segs[m].lsn = last;
+            next.segs.push(new_mutable(&self.cfg));
+            *write(&self.snap) = Arc::new(next);
         }
         self.wal.remove_before(last + 1)?;
         Ok(())
     }
 
-    fn mutable(&self) -> &Seg {
-        &self.segs[self.segs.len() - 1]
+    /// Waits for the write in flight, then fails every later one with
+    /// `Closed` (`Db` calls it before deleting the directory).
+    pub fn close(&self) {
+        lock(&self.writer).closed = true;
     }
 
-    fn new_mutable(&self) -> Seg {
-        Seg {
-            lsn: 0,
-            index: Hnsw::new(self.cfg.dim, self.cfg.metric, self.cfg.hnsw),
-            ids: Vec::new(),
-            payloads: PayloadStore::new(),
-            dead: RoaringBitmap::new(),
+    fn writer(&self) -> Result<MutexGuard<'_, Writer>> {
+        let w = lock(&self.writer);
+        if w.closed {
+            return Err(Error::Closed);
         }
+        Ok(w)
+    }
+
+    fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::clone(&read(&self.snap))
+    }
+
+    fn vector(&self, seg: &Seg, row: u32) -> Option<Vec<f32>> {
+        let (d, r) = (self.cfg.dim, row as usize);
+        Some(seg.index.vectors().get(r * d..(r + 1) * d)?.to_vec())
     }
 
     fn check_dim(&self, v: &[f32]) -> Result<()> {
@@ -347,33 +574,56 @@ impl Collection {
         Ok(())
     }
 
-    /// Appends to the WAL. Only a record rejected up front is a plain
-    /// failure; anything else may have reached the disk.
-    fn log(&self, r: &Record) -> Result<()> {
-        match self.wal.append(r) {
+    /// Appends to the WAL with one sync. Only a batch rejected up front is
+    /// a plain failure; anything else may have reached the disk.
+    fn log(&self, records: &[Record]) -> Result<()> {
+        match self.wal.append_batch(records) {
             Ok(_) => Ok(()),
             Err(e @ WalError::RecordTooLarge(_)) => Err(e.into()),
             Err(e) => Err(Error::Unknown(e)),
         }
     }
 
-    fn apply_upsert(&mut self, id: u64, vector: &[f32], payload: &Value) -> Result<()> {
-        let m = self.segs.len() - 1;
-        let seg = &mut self.segs[m];
-        let row = seg.ids.len() as u32;
-        seg.payloads.insert(row, payload)?;
-        seg.index.add(vector)?;
-        seg.ids.push(id);
-        if let Some((s, r)) = self.live.insert(id, (m as u32, row)) {
-            self.segs[s as usize].dead.insert(r);
+    /// Adds the rows to the mutable segment, then publishes them. The
+    /// caller is the writer (or `open`) and has validated the batch, so
+    /// nothing here fails in practice.
+    fn apply_upserts(&self, ids: &[u64], vectors: &[f32], payloads: &[Value]) -> Result<()> {
+        let snap = self.snapshot();
+        let m = snap.segs.len() - 1;
+        let start = snap.segs[m].rows;
+        let d = self.cfg.dim;
+        for (i, chunk) in ids.chunks(APPLY_CHUNK).enumerate() {
+            let first = i * APPLY_CHUNK;
+            let mut seg = write(&snap.segs[m].seg);
+            let rows = seg
+                .index
+                .add(&vectors[first * d..(first + chunk.len()) * d])?;
+            for (row, p) in rows.zip(&payloads[first..]) {
+                seg.payloads.insert(row, p)?;
+            }
+            seg.ids.extend_from_slice(chunk);
         }
+        let mut next = (*snap).clone();
+        let mut live = write(&self.live);
+        for (row, &id) in (start..).zip(ids) {
+            if let Some((s, r)) = live.insert(id, (m as u32, row)) {
+                Arc::make_mut(&mut next.segs[s as usize].dead).insert(r);
+            }
+        }
+        next.segs[m].rows = start + ids.len() as u32;
+        *write(&self.snap) = Arc::new(next);
         Ok(())
     }
 
-    fn apply_delete(&mut self, id: u64) {
-        if let Some((s, r)) = self.live.remove(&id) {
-            self.segs[s as usize].dead.insert(r);
+    fn apply_deletes(&self, ids: &[u64]) {
+        let mut next = (*self.snapshot()).clone();
+        let mut live = write(&self.live);
+        for id in ids {
+            if let Some((s, r)) = live.remove(id) {
+                Arc::make_mut(&mut next.segs[s as usize].dead).insert(r);
+            }
         }
+        *write(&self.snap) = Arc::new(next);
     }
 
     fn write_segment(&self, seg: &Seg, lsn: Lsn) -> Result<()> {
@@ -392,36 +642,66 @@ impl Collection {
         framed::write(&path, PAYLOADS_MAGIC, PAYLOADS_VERSION, &body)
             .map_err(|e| Error::File(path, e))
     }
+}
 
-    fn load_segment(&self, lsn: Lsn, dead: RoaringBitmap) -> Result<Seg> {
-        let path = file_path(&self.dir, lsn, "seg");
-        let s = Segment::open(&path).map_err(|e| Error::Segment(path.clone(), e))?;
-        if s.dim() != self.cfg.dim || s.metric() != self.cfg.metric.code() {
-            return Err(Error::Invalid(
-                "config dim/metric differ from the collection's",
-            ));
-        }
-        if s.blob_kind() != BlobKind::Hnsw {
-            return Err(corrupt(&path, "not an HNSW segment"));
-        }
-        let index = Hnsw::from_bytes(s.index_blob(), s.vectors().to_vec())?;
-        let ids = s.ids().to_vec();
-        if dead.max().is_some_and(|r| r as usize >= ids.len()) {
-            return Err(corrupt(&path, "manifest tombstones a row past the end"));
-        }
-        let path = file_path(&self.dir, lsn, "payloads");
-        let body = framed::read(&path, PAYLOADS_MAGIC, PAYLOADS_VERSION)
-            .map_err(|e| Error::File(path.clone(), e))?;
-        let payloads = decode_payloads(&body, ids.len() as u32)
-            .ok_or_else(|| corrupt(&path, "bad payloads"))?;
-        Ok(Seg {
-            lsn,
-            index,
-            ids,
-            payloads,
-            dead,
-        })
+fn new_mutable(cfg: &Config) -> View {
+    let seg = Seg {
+        index: Hnsw::new(cfg.dim, cfg.metric, cfg.hnsw),
+        ids: Vec::new(),
+        payloads: PayloadStore::with_schema(&cfg.schema),
+    };
+    View {
+        lsn: 0,
+        seg: Arc::new(RwLock::new(seg)),
+        rows: 0,
+        dead: Arc::default(),
     }
+}
+
+fn load_segment(dir: &Path, cfg: &Config, lsn: Lsn, dead: &RoaringBitmap) -> Result<Seg> {
+    let path = file_path(dir, lsn, "seg");
+    let s = Segment::open(&path).map_err(|e| Error::Segment(path.clone(), e))?;
+    if s.dim() != cfg.dim || s.metric() != cfg.metric.code() {
+        return Err(Error::Invalid(
+            "config dim/metric differ from the collection's",
+        ));
+    }
+    if s.blob_kind() != BlobKind::Hnsw {
+        return Err(corrupt(&path, "not an HNSW segment"));
+    }
+    let index = Hnsw::from_bytes(s.index_blob(), s.vectors().to_vec())?;
+    let ids = s.ids().to_vec();
+    if dead.max().is_some_and(|r| r as usize >= ids.len()) {
+        return Err(corrupt(&path, "manifest tombstones a row past the end"));
+    }
+    let path = file_path(dir, lsn, "payloads");
+    let body = framed::read(&path, PAYLOADS_MAGIC, PAYLOADS_VERSION)
+        .map_err(|e| Error::File(path.clone(), e))?;
+    let payloads = decode_payloads(&body, ids.len() as u32, &cfg.schema)
+        .ok_or_else(|| corrupt(&path, "bad payloads"))?;
+    Ok(Seg {
+        index,
+        ids,
+        payloads,
+    })
+}
+
+fn payload(seg: &Seg, row: u32) -> Value {
+    seg.payloads.get(row).map_or(Value::Null, Value::Object)
+}
+
+// Lock holders don't panic in practice; if one did, its state is no worse
+// than the panic left it, so keep serving rather than cascade.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn corrupt(path: &Path, what: &str) -> Error {
@@ -513,11 +793,11 @@ fn encode_payloads(store: &PayloadStore, rows: u32) -> Vec<u8> {
     out
 }
 
-fn decode_payloads(mut b: &[u8], rows: u32) -> Option<PayloadStore> {
+fn decode_payloads(mut b: &[u8], rows: u32, schema: &Schema) -> Option<PayloadStore> {
     if u32_at(&mut b)? != rows {
         return None;
     }
-    let mut store = PayloadStore::new();
+    let mut store = PayloadStore::with_schema(schema);
     for row in 0..rows {
         let len = u32_at(&mut b)? as usize;
         let json = take(&mut b, len)?;
@@ -596,7 +876,15 @@ mod tests {
                 ef_construction: 16,
                 seed: 1,
             },
+            schema: Schema::new(),
             sync: SyncPolicy::Batch,
+        }
+    }
+
+    fn opts(filter: Option<&Filter>) -> SearchOptions<'_> {
+        SearchOptions {
+            filter,
+            ..SearchOptions::default()
         }
     }
 
@@ -638,7 +926,8 @@ mod tests {
     /// Rows across all segments, dead or alive: replaying a covered
     /// record twice would add one.
     fn rows(c: &Collection) -> usize {
-        c.segs.iter().map(|s| s.ids.len()).sum()
+        let snap = c.snapshot();
+        snap.segs.iter().map(|v| read(&v.seg).ids.len()).sum()
     }
 
     /// Ops 0..n: mostly upserts over ids 0..40, every 5th a delete.
@@ -670,16 +959,16 @@ mod tests {
         assert!(!c.delete(1_000).unwrap());
 
         let (&id, &ver) = model.iter().next().unwrap();
-        let hits = c.search(&vec_for(id, ver), 5, None).unwrap();
-        assert_eq!(hits[0], (id, 0.0));
-        let all = c.search(&vec_for(0, 0), 100, None).unwrap();
-        assert!(all.iter().all(|(id, _)| model.contains_key(id)));
+        let hits = c.search(&vec_for(id, ver), 5, &opts(None)).unwrap();
+        assert_eq!((hits[0].id, hits[0].dist), (id, 0.0));
+        let all = c.search(&vec_for(0, 0), 100, &opts(None)).unwrap();
+        assert!(all.iter().all(|m| model.contains_key(&m.id)));
         let red: Filter = serde_json::from_value(json!({"eq": {"color": "red"}})).unwrap();
-        let hits = c.search(&vec_for(0, 0), 100, Some(&red)).unwrap();
+        let hits = c.search(&vec_for(0, 0), 100, &opts(Some(&red))).unwrap();
         assert!(!hits.is_empty());
         assert!(
             hits.iter()
-                .all(|(id, _)| model.contains_key(id) && id % 2 == 0)
+                .all(|m| model.contains_key(&m.id) && m.id % 2 == 0)
         );
 
         let (before, logged) = (rows(&c), c.wal.next_lsn() - 1);
@@ -708,7 +997,7 @@ mod tests {
         c.seal().unwrap();
         run(&mut c, &mut model, 90..100); // left in the WAL
         check(&c, &model);
-        let (before, unsealed) = (rows(&c), c.wal.next_lsn() - 1 - c.covered);
+        let (before, unsealed) = (rows(&c), c.wal.next_lsn() - 1 - lock(&c.writer).covered);
         let wal_files = fs::read_dir(d.0.join("wal")).unwrap().count();
         assert_eq!(wal_files, 1, "sealed WAL files are dropped");
         drop(c);
@@ -760,7 +1049,7 @@ mod tests {
         let mut model = Model::new();
         run(&mut c, &mut model, 0..10);
         c.seal().unwrap();
-        let lsn = format!("{:020}", c.covered);
+        let lsn = format!("{:020}", lock(&c.writer).covered);
         drop(c);
         for name in [
             "MANIFEST.tmp",
@@ -816,6 +1105,86 @@ mod tests {
 
     fn open_err(d: &TempDir) -> Error {
         Collection::open(&d.0, cfg()).err().unwrap()
+    }
+
+    #[test]
+    fn batches_are_checked_whole_and_replayed_in_order() {
+        let d = TempDir::new("batch");
+        let c = open(&d);
+        let vecs: Vec<f32> = [1, 2, 1].iter().flat_map(|&i| vec_for(i, i)).collect();
+        // The third payload conflicts with the first: nothing is written.
+        let bad = [json!({"n": 1}), Value::Null, json!({"n": "x"})];
+        let e = c.upsert_batch(&[1, 2, 1], &vecs, &bad);
+        assert!(matches!(e, Err(Error::Payload(_))));
+        assert!(c.upsert_batch(&[1, 2], &vecs, &[]).is_err()); // short ids
+        assert_eq!((c.len(), c.wal.next_lsn()), (0, 1));
+        let good = [json!({"n": 1}), Value::Null, json!({"n": 3})];
+        c.upsert_batch(&[1, 2, 1], &vecs, &good).unwrap();
+        assert_eq!(c.wal.next_lsn(), 4);
+        assert_eq!(c.get(1).unwrap(), (vec_for(1, 1), json!({"n": 3})));
+        assert_eq!(c.delete_batch(&[1, 1, 9]).unwrap(), 1);
+        assert_eq!(c.upsert_batch(&[], &[], &[]).ok(), Some(()));
+        drop(c);
+        let (c, rep) = Collection::open(&d.0, cfg()).unwrap();
+        assert_eq!(rep.replayed, 4);
+        assert_eq!(rows(&c), 3);
+        assert!(c.get(1).is_none());
+        assert_eq!(c.get(2).unwrap(), (vec_for(2, 2), Value::Null));
+    }
+
+    /// One writer upserting, replacing, deleting and sealing while readers
+    /// search: a delete acknowledged before a search started is never in
+    /// its results, and no id appears twice.
+    #[test]
+    fn readers_never_see_acknowledged_deletes() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let d = TempDir::new("concurrent");
+        let c = open(&d);
+        // id → sequence number of its delete's ack (ids never come back).
+        let deleted = RwLock::new(HashMap::<u64, u64>::new());
+        let (acks, done) = (AtomicU64::new(0), AtomicBool::new(false));
+        std::thread::scope(|s| {
+            for r in 0..3u64 {
+                let (c, deleted, acks, done) = (&c, &deleted, &acks, &done);
+                s.spawn(move || {
+                    let mut searches = 0;
+                    while !done.load(Ordering::SeqCst) || searches < 10 {
+                        let seen = acks.load(Ordering::SeqCst);
+                        let q = vec_for(r * 11 + searches, 0);
+                        let hits = c.search(&q, 20, &opts(None)).unwrap();
+                        let dead = read(deleted);
+                        let mut ids = HashSet::new();
+                        for m in &hits {
+                            assert!(ids.insert(m.id), "id {} twice", m.id);
+                            if let Some(&at) = dead.get(&m.id) {
+                                assert!(at > seen, "id {} deleted at {at}, search at {seen}", m.id);
+                            }
+                        }
+                        searches += 1;
+                    }
+                });
+            }
+            for round in 0..60u64 {
+                let ids: Vec<u64> = (round * 50..round * 50 + 50).collect();
+                let vecs: Vec<f32> = ids.iter().flat_map(|&i| vec_for(i, round)).collect();
+                c.upsert_batch(&ids, &vecs, &[]).unwrap();
+                // Replace some earlier live ids (odd), delete others (even).
+                let old: Vec<u64> = (0..round * 50).filter(|i| i % 7 == round % 7).collect();
+                let (gone, keep): (Vec<u64>, Vec<u64>) = old.iter().partition(|&&i| i % 2 == 0);
+                let vecs: Vec<f32> = keep.iter().flat_map(|&i| vec_for(i, round + 1)).collect();
+                c.upsert_batch(&keep, &vecs, &[]).unwrap();
+                c.delete_batch(&gone).unwrap();
+                let at = acks.fetch_add(1, Ordering::SeqCst) + 1;
+                write(&deleted).extend(gone.iter().map(|&i| (i, at)));
+                if round % 20 == 19 {
+                    c.seal().unwrap();
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let live = c.len();
+        drop(c);
+        assert_eq!(open(&d).len(), live);
     }
 
     #[test]
@@ -881,10 +1250,10 @@ mod tests {
         let fixture: &[u8] = include_bytes!("../testdata/payloads-v1");
         assert_eq!(fs::read(&p).unwrap(), fixture);
         let body = framed::read(&p, PAYLOADS_MAGIC, PAYLOADS_VERSION).unwrap();
-        let back = decode_payloads(&body, 3).unwrap();
+        let back = decode_payloads(&body, 3, &Schema::new()).unwrap();
         for (r, v) in rows.iter().enumerate() {
             assert_eq!(back.get(r as u32), v.as_object().cloned());
         }
-        assert!(decode_payloads(&body, 4).is_none());
+        assert!(decode_payloads(&body, 4, &Schema::new()).is_none());
     }
 }
