@@ -35,7 +35,7 @@ ANN cores are hand-written. Decisions layered on top of that
 - [ ] 1.3 `tools/fetch-dataset.sh` (curl + tar) for SIFT10K (siftsmall)
       and SIFT1M into ~/data/Nearpoint/; checks `df -h` first, resumable
       (`curl -C -`), verifies sizes after extraction.
-- [ ] 1.4 Scalar L2, inner product, cosine (f32), plus int8 L2/dot. Scalar
+- [x] 1.4 Scalar L2, inner product, cosine (f32), plus int8 L2/dot. Scalar
       references are plain sequential loops (no manual unrolling), so they
       are the honest baseline for the NEON speedup.
 - [ ] 1.5 NEON versions via `std::arch::aarch64`, selected with

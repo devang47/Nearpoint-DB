@@ -15,6 +15,20 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Scalar distance kernels (task 1.4)
+- **What:** `crates/kernels/src/scalar.rs`: `l2_sq`, `dot`, `cosine_distance`
+  (f32) and `l2_sq_i8` → `u32`, `dot_i8` → `i32`. Plain sequential loops;
+  panic on length mismatch; cosine with a zero vector is defined as 1.
+- **Why:** task 1.4. They're the reference the NEON kernels (1.5) are
+  proptested against and the baseline for the ≥4× speedup target. The int8
+  return types are exact up to dim 65,536 (tested at the extremes).
+
+## 2026-10-28 — Dataset downloader (task 1.3, in progress)
+- **What:** `tools/fetch-dataset.sh siftsmall|sift1m` (curl + tar, resumable,
+  checks every file's size); `#[ignore]`d test loading the real siftsmall.
+- **Why:** task 1.3. The texmex FTP mirror runs at ~30 KB/s, so SIFT1M takes
+  over an hour; the task is ticked once it lands and verifies.
+
 ## 2026-10-28 — Dataset loaders (task 1.2)
 - **What:** `crates/bench` gains a library with `dataset::{read_xvecs,
   read_bin, read_bin_ground_truth}` reading texmex and big-ann files straight
