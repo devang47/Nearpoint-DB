@@ -316,9 +316,12 @@ fn writer(st: &State, w: u64) {
         if !doomed.is_empty() {
             match http.json("POST", &st.path("/points/delete"), &json!({"ids": doomed})) {
                 Ok(_) => {
-                    let at = st.acks.fetch_add(1, SeqCst) + 1;
+                    // Bump `acks` under the map's lock, so a reader that saw
+                    // the new count also sees these ids when it checks.
                     let mut d = st.deleted.write().unwrap_or_else(|e| e.into_inner());
+                    let at = st.acks.fetch_add(1, SeqCst) + 1;
                     d.extend(doomed.iter().map(|&id| (id, at)));
+                    drop(d);
                     st.count("delete");
                 }
                 // Unknown outcome: don't count these ids as deleted.
