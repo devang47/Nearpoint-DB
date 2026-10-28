@@ -6,8 +6,10 @@ index: durable writes (WAL), CRUD, metadata filtering, an HTTP API, and
 concurrent reads and writes.
 
 > **Status:** Phases 1–2 done (kernels, benchmark harness, flat and HNSW
-> indexes). HNSW on SIFT1M: recall@10 0.963 at 0.106 ms p50, built in 44 s.
-> No server or persistence yet; Phase 3 (durability) is next. Progress is
+> indexes; HNSW on SIFT1M: recall@10 0.96 at 0.11 ms p50, built in 44 s).
+> Building blocks for later phases are in: write-ahead log, segment file
+> format, k-means/PQ/int8 quantization, payload store and filters. Not yet
+> wired into a server; recovery (3.3) is next. Progress is
 > in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Targets

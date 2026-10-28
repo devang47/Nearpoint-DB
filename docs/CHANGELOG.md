@@ -15,6 +15,64 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Parallel round: WAL, segments, quantization, filters
+- **What:** four independent tasks built in parallel worktrees and merged:
+  3.1 WAL, 3.2 segment format + index serialization, 5.1–5.3 quantization,
+  7.1–7.2 payloads + filters (entries below). Then, on a quiet machine:
+  WAL sync latency and a new group-commit throughput test, a re-run of the
+  SIFT1M quantization check, and an HNSW regression run. ADRs 0006 (segment
+  v1) and 0007 (WAL poisoning) written from the agents' drafts; formats
+  index updated.
+- **Why:** these tasks touch disjoint crates/modules, so running them
+  side by side saved wall-clock time. Timings were taken only after the
+  merge, so no number was measured while four builds shared the CPU.
+
+## 2026-10-28 — Write-ahead log v1 (task 3.1)
+- **What:** `storage::wal`: directory of LSN-named segment files; records
+  (Upsert with opaque payload, Delete) with a 17-byte header (crc, len, kind,
+  lsn) and CRC32 over everything but the crc; versioned file header
+  (`NPNT_WAL`, v1, CRC) published atomically via tmp+rename+dir fsync;
+  sync policies Always / Batch (group commit, default) / Interval; torn-tail
+  recovery that truncates at the first bad record and drops later files;
+  `rotate`/`remove_before`; `failpoints` feature for crash tests. Format in
+  docs/formats/wal.md.
+- **Why:** Phase 3 durability: acknowledged writes must survive a crash.
+  Verified that Rust 1.98 std's `sync_data` already issues `F_FULLFSYNC` on
+  macOS, so no libc call is needed.
+
+## 2026-10-28 — Segment file format v1 and HNSW/Flat serialization (task 3.2)
+- **What:** `storage::segment`: versioned, little-endian segment file (64 B
+  header; vectors, ids and index blob at 64-byte-aligned offsets; 96 B footer
+  with per-section CRC32s, section table, footer CRC, trailing magic), atomic
+  publish (tmp, sync_data, rename, dir fsync), and `Segment::open` that mmaps,
+  checks every CRC and the padding, and reads vectors and ids in place.
+  `Hnsw`/`Flat` `to_bytes`/`from_bytes` with their own blob version and full
+  validation on load. A committed v1 fixture, tests covering every bit flip
+  and truncation, a proptest that corrupt blobs never panic, and an HNSW →
+  segment → reopen → identical-search test. Docs in docs/formats/segment.md.
+- **Why:** Phases 3 and 6 need sealed segments that survive restarts and
+  that a reader can trust: damage gives a typed error, never a panic or an
+  out-of-bounds read.
+
+## 2026-10-28 — k-means, product quantization, int8 scalar quantization (tasks 5.1–5.3)
+- **What:** `quant` crate: Lloyd's k-means with k-means++ seeding (rayon,
+  sampled training, early stop, empty clusters re-seeded from the farthest
+  points, bit-identical at any thread count); 8-bit PQ with batch encode,
+  decode and ADC distance tables; int8 SQ (per-dim offset, shared scale)
+  ranked with `kernels::l2_sq_i8`. An ignored SIFT1M quality test. ADR 0004.
+- **Why:** building blocks for IVF-PQ + re-rank (Phase 5). The numbers show
+  ADC alone can't reach 0.9 recall, but PQ candidates plus a re-rank can.
+
+## 2026-10-28 — Payload store and filter expressions (tasks 7.1–7.2)
+- **What:** `crates/engine`: `payload::PayloadStore` (one typed column per
+  field; dictionary-encoded keywords with a bitmap of rows per term; dense
+  numeric columns plus presence bitmaps), `filter::Filter` (eq/in/range/
+  exists/and/or/not, serde JSON shape) and `evaluate` → `RoaringBitmap`, plus
+  `selectivity`. Docs in `docs/filters.md`, ADR 0005.
+- **Why:** Phase 7 metadata filtering. The bitmap is what 7.3 (filtered
+  HNSW/IVF) and 7.4 (brute-force planner) consume. A proptest checks
+  `evaluate` against a row-by-row reference evaluator.
+
 ## 2026-10-28 — Index trait, flat, HNSW, sweeps; Phase 2 accepted (2.1–2.4)
 - **What:** `crates/index`: `Index` trait (`add`/`search`, three metrics),
   rayon-parallel `Flat`, and `Hnsw` (parallel build, selection heuristic,

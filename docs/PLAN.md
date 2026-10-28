@@ -69,13 +69,15 @@ single-threaded query; build ≤ 10 min.
 p50 0.106 ms; build 44.4 s on 10 threads.
 
 ## Phase 3: Durability
-- [ ] 3.1 WAL: length-prefixed records (upsert/delete), CRC32 per record,
+- [x] 3.1 WAL: length-prefixed records (upsert/delete), CRC32 per record,
       configurable fsync policy (every write / batched / interval). On
       macOS plain `fsync` doesn't reach stable storage; std's `sync_data`
-      issues `F_FULLFSYNC` (verify, and measure its latency; it's
-      milliseconds). Batched group commit is the default.
-- [ ] 3.2 Segment file format v1: header, vectors, ids, index blob,
+      issues `F_FULLFSYNC` (verified: both `sync_data` and `sync_all` do;
+      ~4 ms each on the M4). Batched group commit is the default. Any I/O
+      failure poisons the WAL (ADR 0007). Format: docs/formats/wal.md.
+- [x] 3.2 Segment file format v1: header, vectors, ids, index blob,
       footer with checksums. Document in docs/formats/segment.md.
+      Plus `Hnsw`/`Flat` `to_bytes`/`from_bytes` for the index blob (ADR 0006).
 - [ ] 3.3 Recovery: on startup, load sealed segments, replay WAL,
       truncate torn tail records.
 - [ ] 3.4 Crash tests, two layers: (a) hand-rolled fail points behind a
@@ -106,9 +108,12 @@ many segments.
 no errors; deleted ids never appear in results.
 
 ## Phase 5: Quantization and IVF-PQ
-- [ ] 5.1 k-means (k-means++ init, multithreaded, trains on a sample).
-- [ ] 5.2 Product quantization (m subquantizers, 8-bit codes); OPQ optional.
-- [ ] 5.3 Scalar quantization (int8) for full-vector storage at lower cost.
+- [x] 5.1 k-means (k-means++ init, multithreaded, trains on a sample).
+- [x] 5.2 Product quantization (m subquantizers, 8-bit codes); OPQ optional.
+- [x] 5.3 Scalar quantization (int8) for full-vector storage at lower cost.
+      Quality on SIFT1M (ADR 0004, RESULTS.md): PQ ADC alone tops out at
+      0.53 (m=16) / 0.73 (m=32) recall@10, so 5.4 must re-rank. PQ m=16 +
+      top-1000 + SQ int8 re-rank reaches 0.98.
 - [ ] 5.4 IVF-PQ index: coarse quantizer, inverted lists, ADC with
       lookup tables, nprobe parameter.
 - [ ] 5.5 4-bit fast-scan PQ kernel with NEON table lookups (`vqtbl1q_u8`).
@@ -126,8 +131,9 @@ no errors; deleted ids never appear in results.
 and p99 latency stay within 10% of the start.
 
 ## Phase 7: Metadata filtering
-- [ ] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).
-- [ ] 7.2 Filter expressions (eq, in, range, and/or/not) → roaring bitmaps.
+- [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).
+- [x] 7.2 Filter expressions (eq, in, range, and/or/not) → roaring bitmaps.
+      JSON shape and semantics in docs/filters.md (ADR 0005).
 - [ ] 7.3 Filter applied during graph traversal and IVF scanning.
 - [ ] 7.4 Planner: brute-force over the bitmap when selectivity is very low.
 **Acceptance:** recall@10 ≥ 0.9 at filter selectivity 1%, 10%, and 50%.
