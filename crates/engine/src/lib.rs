@@ -1,5 +1,6 @@
 //! Collections, segments, compaction, deletes and filters.
 
+pub mod collection;
 pub mod filter;
 pub mod payload;
 

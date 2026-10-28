@@ -505,7 +505,10 @@ mod tests {
     fn recall(h: &Hnsw, f: &Flat, dim: usize, ef: usize) -> f64 {
         let (queries, k) = (100, 10);
         let qs = test_data::vectors(queries, dim, 99);
-        let p = SearchParams { ef };
+        let p = SearchParams {
+            ef,
+            ..SearchParams::default()
+        };
         let mut hits = 0;
         for q in qs.chunks_exact(dim) {
             let truth: Vec<u32> = f.search(q, k, &p).unwrap().iter().map(|h| h.id).collect();
@@ -570,7 +573,10 @@ mod tests {
     }
 
     fn search_all(h: &Hnsw, dim: usize) -> Vec<Vec<Hit>> {
-        let p = SearchParams { ef: 48 };
+        let p = SearchParams {
+            ef: 48,
+            ..SearchParams::default()
+        };
         test_data::vectors(300, dim, 5)
             .chunks_exact(dim)
             .map(|q| h.search(q, 10, &p).unwrap())
@@ -698,7 +704,10 @@ mod tests {
             if let Ok(h) = Hnsw::from_bytes(&b, vecs.clone()) {
                 // Whatever loads must be searchable without panicking.
                 for q in test_data::vectors(5, 4, 3).as_chunks::<4>().0 {
-                    let _ = h.search(q, 10, &SearchParams { ef: 32 });
+                    let _ = h.search(q, 10, &SearchParams {
+                        ef: 32,
+                        ..SearchParams::default()
+                    });
                 }
             }
         }

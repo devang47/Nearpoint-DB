@@ -212,7 +212,10 @@ fn run_queries(
     k: usize,
     ef: usize,
 ) -> Result<Run> {
-    let params = SearchParams { ef };
+    let params = SearchParams {
+        ef,
+        ..SearchParams::default()
+    };
     let mut latencies = Vec::with_capacity(query.len());
     // Two recalls. `id_hits`: result ids found in the ground-truth top-k.
     // `tie_hits`: results whose true distance is <= the k-th ground-truth

@@ -7,13 +7,17 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::Range;
 
+use roaring::RoaringBitmap;
+
 mod blob;
 pub mod flat;
 pub mod hnsw;
+pub mod ivfpq;
 mod visited;
 
 pub use flat::Flat;
 pub use hnsw::Hnsw;
+pub use ivfpq::IvfPq;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {
@@ -104,15 +108,27 @@ impl PartialOrd for Hit {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SearchParams {
+pub struct SearchParams<'a> {
     /// HNSW candidate-list size (`ef_search`); raised to `k` if smaller.
     /// Ignored by exact indexes.
     pub ef: usize,
+    /// IVF lists probed per query. Ignored by other indexes.
+    pub nprobe: usize,
+    /// IVF-PQ candidates re-ranked with finer vectors (0 = no re-rank).
+    /// Ignored by other indexes.
+    pub rerank: usize,
+    /// Only ids in this set may be returned (`None` = all ids).
+    pub filter: Option<&'a RoaringBitmap>,
 }
 
-impl Default for SearchParams {
+impl Default for SearchParams<'_> {
     fn default() -> Self {
-        SearchParams { ef: 64 }
+        SearchParams {
+            ef: 64,
+            nprobe: 16,
+            rerank: 0,
+            filter: None,
+        }
     }
 }
 
