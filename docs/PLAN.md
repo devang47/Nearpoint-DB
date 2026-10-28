@@ -10,8 +10,9 @@ ANN cores are hand-written. Decisions layered on top of that
 - Kernels dispatch at **compile time**: NEON is baseline on aarch64 and
   `.cargo/config.toml` builds with `target-cpu=native`, so `dotprod`/`fp16`
   are `cfg(target_feature)` checks, not runtime detection.
-- `libc` (storage + bench only) for what std lacks: `F_NOCACHE`,
-  `proc_pid_rusage` (phys_footprint), `getrusage`.
+- `libc` (storage only, since it needs `unsafe`) for what std lacks:
+  `F_NOCACHE`, `proc_pid_rusage` (phys_footprint), `getrusage`. Bench gets
+  memory numbers through `storage::sys`.
 - No HTTP client crate: tools shell out to the system `curl` (handles the
   texmex FTP mirror and HTTP range requests) and `tar`.
 - JSON API plus one raw-binary bulk-upsert path; config via clap flags +
@@ -44,11 +45,14 @@ ANN cores are hand-written. Decisions layered on top of that
       behind `cfg(target_feature = "dotprod")`. Proptest vs scalar
       (tolerance 1e-4 relative for f32; exact for int8).
 - [x] 1.6 Criterion benches for all kernels at dims 96, 128, 768.
-- [ ] 1.7 Bench harness: recall@k vs ground truth, p50/p95/p99 latency,
+- [x] 1.7 Bench harness: recall@k vs ground truth, p50/p95/p99 latency,
       QPS, peak RSS and peak phys_footprint. Fixed RNG seeds, recorded in
-      every result row.
+      every result row (from the first randomized index on). Recall is
+      tie-aware, with id-match reported beside it (ADR 0002).
 **Acceptance:** brute force on SIFT1M matches ground truth exactly
 (recall@10 = 1.0); NEON ≥4× faster than scalar at dim 128.
+**Status (2026-10-28): met.** Tie-aware recall@10 = 1.0000 (id match
+0.9994, all ties); NEON f32 L2 4.4× scalar at dim 128.
 
 ## Phase 2: In-memory indexes
 - [ ] 2.1 `Index` trait: build, insert, search(query, k, params) → ids + distances.

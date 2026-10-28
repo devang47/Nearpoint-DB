@@ -15,6 +15,16 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Bench harness; Phase 1 accepted (task 1.7)
+- **What:** `bench` binary (`--dataset siftsmall|sift1m --index flat --k
+  --queries`): recall@k (tie-aware + id match), p50/p95/p99, single-thread
+  QPS, peak RSS and phys_footprint. `index::flat::search` (exact top-k heap),
+  `storage::sys::peak_memory`. libc narrowed to `storage` only (needs
+  `unsafe`; ADR 0001 amended). ADR 0002 for the recall definition.
+- **Why:** task 1.7 and Phase 1 acceptance. SIFT1M brute force: recall@10
+  1.0000 tie-aware, 0.9994 by id match; every mismatch is an equal-distance
+  tie (ADR 0002). Results in `docs/RESULTS.md`.
+
 ## 2026-10-28 — Kernel benchmarks (task 1.6)
 - **What:** `crates/kernels/benches/kernels.rs` (criterion): scalar vs NEON for
   all five kernels at dims 96/128/768. First numbers in `docs/RESULTS.md`.

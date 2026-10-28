@@ -43,8 +43,8 @@ The roadmap lives in `docs/PLAN.md`. Always check it before starting work.
 - Core algorithms are written by hand. Do NOT add ANN/vector-search crates
   (no hnsw_rs, faiss bindings, usearch, etc.).
 - Allowed dependencies: tokio, axum, serde, serde_json, memmap2, rayon,
-  roaring, crc32fast, bytemuck, rand, thiserror, tracing, clap;
-  `libc` only in `storage` and `bench`; anyhow and tracing-subscriber
+  roaring, crc32fast, bytemuck, rand, thiserror, tracing;
+  `libc` only in `storage`; anyhow, clap and tracing-subscriber
   only in binaries; criterion and proptest as dev-dependencies.
   Versions live in the root `Cargo.toml` `[workspace.dependencies]`;
   crates use `dep.workspace = true`. Ask before adding anything else.

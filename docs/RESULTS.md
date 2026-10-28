@@ -3,8 +3,20 @@
 Measured numbers only, release builds on the Mac mini, newest first.
 Missed targets are recorded as missed. Never tune the benchmark to hide one.
 
+recall@10 is tie-aware (a hit is a result whose true distance is <= the
+10th ground-truth distance; `docs/adr/0002-tie-aware-recall.md`); the
+id-match figure is always recorded beside it. Warm cache unless noted.
+
 | Date | Task | Dataset | Index + params | Seed | recall@10 | p50 | p99 | QPS | Peak RSS | Peak phys_footprint | Disk | Build time | Commit |
 |------|------|---------|----------------|------|-----------|-----|-----|-----|----------|---------------------|------|------------|--------|
+| 2026-10-28 | 1.7 | SIFT1M (1M base, 10k queries) | flat, exact, 1 thread | – | **1.0000** (id match 0.9994) | 7.82 ms | 9.39 ms | 126.7 | 499 MiB | 499 MiB | – | – | 8c51523 |
+| 2026-10-28 | 1.7 | siftsmall (10k base, 100 queries) | flat, exact, 1 thread | – | 1.0000 (id match 1.0000) | 0.16 ms | 0.28 ms | 5686 | 7 MiB | 6 MiB | – | – | 8c51523 |
+
+- **2026-10-28 SIFT1M flat:** Phase 1 target "brute force matches ground
+  truth exactly" **met**. All 56 queries with an id mismatch return exactly
+  the ground truth's 10 distances; the two just break equal-distance ties
+  differently. Also validates the HF mirror (`qbo-odp/sift1m`): its base,
+  query and ground truth agree for all 10k queries. Mac mini M4, 16 GB.
 
 ## Kernel microbenchmarks
 

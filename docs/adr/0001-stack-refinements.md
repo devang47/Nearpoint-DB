@@ -8,9 +8,11 @@ the target machine (Apple Silicon Mac mini, macOS) turned up needs the
 list didn't cover, and some rules that review alone would enforce.
 
 ## Decision
-1. **`libc` allowed in `storage` and `bench`.** std has no `F_NOCACHE`
+1. **`libc` allowed in `storage` only.** std has no `F_NOCACHE`
    (cold-cache benches, 8.2), `proc_pid_rusage`/`getrusage` (peak memory,
-   1.7), or `madvise` beyond what memmap2 exposes.
+   1.7), or `madvise` beyond what memmap2 exposes. *Amended 2026-10-28:* first
+   drafted as `storage` + `bench`, but calling libc needs `unsafe`, which
+   `bench` may not use; bench reads memory through `storage::sys`.
 2. **No HTTP client crate.** `tools/` shells out to the system `curl`,
    which already speaks the texmex FTP mirror, HTTP range requests and
    resume (`-C -`). Billion mode (9.2) pipes `curl` into the builder's

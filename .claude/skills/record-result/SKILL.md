@@ -11,7 +11,8 @@ description: Run a Nearpoint benchmark (recall, latency, QPS, memory, disk) in r
    `cargo run --release -p bench -- --dataset sift1m --index hnsw`.
    Kernel microbenches: `cargo bench -p kernels`.
 3. **Collect** everything the RESULTS.md header asks for: date, task id,
-   dataset (with N), index + params, RNG seed, recall@10, p50/p99, QPS,
+   dataset (with N), index + params, RNG seed, recall@10 (tie-aware, with
+   the id-match figure beside it; the harness prints both), p50/p99, QPS,
    peak RSS **and** peak phys_footprint, disk used, build time, and
    `git rev-parse --short HEAD`. Unmeasured column → `n/m`, not a guess.
 4. **Cold vs warm.** Say which. Cold-cache runs use `F_NOCACHE` and

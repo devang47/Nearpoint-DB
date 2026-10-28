@@ -13,9 +13,9 @@ publish = false
 anyhow = "1"                                                 # binaries only
 axum = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
-clap = { version = "4.6", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }    # binaries only
 crc32fast = "1.5"
-libc = "0.2"                                                 # storage + bench only (ADR 0001)
+libc = "0.2"                                                 # storage only (ADR 0001)
 memmap2 = "0.9"
 rand = "0.10"
 rayon = "1.12"
