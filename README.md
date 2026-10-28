@@ -5,9 +5,10 @@ Silicon Mac mini (16 GB RAM, 256 GB SSD). It's a database, not just an
 index: durable writes (WAL), CRUD, metadata filtering, an HTTP API, and
 concurrent reads and writes.
 
-> **Status:** Phase 1, kernels and benchmark harness. The workspace is
-> scaffolded and nothing is usable yet. Progress is tracked in
-> [`docs/PLAN.md`](docs/PLAN.md).
+> **Status:** Phases 1–2 done (kernels, benchmark harness, flat and HNSW
+> indexes). HNSW on SIFT1M: recall@10 0.963 at 0.106 ms p50, built in 44 s.
+> No server or persistence yet; Phase 3 (durability) is next. Progress is
+> in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Targets
 
