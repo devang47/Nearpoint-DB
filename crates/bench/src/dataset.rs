@@ -335,4 +335,24 @@ mod tests {
         // Plain ids-only reader sees the trailing distances as a size mismatch.
         assert!(read_bin::<u32>(&f.0, None).is_err());
     }
+
+    #[test]
+    #[ignore = "needs ~/data/Nearpoint/siftsmall (tools/fetch-dataset.sh siftsmall)"]
+    fn real_siftsmall() {
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("data/Nearpoint/siftsmall");
+        let base = read_xvecs::<f32>(&dir.join("siftsmall_base.fvecs"), None).unwrap();
+        let query = read_xvecs::<f32>(&dir.join("siftsmall_query.fvecs"), None).unwrap();
+        let gt = read_xvecs::<i32>(&dir.join("siftsmall_groundtruth.ivecs"), None).unwrap();
+        assert_eq!((base.len(), base.dim()), (10_000, 128));
+        assert_eq!((query.len(), query.dim()), (100, 128));
+        assert_eq!((gt.len(), gt.dim()), (100, 100));
+        // SIFT components are integers in 0..=255 stored as f32; a decoding
+        // bug (offset, endianness) would break this immediately.
+        assert!(
+            base.as_flat()
+                .iter()
+                .all(|&x| x.fract() == 0.0 && (0.0..=255.0).contains(&x))
+        );
+        assert!(gt.as_flat().iter().all(|&id| (0..10_000).contains(&id)));
+    }
 }
