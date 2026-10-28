@@ -15,6 +15,16 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — NEON distance kernels (task 1.5)
+- **What:** `crates/kernels/src/neon.rs`: f32 L2/dot (16 floats per iteration,
+  4 accumulators) and cosine (via three `dot`s); int8 dot via SDOT and int8 L2
+  via SABD + UDOT. The crate root re-exports the best version for the build
+  (`cfg(target_arch)` / `cfg(target_feature = "dotprod")`); proptests against
+  `scalar` (f32 within 1e-4 of the sum's scale, int8 exact).
+- **Why:** task 1.5. Arithmetic intrinsics are safe inside
+  `#[target_feature]` functions on 1.98, so `unsafe` is limited to loads and
+  the one call into each such function.
+
 ## 2026-10-28 — Scalar distance kernels (task 1.4)
 - **What:** `crates/kernels/src/scalar.rs`: `l2_sq`, `dot`, `cosine_distance`
   (f32) and `l2_sq_i8` → `u32`, `dot_i8` → `i32`. Plain sequential loops;

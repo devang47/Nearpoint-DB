@@ -38,7 +38,7 @@ ANN cores are hand-written. Decisions layered on top of that
 - [x] 1.4 Scalar L2, inner product, cosine (f32), plus int8 L2/dot. Scalar
       references are plain sequential loops (no manual unrolling), so they
       are the honest baseline for the NEON speedup.
-- [ ] 1.5 NEON versions via `std::arch::aarch64`, selected with
+- [x] 1.5 NEON versions via `std::arch::aarch64`, selected with
       `cfg(target_arch)` (scalar on other arches); int8 dot via `SDOT`
       behind `cfg(target_feature = "dotprod")`. Proptest vs scalar
       (tolerance 1e-4 relative for f32; exact for int8).
