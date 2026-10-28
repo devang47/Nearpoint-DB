@@ -20,7 +20,7 @@ use storage::wal::WalError;
 /// Largest request body. A bulk upsert is decoded into vectors and WAL
 /// records next to the body, so peak memory is a few times this.
 pub const MAX_BODY: usize = 256 << 20;
-/// Largest `k` or `ef` a search accepts.
+/// Largest `k`, `ef`, `nprobe` or `rerank` a search accepts.
 pub const MAX_K: usize = 10_000;
 
 pub fn router(db: Arc<Db>) -> Router {
@@ -111,6 +111,12 @@ fn describe(name: &str, c: &Collection) -> Value {
     if let Value::Object(m) = &mut v {
         m.insert("name".into(), name.into());
         m.insert("points".into(), c.len().into());
+        let segs: Vec<Value> = c
+            .segments()
+            .iter()
+            .map(|s| json!({"index": s.index, "rows": s.rows, "dead": s.dead}))
+            .collect();
+        m.insert("segments".into(), segs.into());
     }
     v
 }
@@ -329,6 +335,8 @@ struct Search {
     #[serde(default = "default_k")]
     k: usize,
     ef: Option<usize>,
+    nprobe: Option<usize>,
+    rerank: Option<usize>,
     filter: Option<Filter>,
     #[serde(default)]
     with_payload: bool,
@@ -345,13 +353,18 @@ async fn search(
     Path(name): Path<String>,
     Json(req): Json<Search>,
 ) -> ApiResult<Json<Value>> {
-    if req.k > MAX_K || req.ef.is_some_and(|ef| ef > MAX_K) {
-        return Err(bad(format!("k and ef must be at most {MAX_K}")));
+    let knobs = [req.ef, req.nprobe, req.rerank];
+    if req.k > MAX_K || knobs.iter().flatten().any(|&x| x > MAX_K) {
+        return Err(bad(format!(
+            "k, ef, nprobe and rerank must be at most {MAX_K}"
+        )));
     }
     let c = collection(&db, &name)?;
     blocking(move || {
         let opts = SearchOptions {
             ef: req.ef,
+            nprobe: req.nprobe,
+            rerank: req.rerank,
             filter: req.filter.as_ref(),
             with_payload: req.with_payload,
             with_vector: req.with_vector,

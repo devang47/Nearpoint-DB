@@ -26,6 +26,10 @@ struct Args {
     /// loss can lose that window).
     #[arg(long, env = "NEARPOINT_SYNC", default_value = "batch", value_parser = parse_sync)]
     sync: SyncPolicy,
+    /// Threads for background index builds and compaction; 0 = half the
+    /// cores, so builds don't starve searches.
+    #[arg(long, env = "NEARPOINT_BUILD_THREADS", default_value_t = 0)]
+    build_threads: usize,
 }
 
 fn parse_sync(s: &str) -> Result<SyncPolicy, String> {
@@ -49,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    engine::collection::set_build_threads(args.build_threads);
     let db = Db::open(&args.data_dir, args.sync)
         .with_context(|| format!("opening {}", args.data_dir.display()))?;
     for (name, c) in db.list() {
