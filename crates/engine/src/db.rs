@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, TryLockError};
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::thread::JoinHandle;
@@ -82,10 +83,12 @@ fn maintain_all(colls: &Colls, stop: &(Mutex<bool>, Condvar)) {
             if *stop.0.lock().unwrap_or_else(PoisonError::into_inner) {
                 return;
             }
-            match c.maintain() {
-                Ok(did) => busy |= did,
-                Err(Error::Closed) => {}
-                Err(e) => tracing::error!(collection = %name, "background step failed: {e}"),
+            // A panic must not end maintenance for every collection.
+            match panic::catch_unwind(AssertUnwindSafe(|| c.maintain())) {
+                Ok(Ok(did)) => busy |= did,
+                Ok(Err(Error::Closed)) => {}
+                Ok(Err(e)) => tracing::error!(collection = %name, "background step failed: {e}"),
+                Err(_) => tracing::error!(collection = %name, "background step panicked"),
             }
         }
         let stopped = stop.0.lock().unwrap_or_else(PoisonError::into_inner);

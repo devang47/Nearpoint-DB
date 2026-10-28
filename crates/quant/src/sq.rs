@@ -44,8 +44,9 @@ impl Sq {
             .zip(&max)
             .map(|(lo, hi)| hi - lo)
             .fold(0f32, f32::max);
-        let scale = if range > 0.0 { range / 255.0 } else { 1.0 };
-        Ok(Sq { min, scale })
+        // A range overflowing to inf (or underflowing to 0) is an error
+        // here, not a blob `from_parts` refuses to load later.
+        Sq::from_parts(min, if range > 0.0 { range / 255.0 } else { 1.0 })
     }
 
     /// From stored parameters (e.g. read back from disk).

@@ -32,7 +32,9 @@ directory, so a restart needs no other flags.
   the bulk upsert. Unknown fields are rejected.
 - Ids are unsigned 64-bit integers (exact in JSON up to 2^64 − 1, but
   JavaScript clients lose precision above 2^53).
-- Vectors are arrays of `dim` finite numbers. Stored vectors are returned
+- Vectors are arrays of `dim` numbers with |x| ≤ 1e15 (larger ones would
+  overflow f32 distances); `cosine` vectors and queries must be nonzero.
+  Stored vectors are returned
   in stored form: unit length for `cosine`.
 - A write is acknowledged (2xx) only after it is in the WAL and durable
   per `--sync`, and is visible to every search that starts after the
@@ -46,7 +48,7 @@ Errors from Nearpoint are JSON: `{"error": "<message>"}`.
 
 | Status | When |
 |--------|------|
-| 400 | invalid input: wrong vector length, NaN/infinite component, payload type conflict, bad filter type, invalid config or name, `k`/`ef`/`nprobe`/`rerank` over 10,000, malformed bulk body |
+| 400 | invalid input: wrong vector length, NaN/infinite or > 1e15 component, zero `cosine` vector, payload type conflict, bad filter type, invalid config or name, `k`/`ef`/`nprobe`/`rerank` over 10,000, malformed bulk body |
 | 404 | no such collection, point, or the collection was dropped during the request |
 | 409 | collection already exists |
 | 413 | body over 256 MiB (plain text) |
@@ -82,9 +84,9 @@ Creates a collection. `name`: 1–64 characters of `A-Z a-z 0-9 _ -`.
 | `metric` | yes | `l2` (squared Euclidean), `inner_product` (negated dot) or `cosine` (1 − cos) |
 | `hnsw` | no | any of `m` (≥ 2, default 16), `ef_construction` (≥ 1, default 200), `seed` (default 42) |
 | `schema` | no | declared payload field types: `int`, `float`, `bool`, `keyword`, `keyword_list`. Undeclared fields take the type of their first value in each segment (`docs/filters.md`); segments whose undeclared fields differ in type are never merged, so declare fields you filter on |
-| `seal_rows` | no | the in-memory segment is sealed to disk once it has this many rows (default 100,000, ≥ 1) |
+| `seal_rows` | no | the in-memory segment is sealed to disk once it has this many rows (default 100,000, ≥ 1, ≤ half of `max_merge_rows`, and of `ivf_rows` for `inner_product`, or fresh segments could never merge) |
 | `ivf_rows` | no | sealed segments with at least this many rows are rebuilt as IVF-PQ, for `l2` and `cosine` (default 1,000,000, ≥ 1,024). `inner_product` collections stay HNSW and merge only below this size |
-| `max_merge_rows` | no | compaction never merges segments into one bigger than this (default 4,000,000, ≥ 1) |
+| `max_merge_rows` | no | compaction never merges segments into one bigger than this (default 4,000,000, ≥ 1); also capped at 2 GiB of f32 vectors (4M rows at dim 128, 512k at dim 1024) |
 
 `201` with the collection description (below). `409` if it exists, `400`
 if invalid.

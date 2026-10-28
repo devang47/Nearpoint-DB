@@ -99,7 +99,9 @@ re-rank lifts that) and its merges are capped below `ivf_rows`.
 IVF-PQ parameters: nlist = √n (the measured SIFT1M and BIGANN 10M points,
 0.92 recall with nprobe 16/32 rerank 100, used ~1–1.3·√n; 4·√n with
 nprobe 32 would probe a smaller fraction than anything measured), 8-bit
-PQ with the largest m ≤ 16 dividing dim, `max_train = max(64·nlist,
+PQ with the largest m ≤ max(16, dim/8) dividing dim (16-byte codes up
+to dim 128, ~8-dim subspaces beyond; a dim with no split into subspaces
+of ≤ 16 dims, e.g. a prime, stays HNSW like inner product), `max_train = max(64·nlist,
 262144)`. IVF-PQ segments keep their f32 vectors in the file (element
 type 0) and serve `get`/`with_vector` from the map, so `get` stays exact
 and costs no RAM. Search defaults: `nprobe 32`, `rerank 100`
@@ -163,8 +165,21 @@ leftovers that open deletes.
   in one delays the others' seals (the mutable segment then grows past
   `seal_rows` meanwhile; it is in RAM).
 - A merge holds its rows' f32 vectors, the new index and (while writing)
-  its blob: ~2.6 GB at the default 4M-row cap and dim 128. Lower
-  `max_merge_rows` for wide vectors.
+  its blob: ~2.6 GB at the default 4M-row cap and dim 128. The cap is
+  also limited to 2 GiB of f32 input, so wide vectors merge smaller.
 - `seal()` waits for a background step in flight (seconds for a 1M-row
   IVF-PQ build).
 - Every publish still rewrites all tombstones (ADR 0008's `ponytail:`).
+
+## Addendum (2026-10-29): review fixes before the soak
+- Upserts and queries reject components beyond ±1e15 and zero `cosine`
+  vectors. A huge but finite range made IVF-PQ's int8 scale infinite: the
+  segment was published, then refused to load, so the database would not
+  open. `Sq::train` now errors on such a scale, and a failed IVF-PQ build
+  falls back to HNSW instead of retrying forever.
+- A rewrite syncs the WAL before building: with a poisoned WAL every
+  retry used to write a new orphan file pair before failing to publish.
+- `Config::validate` requires `seal_rows ≤ cap / 2`, or fresh segments
+  start at the merge cap and the segment count grows without bound.
+- The Db thread catches a panicking `maintain` and logs it, so one bad
+  collection doesn't stop maintenance for all of them.

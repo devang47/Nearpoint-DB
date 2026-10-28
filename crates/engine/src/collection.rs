@@ -64,6 +64,10 @@ pub const DEFAULT_NPROBE: usize = 32;
 pub const DEFAULT_RERANK: usize = 100;
 /// Smallest `ivf_rows`: 8-bit PQ trains 256 centroids per subspace.
 const MIN_IVF_ROWS: u32 = 1024;
+/// Largest accepted vector component: keeps squared distances finite.
+const MAX_COMPONENT: f32 = 1e15;
+/// A merge's f32 copy at most this big (4M rows at dim 128).
+const MERGE_BYTES: u64 = 2 << 30;
 
 /// A collection's settings. Everything but `sync` is persisted by
 /// [`crate::Db`] (docs/formats/manifest.md, `CONFIG`).
@@ -103,6 +107,18 @@ impl Config {
         if self.seal_rows == 0 || self.max_merge_rows == 0 || self.ivf_rows < MIN_IVF_ROWS {
             return Err(Error::Invalid(
                 "need seal_rows >= 1, max_merge_rows >= 1, ivf_rows >= 1024",
+            ));
+        }
+        // Else fresh seals start at the merge cap and never merge, so the
+        // segment count (and search fan-out) grows without bound.
+        let ip_cap = if self.metric == Metric::InnerProduct {
+            self.ivf_rows
+        } else {
+            u32::MAX
+        };
+        if u64::from(self.seal_rows) * 2 > u64::from(self.max_merge_rows.min(ip_cap)) {
+            return Err(Error::Invalid(
+                "need seal_rows <= max_merge_rows / 2 (and ivf_rows / 2 for inner product)",
             ));
         }
         Ok(())
@@ -517,9 +533,7 @@ impl Collection {
         if !payloads.is_empty() && payloads.len() != n {
             return Err(Error::Invalid("need one payload per id, or none"));
         }
-        if !vectors.iter().all(|x| x.is_finite()) {
-            return Err(Error::Invalid("vector has a NaN or infinite component"));
-        }
+        self.check_vectors(vectors)?;
         let nulls;
         let payloads = if payloads.is_empty() {
             nulls = vec![Value::Null; n];
@@ -607,10 +621,14 @@ impl Collection {
             .iter()
             .enumerate()
             .map(|(i, v)| SegmentInfo {
-                index: match read(&v.seg).index {
-                    _ if i == last => "mutable",
-                    SegIndex::Hnsw(_) => "hnsw",
-                    SegIndex::IvfPq(..) => "ivf_pq",
+                // The mutable segment's lock is skipped: the writer holds it.
+                index: if i == last {
+                    "mutable"
+                } else {
+                    match read(&v.seg).index {
+                        SegIndex::Hnsw(_) => "hnsw",
+                        SegIndex::IvfPq(..) => "ivf_pq",
+                    }
                 },
                 rows: v.rows,
                 dead: v.dead.len(),
@@ -622,6 +640,7 @@ impl Collection {
     /// Segments are searched in parallel (rayon) and their hits merged.
     pub fn search(&self, query: &[f32], k: usize, opts: &SearchOptions) -> Result<Vec<Match>> {
         self.check_dim(query)?;
+        self.check_vectors(query)?;
         let snap = self.snapshot();
         let one = |(s, view): (usize, &View)| -> Result<Vec<(f32, usize, u32)>> {
             let n = view.rows;
@@ -863,7 +882,7 @@ impl Collection {
         // 3. Merge MERGE_FACTOR segments of the lowest size tier that has
         // that many, smallest first, up to the cap and only with payload
         // columns of matching types.
-        let mut cap = u64::from(self.cfg.max_merge_rows);
+        let mut cap = self.merge_cap();
         if !self.ivf_allowed() {
             cap = cap.min(ivf_rows - 1);
         }
@@ -901,8 +920,17 @@ impl Collection {
 
     /// IVF-PQ only for L2 and cosine: inner product tops out at ~0.84
     /// recall with the int8 re-rank (ADR 0012).
+    /// Also not when no PQ split of `dim` has subspaces of <= 16 dims
+    /// (prime dims): one-byte codes would make the re-rank shortlist noise.
     fn ivf_allowed(&self) -> bool {
-        self.cfg.metric != Metric::InnerProduct
+        self.cfg.metric != Metric::InnerProduct && self.cfg.dim / pq_m(self.cfg.dim) <= 16
+    }
+
+    /// `max_merge_rows`, lowered so a merge's f32 copy stays within
+    /// `MERGE_BYTES` for wide vectors.
+    fn merge_cap(&self) -> u64 {
+        let by_bytes = MERGE_BYTES / (self.cfg.dim as u64 * 4);
+        u64::from(self.cfg.max_merge_rows).min(by_bytes.max(1))
     }
 
     /// Build or compaction step: copies the live rows of `inputs` (as of
@@ -910,6 +938,9 @@ impl Collection {
     /// publishes it in their place. Rows that died meanwhile are dead in
     /// the new segment; ids that moved are remapped.
     fn rewrite(&self, m: &mut Maint, snap: &Snapshot, inputs: &[usize]) -> Result<()> {
+        // A poisoned WAL fails the publish anyway: don't build (and leave
+        // an orphan file pair behind) on every retry.
+        self.wal.sync()?;
         let d = self.cfg.dim;
         let (mut ids, mut vectors, mut src) = (Vec::new(), Vec::new(), Vec::new());
         let segs: Vec<_> = inputs.iter().map(|&i| read(&snap.segs[i].seg)).collect();
@@ -1012,38 +1043,42 @@ impl Collection {
         let pool = build_pool()?;
         if self.ivf_allowed() && n >= self.cfg.ivf_rows as usize {
             let mut index = IvfPq::new(d, self.cfg.metric, ivf_config(d, n, self.cfg.hnsw.seed))?;
-            pool.install(|| index.add(&vectors))?;
-            // The f32 vectors go in the file (element type 0), not in RAM.
-            let blob = index.to_bytes();
-            self.write_files(file, &vectors, &ids, &payloads, BlobKind::IvfPq, &blob)?;
-            drop((vectors, blob));
-            let path = file_path(&self.dir, file, "seg");
-            let mapped = Segment::open(&path).map_err(|e| Error::Segment(path, e))?;
-            Ok(Seg {
-                index: SegIndex::IvfPq(index, mapped),
-                ids,
-                payloads,
-            })
-        } else {
-            let mut index = Hnsw::new(d, self.cfg.metric, self.cfg.hnsw);
-            index.reserve(n);
-            pool.install(|| index.add(&vectors))?;
-            drop(vectors);
-            let blob = index.to_bytes();
-            self.write_files(
-                file,
-                index.vectors(),
-                &ids,
-                &payloads,
-                BlobKind::Hnsw,
-                &blob,
-            )?;
-            Ok(Seg {
-                index: SegIndex::Hnsw(index),
-                ids,
-                payloads,
-            })
+            match pool.install(|| index.add(&vectors)) {
+                Ok(_) => {
+                    // The f32 vectors go in the file (element type 0), not in RAM.
+                    let blob = index.to_bytes();
+                    self.write_files(file, &vectors, &ids, &payloads, BlobKind::IvfPq, &blob)?;
+                    drop((vectors, blob));
+                    let path = file_path(&self.dir, file, "seg");
+                    let mapped = Segment::open(&path).map_err(|e| Error::Segment(path, e))?;
+                    return Ok(Seg {
+                        index: SegIndex::IvfPq(index, mapped),
+                        ids,
+                        payloads,
+                    });
+                }
+                // Data IVF-PQ can't train on stays searchable as HNSW.
+                Err(e) => tracing::warn!("IVF-PQ build failed ({e}); building HNSW instead"),
+            }
         }
+        let mut index = Hnsw::new(d, self.cfg.metric, self.cfg.hnsw);
+        index.reserve(n);
+        pool.install(|| index.add(&vectors))?;
+        drop(vectors);
+        let blob = index.to_bytes();
+        self.write_files(
+            file,
+            index.vectors(),
+            &ids,
+            &payloads,
+            BlobKind::Hnsw,
+            &blob,
+        )?;
+        Ok(Seg {
+            index: SegIndex::Hnsw(index),
+            ids,
+            payloads,
+        })
     }
 
     fn new_key(&self) -> u32 {
@@ -1060,6 +1095,25 @@ impl Collection {
 
     fn snapshot(&self) -> Arc<Snapshot> {
         Arc::clone(&read(&self.snap))
+    }
+
+    /// Bounded components keep f32 distances and IVF-PQ's int8 scale
+    /// finite; cosine has no direction for a zero vector (HNSW and IVF-PQ
+    /// would score it differently).
+    fn check_vectors(&self, vectors: &[f32]) -> Result<()> {
+        if !vectors.iter().all(|x| x.abs() <= MAX_COMPONENT) {
+            return Err(Error::Invalid(
+                "vector component is NaN, infinite or beyond ±1e15",
+            ));
+        }
+        if self.cfg.metric == Metric::Cosine
+            && vectors
+                .chunks_exact(self.cfg.dim)
+                .any(|v| v.iter().all(|&x| x == 0.0))
+        {
+            return Err(Error::Invalid("cosine needs a nonzero vector"));
+        }
+        Ok(())
     }
 
     fn check_dim(&self, v: &[f32]) -> Result<()> {
@@ -1187,16 +1241,25 @@ fn merge_kinds(kinds: &mut Schema, store: &PayloadStore) -> bool {
 
 /// IVF-PQ for `n` rows: nlist = sqrt(n) (the measured SIFT1M and 10M
 /// points used ~1x and 1.3x sqrt(n) with nprobe 16 and 32), 8-bit PQ with
-/// the largest m <= 16 that divides `dim`.
+/// `pq_m` subspaces.
 fn ivf_config(dim: usize, n: usize, seed: u64) -> ivfpq::Config {
     let nlist = ((n as f64).sqrt().round() as usize).max(1);
     ivfpq::Config {
         nlist,
-        m: (1..=16).rev().find(|m| dim.is_multiple_of(*m)).unwrap_or(1),
+        m: pq_m(dim),
         nbits: 8,
         max_train: (nlist * 64).max(ivfpq::Config::default().max_train),
         seed,
     }
+}
+
+/// The largest m <= max(16, dim / 8) dividing `dim`: 16 bytes per code
+/// (SIFT's measured setting) up to dim 128, subspaces of ~8 dims beyond.
+fn pq_m(dim: usize) -> usize {
+    (1..=16.max(dim / 8))
+        .rev()
+        .find(|m| dim.is_multiple_of(*m))
+        .unwrap_or(1)
 }
 
 fn new_mutable(cfg: &Config, key: u32) -> View {
@@ -1551,6 +1614,8 @@ mod tests {
         check(&c, &model);
         assert!(c.upsert(1, &[1.0], &Value::Null).is_err()); // wrong dim
         assert!(c.upsert(1, &[f32::NAN; DIM], &Value::Null).is_err());
+        assert!(c.upsert(1, &[2e38; DIM], &Value::Null).is_err()); // overflows L2
+        assert!(c.search(&[f32::INFINITY; DIM], 1, &opts(None)).is_err());
         assert!(matches!(
             c.upsert(1, &vec_for(1, 0), &json!({"color": 3})),
             Err(Error::Payload(_))
@@ -1903,6 +1968,56 @@ mod tests {
         assert!(decode_payloads(&body, 4, &Schema::new()).is_none());
     }
 
+    /// Review fixes: configs that could never merge are rejected, cosine
+    /// refuses zero vectors, prime dims stay HNSW, wide dims cap merges.
+    #[test]
+    fn config_and_input_guards() {
+        let ip = |seal_rows| Config {
+            metric: Metric::InnerProduct,
+            seal_rows,
+            ..cfg()
+        };
+        assert!(ip(512).validate().is_ok());
+        assert!(ip(513).validate().is_err()); // ivf_rows 1024 caps IP merges
+        assert!(
+            Config {
+                max_merge_rows: 150_000,
+                ..cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert_eq!(
+            (pq_m(4), pq_m(32), pq_m(128), pq_m(768), pq_m(97)),
+            (4, 16, 16, 96, 1)
+        );
+
+        let d = TempDir::new("guards");
+        let cos = Config {
+            metric: Metric::Cosine,
+            ..cfg()
+        };
+        let c = open_with(&d, cos);
+        assert!(c.upsert(1, &[0.0; DIM], &Value::Null).is_err());
+        assert!(c.search(&[0.0; DIM], 1, &opts(None)).is_err());
+        assert!(c.ivf_allowed());
+        drop(c);
+        let d = TempDir::new("guards-prime");
+        let c = open_with(&d, Config { dim: 97, ..cfg() });
+        assert!(!c.ivf_allowed());
+        drop(c);
+        let d = TempDir::new("guards-wide");
+        let c = open_with(
+            &d,
+            Config {
+                dim: 1024,
+                max_merge_rows: 4_000_000,
+                ..cfg()
+            },
+        );
+        assert_eq!(c.merge_cap(), (2 << 30) / 4096);
+    }
+
     fn open_with(d: &TempDir, cfg: Config) -> Arc<Collection> {
         Arc::new(Collection::open(&d.0, cfg).unwrap().0)
     }
@@ -2089,7 +2204,12 @@ mod tests {
     fn big_segments_become_ivf_pq() {
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
             let d = TempDir::new("ivf");
-            let cfg = Config { metric, ..cfg() };
+            // seal_rows <= ivf_rows / 2: inner product must still merge.
+            let cfg = Config {
+                metric,
+                seal_rows: 512,
+                ..cfg()
+            };
             let mut c = open_with(&d, cfg.clone());
             let n = 1500u64;
             let ids: Vec<u64> = (0..n).collect();
