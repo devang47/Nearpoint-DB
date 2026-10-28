@@ -8,6 +8,10 @@
 //! fast-scan block layout (`kernels::pq4_set`) and scanned 32 at a time
 //! with u8-quantized tables (`kernels::pq4_scan`).
 //!
+//! Re-ranking: every vector is also kept as int8 SQ codes, by id. With
+//! `params.rerank > 0` the best `max(k, rerank)` PQ candidates are re-scored
+//! against them (f32 query vs decoded code) and those distances returned.
+//!
 //! L2 only: `new` rejects other metrics.
 //!
 //! Building is `train` (k-means and PQ codebooks on a sample) then `add`;
@@ -16,7 +20,7 @@
 use std::collections::BinaryHeap;
 use std::ops::Range;
 
-use quant::{Centroids, KMeans, Pq, PqConfig};
+use quant::{Centroids, KMeans, Pq, PqConfig, Sq};
 use rayon::prelude::*;
 
 use crate::{Error, Hit, Index, Metric, Result, SearchParams, batch_ids, check_dim};
@@ -52,12 +56,15 @@ pub struct IvfPq {
     cfg: Config,
     quant: Option<Quantizers>,
     lists: Vec<List>,
+    /// SQ int8 codes by id, `dim` bytes each, for re-ranking.
+    sq_codes: Vec<i8>,
     len: usize,
 }
 
 struct Quantizers {
     coarse: Centroids,
     pq: Pq,
+    sq: Sq,
 }
 
 #[derive(Default)]
@@ -86,6 +93,7 @@ impl IvfPq {
             cfg,
             quant: None,
             lists: Vec::new(),
+            sq_codes: Vec::new(),
             len: 0,
         })
     }
@@ -94,8 +102,8 @@ impl IvfPq {
         self.cfg
     }
 
-    /// Trains the coarse quantizer and PQ codebooks on (a sample of at
-    /// most `max_train` rows of) `data`. Only on an empty index: codes
+    /// Trains the coarse quantizer, PQ codebooks and SQ ranges on (a sample
+    /// of at most `max_train` rows of) `data`. Only on an empty index: codes
     /// already stored would no longer match.
     pub fn train(&mut self, data: &[f32]) -> Result<()> {
         if self.len > 0 {
@@ -110,6 +118,7 @@ impl IvfPq {
             ..KMeans::new(cfg.nlist, dim)
         }
         .train(&x)?;
+        let sq = Sq::train(&x, dim, usize::MAX, cfg.seed)?;
         let mut residuals = x.into_owned();
         residuals
             .par_chunks_exact_mut(dim)
@@ -120,7 +129,7 @@ impl IvfPq {
             ..PqConfig::new(dim, cfg.m)
         }
         .train(&residuals)?;
-        self.quant = Some(Quantizers { coarse, pq });
+        self.quant = Some(Quantizers { coarse, pq, sq });
         self.lists = (0..cfg.nlist).map(|_| List::default()).collect();
         Ok(())
     }
@@ -174,6 +183,12 @@ impl IvfPq {
             }
             kernels::pq4_set(&mut list.codes, at, code);
         }
+        let start = self.sq_codes.len();
+        self.sq_codes.resize(start + n * dim, 0);
+        self.sq_codes[start..]
+            .par_chunks_exact_mut(dim)
+            .zip(vectors.par_chunks_exact(dim))
+            .for_each(|(code, v)| q.sq.encode_into(v, code));
         self.len += n;
     }
 }
@@ -234,9 +249,12 @@ impl Index for IvfPq {
         Ok(ids)
     }
 
-    /// Scans the `params.nprobe` nearest lists and returns the `k` nearest
-    /// by ADC distance (the squared L2 to the PQ reconstruction). Ids not
-    /// in `params.filter` are skipped while scanning.
+    /// Scans the `params.nprobe` nearest lists for the `max(k,
+    /// params.rerank)` nearest by ADC distance (the squared L2 to the PQ
+    /// reconstruction). Ids not in `params.filter` are skipped while
+    /// scanning. With `params.rerank > 0` those candidates are re-scored
+    /// with their SQ codes (squared L2 to the int8 reconstruction); the `k`
+    /// nearest are returned either way.
     fn search(&self, query: &[f32], k: usize, params: &SearchParams) -> Result<Vec<Hit>> {
         check_dim(self.dim, query.len())?;
         let Some(q) = &self.quant else {
@@ -262,9 +280,10 @@ impl Index for IvfPq {
             cells.truncate(nprobe);
         }
 
-        let mut best = BinaryHeap::with_capacity(k + 1);
+        let short = k.max(params.rerank);
+        let mut best = BinaryHeap::with_capacity(short + 1);
         let mut offer = |id: u32, dist: f32| {
-            if best.len() == k && best.peek().is_some_and(|w: &Hit| dist >= w.dist) {
+            if best.len() == short && best.peek().is_some_and(|w: &Hit| dist >= w.dist) {
                 return;
             }
             // After the distance test: most ids never get this far, and a
@@ -273,7 +292,7 @@ impl Index for IvfPq {
                 return;
             }
             best.push(Hit { id, dist });
-            if best.len() > k {
+            if best.len() > short {
                 best.pop();
             }
         };
@@ -300,7 +319,30 @@ impl Index for IvfPq {
                 offer(id, bias + f32::from(s) * step);
             }
         }
-        Ok(best.into_sorted_vec())
+
+        let mut hits = best.into_vec();
+        if params.rerank > 0 {
+            // |q - decode(c)|² = scale² · |(q - min) / scale - 128 - c|²: the
+            // query goes into code units once, then each candidate is one
+            // i8 -> f32 widening and an f32 L2 kernel call.
+            let scale = q.sq.scale();
+            let qs: Vec<f32> = query
+                .iter()
+                .zip(q.sq.min())
+                .map(|(&x, &lo)| (x - lo) / scale - 128.0)
+                .collect();
+            let mut code = vec![0f32; self.dim];
+            for h in &mut hits {
+                let c = &self.sq_codes[h.id as usize * self.dim..][..self.dim];
+                for (f, &b) in code.iter_mut().zip(c) {
+                    *f = f32::from(b);
+                }
+                h.dist = kernels::l2_sq(&qs, &code) * scale * scale;
+            }
+        }
+        hits.sort_unstable();
+        hits.truncate(k);
+        Ok(hits)
     }
 }
 
@@ -422,6 +464,45 @@ mod tests {
                 (h.dist - want).abs() <= 1e-4 * want.max(1.0),
                 "{h:?} vs {want}"
             );
+        }
+    }
+
+    #[test]
+    fn rerank_returns_sq_distances_and_lifts_recall() {
+        let data = test_data::vectors(3000, DIM, 8);
+        let queries = test_data::vectors(50, DIM, 9);
+        for nbits in [8, 4] {
+            let mut ivf = IvfPq::new(DIM, Metric::L2, Config { nbits, ..cfg() }).unwrap();
+            ivf.add(&data).unwrap();
+            let at = |rerank| {
+                let p = SearchParams {
+                    nprobe: 16,
+                    rerank,
+                    ..SearchParams::default()
+                };
+                recall(&ivf, &data, &queries, 10, &p)
+            };
+            let (plain, reranked) = (at(0), at(200));
+            assert!(
+                plain < reranked && reranked > 0.9,
+                "nbits {nbits}: {plain} -> {reranked}"
+            );
+
+            let p = SearchParams {
+                nprobe: 16,
+                rerank: 50,
+                ..SearchParams::default()
+            };
+            let q = &queries[..DIM];
+            let sq = &ivf.quant.as_ref().unwrap().sq;
+            for h in ivf.search(q, 10, &p).unwrap() {
+                let code = &ivf.sq_codes[h.id as usize * DIM..][..DIM];
+                let want = kernels::l2_sq(q, &sq.decode(code));
+                assert!(
+                    (h.dist - want).abs() <= 1e-3 * want.max(1.0),
+                    "{h:?} vs {want}"
+                );
+            }
         }
     }
 

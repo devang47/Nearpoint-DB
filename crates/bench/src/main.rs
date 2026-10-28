@@ -205,9 +205,10 @@ fn main() -> Result<()> {
             let mut ivf = IvfPq::new(base.dim(), Metric::L2, cfg)?;
             // Train on rows spread over the whole base, not the first batch.
             let (n, t) = (base.len(), base.len().min(cfg.max_train));
-            let sample: Vec<f32> = (0..t)
-                .flat_map(|i| base.row(i * n / t).into_owned())
-                .collect();
+            let mut sample = Vec::with_capacity(t * base.dim());
+            for i in 0..t {
+                sample.extend_from_slice(&base.row(i * n / t));
+            }
             ivf.train(&sample)?;
             let label = format!("ivfpq nlist={} m={} nbits={}", cfg.nlist, cfg.m, cfg.nbits);
             (Box::new(ivf), label)
