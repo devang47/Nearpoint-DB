@@ -1,24 +1,44 @@
-//! Phase 4 acceptance load test: concurrent upserts (JSON and bulk),
-//! replacements, deletes, seals and searches against a running server.
+//! Load test: concurrent upserts (JSON and bulk), replacements, deletes,
+//! seals and searches against a running server. Phase 4 acceptance (default
+//! mode) and the Phase 6 soak (`--live N`).
 //!
 //! Checks, for the whole run:
 //! - every request succeeds (any non-2xx or I/O error is an error);
 //! - no search returns an id whose delete was acknowledged before the
 //!   search was sent (deleted ids are never re-inserted, so this is exact);
 //! - no search returns an id twice, or a hit failing its filter;
-//! - a get of an acknowledged-deleted id is 404, of a live id 200.
+//! - a get of an acknowledged-deleted id is 404, of a live id 200;
+//! - (soak) at each probe the server's live count equals the client's.
 //!
 //! Each writer owns the ids `≡ w (mod writers)`, so no two threads race on
-//! one id. Exits non-zero if any check failed. Latency is printed for
-//! eyeballing only; the machine may be shared.
+//! one id, and keeps every live vector it wrote (the client model). Exits
+//! non-zero if any check failed. Latency is informational; the machine may
+//! be shared.
+//!
+//! Soak mode (`--live N`): bulk-preload N points, then each write round
+//! inserts `--batch` new ids and deletes `--batch` live ones, so the live
+//! count stays at N. Every `--probe-secs` a probe pauses the writers (they
+//! hold `pause` shared per round, the probe takes it exclusively, so the
+//! model equals the server's state), sends `--probe-queries` k = 10
+//! searches at default params and scores them against the exact top 10,
+//! by brute force over the model. One line per window, also appended to
+//! `--csv`: reader search p50/p99 and searches/s, write requests/s, live
+//! count, recall@10, server RSS (`--server-pid`), writer pause. The run
+//! ends at the last full window, then compares the first and last windows:
+//! PASS if recall fell and p99 rose by at most `--max-drift` (relative).
+//! A drift FAIL sets the exit code only with `--fail-on-drift`.
 //!
 //! ```text
 //! cargo run --release -p server --bin loadtest -- --addr 127.0.0.1:7700 --secs 1800
+//! cargo run --release -p server --bin loadtest -- --addr 127.0.0.1:7700 --secs 14400 \
+//!     --live 1000000 --probe-secs 60 --server-pid "$(pgrep -nx server)" --csv soak.csv \
+//!     --seal-secs 0 --collection-config '{"seal_rows": 200000}'
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -55,6 +75,33 @@ struct Args {
     seal_secs: u64,
     #[arg(long)]
     keep: bool,
+    /// Soak mode: preload this many points and keep the live count there
+    /// (0: the default Phase 4 mode).
+    #[arg(long, default_value_t = 0)]
+    live: usize,
+    /// Soak: probe (pause writers, measure recall) and report every this
+    /// many seconds.
+    #[arg(long, default_value_t = 60)]
+    probe_secs: u64,
+    /// Soak: k = 10 queries per probe.
+    #[arg(long, default_value_t = 200)]
+    probe_queries: usize,
+    /// Soak: append one CSV row per window to this file.
+    #[arg(long)]
+    csv: Option<PathBuf>,
+    /// Soak: the server's process id, for its RSS (via `ps`).
+    #[arg(long)]
+    server_pid: Option<u32>,
+    /// Soak: allowed relative recall drop and p99 rise, first vs last window.
+    #[arg(long, default_value_t = 0.10)]
+    max_drift: f64,
+    /// Soak: exit non-zero when the drift check fails.
+    #[arg(long)]
+    fail_on_drift: bool,
+    /// JSON object merged into the create-collection body (top-level keys
+    /// replace the defaults), e.g. '{"seal_rows": 200000}'.
+    #[arg(long)]
+    collection_config: Option<String>,
 }
 
 /// One keep-alive HTTP/1.1 connection; enough for this server's replies
@@ -171,13 +218,38 @@ struct State {
     errors: AtomicU64,
     violations: AtomicU64,
     stats: Mutex<Stats>,
+    /// Writers hold it shared for each round; a probe takes it exclusively.
+    pause: RwLock<()>,
+    /// Per writer: its live points, as acknowledged by the server.
+    models: Vec<Mutex<Live>>,
 }
 
 #[derive(Default)]
 struct Stats {
     ops: HashMap<&'static str, u64>,
-    /// Search latencies, µs.
+    /// Search latencies, µs (drained every window in soak mode).
     lat: Vec<u32>,
+}
+
+/// Live ids and their vectors (row-major), in the same order.
+#[derive(Default)]
+struct Live {
+    ids: Vec<u64>,
+    vecs: Vec<f32>,
+}
+
+impl Live {
+    fn push(&mut self, id: u64, v: &[f32]) {
+        self.ids.push(id);
+        self.vecs.extend_from_slice(v);
+    }
+
+    fn swap_remove(&mut self, i: usize, dim: usize) -> u64 {
+        let last = self.ids.len() - 1;
+        self.vecs.copy_within(last * dim..(last + 1) * dim, i * dim);
+        self.vecs.truncate(last * dim);
+        self.ids.swap_remove(i)
+    }
 }
 
 impl State {
@@ -245,16 +317,60 @@ fn bulk_body(ids: &[u64], vectors: &[f32], dim: usize) -> Vec<u8> {
     b
 }
 
+/// Ids per writer loaded by `preload`.
+fn preloaded(a: &Args) -> u64 {
+    (a.live as u64).div_ceil(a.writers)
+}
+
+/// Soak mode: bulk-loads ids `0..preloaded * writers` before the writers
+/// start (id `i` belongs to writer `i % writers`).
+fn preload(st: &State, http: &mut Http) -> anyhow::Result<()> {
+    let a = &st.args;
+    let total = preloaded(a) * a.writers;
+    let mut models: Vec<_> = st
+        .models
+        .iter()
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    let mut rng = 0xB01D;
+    let t = Instant::now();
+    for from in (0..total).step_by(50_000) {
+        let ids: Vec<u64> = (from..(from + 50_000).min(total)).collect();
+        let vecs: Vec<f32> = ids.iter().flat_map(|_| vector(&mut rng, a.dim)).collect();
+        let body = bulk_body(&ids, &vecs, a.dim);
+        let (s, b) = http.call(
+            "POST",
+            &st.path("/points/bulk"),
+            "application/octet-stream",
+            &body,
+        )?;
+        if s != 200 {
+            bail!("preload: {s} {}", String::from_utf8_lossy(&b));
+        }
+        for (&id, v) in ids.iter().zip(vecs.chunks(a.dim)) {
+            models[(id % a.writers) as usize].push(id, v);
+        }
+    }
+    println!(
+        "preloaded {total} points in {:.1} s",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn writer(st: &State, w: u64) {
     let a = &st.args;
     let mut http = Http::new(&a.addr);
     let mut rng = 0x5EED ^ w;
-    let mut next = 0u64; // the writer's ids are next * writers + w
-    let mut live: Vec<u64> = Vec::new();
+    let mut next = preloaded(a); // the writer's ids are next * writers + w
     let period = Duration::from_secs_f64(1.0 / a.rounds_per_sec as f64);
     let mut round = 0u64;
     while !st.stop.load(SeqCst) {
         let started = Instant::now();
+        let pause = st.pause.read().unwrap_or_else(|e| e.into_inner());
+        let mut live = st.models[w as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Insert new ids, alternating JSON and binary bulk.
         let ids: Vec<u64> = (0..a.batch as u64)
             .map(|i| (next + i) * a.writers + w)
@@ -283,35 +399,50 @@ fn writer(st: &State, w: u64) {
         };
         match res {
             Ok(()) => {
-                live.extend(&ids);
+                for (&id, v) in ids.iter().zip(vecs.chunks(a.dim)) {
+                    live.push(id, v);
+                }
                 st.count("insert");
             }
             Err(e) => st.error(e),
         }
         // Replace a few live ids with new vectors.
-        if !live.is_empty() {
-            let points: Vec<Value> = (0..5)
+        if !live.ids.is_empty() {
+            let picks: Vec<(usize, Vec<f32>)> = (0..5)
                 .map(|_| {
-                    let id = live[(splitmix64(&mut rng) % live.len() as u64) as usize];
-                    json!({"id": id, "vector": vector(&mut rng, a.dim), "payload": {"tag": tag(id)}})
+                    let i = (splitmix64(&mut rng) % live.ids.len() as u64) as usize;
+                    (i, vector(&mut rng, a.dim))
+                })
+                .collect();
+            let points: Vec<Value> = picks
+                .iter()
+                .map(|(i, v)| {
+                    let id = live.ids[*i];
+                    json!({"id": id, "vector": v, "payload": {"tag": tag(id)}})
                 })
                 .collect();
             match http.json("POST", &st.path("/points"), &json!({"points": points})) {
-                Ok(_) => st.count("replace"),
+                Ok(_) => {
+                    // In order, so a repeated id's last vector wins, as on the server.
+                    for (i, v) in picks {
+                        live.vecs[i * a.dim..(i + 1) * a.dim].copy_from_slice(&v);
+                    }
+                    st.count("replace")
+                }
                 Err(e) => st.error(e),
             }
         }
-        // Delete some: about as many as inserted once the live set is big,
-        // so it stays bounded.
-        let n = if live.len() > 20_000 {
+        // Delete some: as many as inserted in soak mode or once the live
+        // set is big, so it stays bounded.
+        let n = if a.live > 0 || live.ids.len() > 20_000 {
             a.batch
         } else {
             a.batch / 5
         };
         let mut doomed = Vec::new();
-        for _ in 0..n.min(live.len()) {
-            let i = (splitmix64(&mut rng) % live.len() as u64) as usize;
-            doomed.push(live.swap_remove(i));
+        for _ in 0..n.min(live.ids.len()) {
+            let i = (splitmix64(&mut rng) % live.ids.len() as u64) as usize;
+            doomed.push(live.swap_remove(i, a.dim));
         }
         if !doomed.is_empty() {
             match http.json("POST", &st.path("/points/delete"), &json!({"ids": doomed})) {
@@ -342,7 +473,7 @@ fn writer(st: &State, w: u64) {
                     Err(e) => st.error(e),
                 }
             }
-            if let Some(&id) = live.first() {
+            if let Some(&id) = live.ids.first() {
                 match http.call(
                     "GET",
                     &st.path(&format!("/points/{id}")),
@@ -358,6 +489,8 @@ fn writer(st: &State, w: u64) {
                 }
             }
         }
+        drop(live);
+        drop(pause);
         round += 1;
         if let Some(rest) = period.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);
@@ -438,6 +571,184 @@ fn sealer(st: &State) {
     }
 }
 
+/// Exact top-10 ids per query over the client model. Squared L2 like the
+/// server's `l2` metric (recall only needs the order). Queries are split
+/// across threads; each thread streams the model once.
+fn exact_top10(queries: &[Vec<f32>], models: &[&Live], dim: usize) -> Vec<Vec<u64>> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per = queries.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = queries
+            .chunks(per)
+            .map(|qs| {
+                s.spawn(move || {
+                    let mut best: Vec<Vec<(f32, u64)>> = vec![Vec::new(); qs.len()];
+                    for m in models {
+                        for (&id, v) in m.ids.iter().zip(m.vecs.chunks_exact(dim)) {
+                            for (q, b) in qs.iter().zip(&mut best) {
+                                let d: f32 = q.iter().zip(v).map(|(x, y)| (x - y) * (x - y)).sum();
+                                if b.len() < 10 || d < b[9].0 {
+                                    b.insert(b.partition_point(|e| e.0 <= d), (d, id));
+                                    b.truncate(10);
+                                }
+                            }
+                        }
+                    }
+                    best.into_iter()
+                        .map(|b| b.into_iter().map(|e| e.1).collect())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
+/// Soak probe: pauses the writers, so the client model is exactly the
+/// server's live set, checks the live count and measures recall@10 at
+/// default search params. Returns (live points, recall@10, pause ms).
+fn probe(st: &State, http: &mut Http, rng: &mut u64) -> (usize, f64, f64) {
+    let a = &st.args;
+    let t = Instant::now();
+    let pause = st.pause.write().unwrap_or_else(|e| e.into_inner());
+    let guards: Vec<_> = st
+        .models
+        .iter()
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    let models: Vec<&Live> = guards.iter().map(|g| &**g).collect();
+    let n: usize = models.iter().map(|m| m.ids.len()).sum();
+    match http.json("GET", &st.path(""), &json!(null)) {
+        Ok(info) if info["points"].as_u64() == Some(n as u64) => {}
+        Ok(info) => st.violation(format!(
+            "server has {} live points, the client {n}",
+            info["points"]
+        )),
+        Err(e) => st.error(e),
+    }
+    let (mut queries, mut got) = (Vec::new(), Vec::new());
+    for _ in 0..a.probe_queries {
+        let q = vector(rng, a.dim);
+        match http.json("POST", &st.path("/search"), &json!({"vector": q, "k": 10})) {
+            Ok(v) => {
+                let hits = v["hits"].as_array().cloned().unwrap_or_default();
+                got.push(
+                    hits.iter()
+                        .filter_map(|h| h["id"].as_u64())
+                        .collect::<HashSet<_>>(),
+                );
+                queries.push(q);
+            }
+            Err(e) => st.error(e),
+        }
+    }
+    let truth = exact_top10(&queries, &models, a.dim);
+    drop(guards);
+    drop(pause);
+    let (mut found, mut wanted) = (0, 0);
+    for (g, t) in got.iter().zip(&truth) {
+        found += t.iter().filter(|id| g.contains(id)).count();
+        wanted += t.len();
+    }
+    let recall = found as f64 / wanted.max(1) as f64;
+    (n, recall, t.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Resident set size of `pid` in MiB, via `ps` (KiB).
+fn rss_mib(pid: u32) -> Option<f64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let kib: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(kib / 1024.0)
+}
+
+/// `q`-quantile of sorted µs latencies, in ms.
+fn pct(sorted: &[u32], q: f64) -> f64 {
+    sorted
+        .get(((sorted.len().max(1) - 1) as f64 * q) as usize)
+        .map_or(f64::NAN, |&us| us as f64 / 1000.0)
+}
+
+/// One soak report window.
+struct Window {
+    p99: f64,
+    recall: f64,
+}
+
+/// Soak mode's main loop: a probe and a report line per window until the
+/// last full window. Returns the windows.
+fn soak(st: &State, http: &mut Http, start: Instant) -> anyhow::Result<Vec<Window>> {
+    let a = &st.args;
+    let mut csv = match &a.csv {
+        Some(p) => {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .with_context(|| format!("open {}", p.display()))?;
+            Some(f)
+        }
+        None => None,
+    };
+    if let Some(f) = &mut csv
+        && f.metadata()?.len() == 0
+    {
+        writeln!(
+            f,
+            "t_s,live,searches_per_s,writes_per_s,p50_ms,p99_ms,recall10,rss_mib,pause_ms,errors,violations"
+        )?;
+    }
+    let sum = |ops: &HashMap<&str, u64>, keys: &[&str]| -> u64 {
+        keys.iter().map(|k| ops.get(k).copied().unwrap_or(0)).sum()
+    };
+    const SEARCHES: &[&str] = &["search", "search_filtered"];
+    const WRITES: &[&str] = &["insert", "replace", "delete"];
+    let probe_secs = a.probe_secs.max(1);
+    let mut rng = 0x9806E;
+    let mut windows = Vec::new();
+    let (mut last_t, mut last_ops) = (start, HashMap::new());
+    for i in 1..=a.secs / probe_secs {
+        std::thread::sleep(
+            (start + Duration::from_secs(i * probe_secs)).saturating_duration_since(Instant::now()),
+        );
+        let (live, recall, pause_ms) = probe(st, http, &mut rng);
+        let (ops, mut lat) = {
+            let mut s = st.stats.lock().unwrap_or_else(|e| e.into_inner());
+            (s.ops.clone(), std::mem::take(&mut s.lat))
+        };
+        let secs = last_t.elapsed().as_secs_f64();
+        last_t = Instant::now();
+        let sps = (sum(&ops, SEARCHES) - sum(&last_ops, SEARCHES)) as f64 / secs;
+        let wps = (sum(&ops, WRITES) - sum(&last_ops, WRITES)) as f64 / secs;
+        last_ops = ops;
+        lat.sort_unstable();
+        let (p50, p99) = (pct(&lat, 0.5), pct(&lat, 0.99));
+        let rss = a.server_pid.and_then(rss_mib);
+        let (errors, violations) = (st.errors.load(SeqCst), st.violations.load(SeqCst));
+        let t = start.elapsed().as_secs();
+        println!(
+            "{t:>6} s: live {live}, search/s {sps:.0}, writes/s {wps:.0}, p50 {p50:.2} ms, \
+             p99 {p99:.2} ms, recall@10 {recall:.4}, rss {} MiB, pause {pause_ms:.0} ms, \
+             errors {errors}, violations {violations}",
+            rss.map_or("-".into(), |r| format!("{r:.0}"))
+        );
+        if let Some(f) = &mut csv {
+            writeln!(
+                f,
+                "{t},{live},{sps:.1},{wps:.1},{p50:.3},{p99:.3},{recall:.4},{},{pause_ms:.0},{errors},{violations}",
+                rss.map_or(String::new(), |r| format!("{r:.1}"))
+            )?;
+        }
+        windows.push(Window { p99, recall });
+    }
+    Ok(windows)
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let st = State {
@@ -448,20 +759,34 @@ fn main() -> anyhow::Result<()> {
         errors: AtomicU64::new(0),
         violations: AtomicU64::new(0),
         stats: Mutex::default(),
+        pause: RwLock::default(),
+        models: (0..args.writers).map(|_| Mutex::default()).collect(),
     };
     let mut http = Http::new(&args.addr);
     http.json("GET", "/health", &json!(null))
         .context("server not reachable")?;
     let _ = http.call("DELETE", &st.path(""), "application/json", b"")?;
-    let cfg = json!({"dim": args.dim, "metric": "l2", "hnsw": {"m": 16, "ef_construction": 100},
-                     "schema": {"tag": "keyword"}});
+    let mut cfg = json!({"dim": args.dim, "metric": "l2", "hnsw": {"m": 16, "ef_construction": 100},
+                         "schema": {"tag": "keyword"}});
+    if let Some(extra) = &args.collection_config {
+        let Value::Object(extra) = serde_json::from_str(extra).context("--collection-config")?
+        else {
+            bail!("--collection-config must be a JSON object");
+        };
+        if let Value::Object(cfg) = &mut cfg {
+            cfg.extend(extra);
+        }
+    }
     http.json("PUT", &st.path(""), &cfg)?;
     println!(
-        "loadtest: {} s, {} writers, {} readers, dim {}, collection {}",
+        "loadtest: {} s, {} writers, {} readers, dim {}, collection {}, config {cfg}",
         args.secs, args.writers, args.readers, args.dim, args.collection
     );
+    if args.live > 0 {
+        preload(&st, &mut http)?;
+    }
     let start = Instant::now();
-    std::thread::scope(|s| {
+    let windows = std::thread::scope(|s| {
         for w in 0..args.writers {
             let st = &st;
             s.spawn(move || writer(st, w));
@@ -472,6 +797,11 @@ fn main() -> anyhow::Result<()> {
         }
         if args.seal_secs > 0 {
             s.spawn(|| sealer(&st));
+        }
+        if args.live > 0 {
+            let windows = soak(&st, &mut http, start);
+            st.stop.store(true, SeqCst);
+            return windows;
         }
         let mut next_report = 30;
         while start.elapsed().as_secs() < args.secs {
@@ -487,7 +817,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
         st.stop.store(true, SeqCst);
-    });
+        Ok(Vec::new())
+    })?;
     let info = http.json("GET", &st.path(""), &json!(null))?;
     if !args.keep {
         http.json("DELETE", &st.path(""), &json!(null))?;
@@ -498,20 +829,56 @@ fn main() -> anyhow::Result<()> {
     println!("ops: {ops:?}");
     println!("live points at the end: {}", info["points"]);
     stats.lat.sort_unstable();
-    if !stats.lat.is_empty() {
-        let p = |q: f64| stats.lat[((stats.lat.len() - 1) as f64 * q) as usize] as f64 / 1000.0;
+    if args.live == 0 && !stats.lat.is_empty() {
         println!(
             "search latency ms (informational): p50 {:.2}, p99 {:.2}, max {:.2}",
-            p(0.5),
-            p(0.99),
-            p(1.0)
+            pct(&stats.lat, 0.5),
+            pct(&stats.lat, 0.99),
+            pct(&stats.lat, 1.0)
         );
+    }
+    let mut drift_ok = true;
+    if args.live > 0 {
+        match (windows.first(), windows.last()) {
+            (Some(f), Some(l)) if windows.len() >= 2 => {
+                let recall = l.recall / f.recall - 1.0;
+                let p99 = l.p99 / f.p99 - 1.0;
+                // NaN (no samples) fails too.
+                drift_ok = recall >= -args.max_drift && p99 <= args.max_drift;
+                println!(
+                    "drift, first vs last window: recall@10 {:.4} -> {:.4} ({:+.1}%), \
+                     p99 {:.2} -> {:.2} ms ({:+.1}%), max {:.0}%: {}",
+                    f.recall,
+                    l.recall,
+                    recall * 100.0,
+                    f.p99,
+                    l.p99,
+                    p99 * 100.0,
+                    args.max_drift * 100.0,
+                    if drift_ok { "PASS" } else { "FAIL" }
+                );
+            }
+            _ => {
+                drift_ok = false;
+                println!("drift: FAIL, fewer than 2 windows (need secs >= 2 * probe-secs)");
+            }
+        }
     }
     let (errors, violations) = (st.errors.load(SeqCst), st.violations.load(SeqCst));
     println!("errors {errors}, violations {violations}");
     if errors + violations > 0 {
         bail!("FAIL");
     }
-    println!("PASS");
+    if !drift_ok && args.fail_on_drift {
+        bail!("FAIL: drift");
+    }
+    println!(
+        "PASS{}",
+        if drift_ok {
+            ""
+        } else {
+            " (checks; drift FAIL)"
+        }
+    );
     Ok(())
 }
