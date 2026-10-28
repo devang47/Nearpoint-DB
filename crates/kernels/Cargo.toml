@@ -1,0 +1,11 @@
+[package]
+name = "kernels"
+description = "Distance kernels: scalar reference + NEON, f32 and int8."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

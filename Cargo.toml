@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The allowed dependency list from AGENTS.md, pinned in one place.
+# Crates opt in with `dep.workspace = true`. Ask before adding anything here.
+[workspace.dependencies]
+anyhow = "1"                                                 # binaries only
+axum = "0.8"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+crc32fast = "1.5"
+libc = "0.2"                                                 # storage + bench only (ADR 0001)
+memmap2 = "0.9"
+rand = "0.10"
+rayon = "1.12"
+roaring = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.54", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] } # binaries only
+# dev-dependencies
+criterion = "0.8"
+proptest = "1"
+
+# AGENTS.md rules enforced by the compiler, not by review.
+[workspace.lints.rust]
+unsafe_code = "deny" # `kernels` and `storage` opt out with #![allow(unsafe_code)]
+
+[workspace.lints.clippy]
+unwrap_used = "deny"                # tests are exempt via clippy.toml
+undocumented_unsafe_blocks = "deny" # every unsafe block needs `// SAFETY:`

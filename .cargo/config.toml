@@ -1,0 +1,5 @@
+# Single-machine project: build for the host CPU. On Apple Silicon this
+# enables NEON plus dotprod/fp16, so kernels dispatch at compile time
+# (cfg(target_feature)) instead of at runtime. See docs/adr/0001.
+[build]
+rustflags = ["-C", "target-cpu=native"]

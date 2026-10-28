@@ -1,0 +1,4 @@
+# Pinned so benchmark numbers in docs/RESULTS.md are comparable across runs.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

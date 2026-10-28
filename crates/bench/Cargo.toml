@@ -1,0 +1,11 @@
+[package]
+name = "bench"
+description = "Recall/latency harness and dataset loaders."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

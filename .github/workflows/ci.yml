@@ -1,0 +1,8 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: macos-latest # Apple Silicon, same arch as the target Mac mini
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check.sh

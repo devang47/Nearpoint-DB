@@ -1,0 +1,11 @@
+[package]
+name = "index"
+description = "The Index trait and its flat, HNSW and IVF-PQ implementations."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "quant"
+description = "k-means, product quantization, scalar quantization."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

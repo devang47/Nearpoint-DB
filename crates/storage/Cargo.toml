@@ -1,0 +1,11 @@
+[package]
+name = "storage"
+description = "WAL, segment file format, mmap and checksums."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

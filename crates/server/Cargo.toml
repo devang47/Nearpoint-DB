@@ -1,0 +1,11 @@
+[package]
+name = "server"
+description = "Nearpoint HTTP server (axum)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

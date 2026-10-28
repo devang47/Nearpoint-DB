@@ -1,0 +1,10 @@
+/target
+.context/
+.DS_Store
+# Datasets live in ~/data/Nearpoint/, never in the repo. Belt and braces:
+*.fvecs
+*.ivecs
+*.bvecs
+*.fbin
+*.u8bin
+*.ibin
