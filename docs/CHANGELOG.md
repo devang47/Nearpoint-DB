@@ -40,11 +40,14 @@ Format:
   proptested against and the baseline for the ≥4× speedup target. The int8
   return types are exact up to dim 65,536 (tested at the extremes).
 
-## 2026-10-28 — Dataset downloader (task 1.3, in progress)
-- **What:** `tools/fetch-dataset.sh siftsmall|sift1m` (curl + tar, resumable,
-  checks every file's size); `#[ignore]`d test loading the real siftsmall.
-- **Why:** task 1.3. The texmex FTP mirror runs at ~30 KB/s, so SIFT1M takes
-  over an hour; the task is ticked once it lands and verifies.
+## 2026-10-28 — Dataset downloader (task 1.3)
+- **What:** `tools/fetch-dataset.sh siftsmall|sift1m [--mirror hf]` (curl +
+  tar, resumable, checks every file's size); `#[ignore]`d test loading the
+  real siftsmall. siftsmall and SIFT1M are in `~/data/Nearpoint/`.
+- **Why:** task 1.3. The canonical texmex FTP runs at ~30 KB/s (SIFT1M ≈ 1.5 h),
+  so `--mirror hf` pulls the extracted files from a third-party Hugging Face
+  copy (`qbo-odp/sift1m`) in ~2 min. It's trusted only after the size checks
+  and after brute force (1.7) reproduces its ground truth exactly.
 
 ## 2026-10-28 — Dataset loaders (task 1.2)
 - **What:** `crates/bench` gains a library with `dataset::{read_xvecs,

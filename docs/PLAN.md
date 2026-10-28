@@ -32,9 +32,10 @@ ANN cores are hand-written. Decisions layered on top of that
       Support reading the first N vectors only (the 1B files' header still
       says 1B, so N must override the header count).
       Plus the big-ann ground-truth .ibin (ids then distances).
-- [ ] 1.3 `tools/fetch-dataset.sh` (curl + tar) for SIFT10K (siftsmall)
+- [x] 1.3 `tools/fetch-dataset.sh` (curl + tar) for SIFT10K (siftsmall)
       and SIFT1M into ~/data/Nearpoint/; checks `df -h` first, resumable
-      (`curl -C -`), verifies sizes after extraction.
+      (`curl -C -`), verifies sizes after extraction. `--mirror hf` for
+      SIFT1M: the texmex FTP runs at ~30 KB/s (~1.5 h), HF takes ~2 min.
 - [x] 1.4 Scalar L2, inner product, cosine (f32), plus int8 L2/dot. Scalar
       references are plain sequential loops (no manual unrolling), so they
       are the honest baseline for the NEON speedup.
