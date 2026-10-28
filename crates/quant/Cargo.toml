@@ -6,6 +6,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+kernels = { path = "../kernels" }
+rand.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
