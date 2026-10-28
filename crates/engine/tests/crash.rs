@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use engine::collection::{Collection, Config};
+use engine::collection::{Collection, Config, SearchOptions};
 use index::{Metric, hnsw};
 use serde_json::{Value, json};
 use storage::wal::SyncPolicy;
@@ -32,6 +32,7 @@ fn config() -> Config {
             ef_construction: 32,
             seed: 7,
         },
+        schema: Default::default(),
         sync: SyncPolicy::Batch,
     }
 }
@@ -145,7 +146,7 @@ fn verify(dir: &Path, model: &mut Model, in_flight: Option<Op>, ctx: &str) {
     }
     let mut took_in_flight = false;
     for id in 0..IDS {
-        let got = c.get(id).map(|(v, p)| (v.to_vec(), p));
+        let got = c.get(id);
         if got != expect(model, id) {
             assert_eq!(
                 got,
@@ -159,11 +160,14 @@ fn verify(dir: &Path, model: &mut Model, in_flight: Option<Op>, ctx: &str) {
         *model = alt;
     }
     assert_eq!(c.len(), model.len(), "{ctx}: live count");
-    let hits = c.search(&vector(0, 0), IDS as usize, None).expect("search");
-    for (id, _) in &hits {
+    let hits = c
+        .search(&vector(0, 0), IDS as usize, &SearchOptions::default())
+        .expect("search");
+    for m in &hits {
         assert!(
-            model.contains_key(id),
-            "{ctx}: search returned dead id {id}"
+            model.contains_key(&m.id),
+            "{ctx}: search returned dead id {}",
+            m.id
         );
     }
 }

@@ -23,6 +23,7 @@ fn config() -> Config {
             ef_construction: 32,
             seed: 7,
         },
+        schema: Default::default(),
         sync: SyncPolicy::Batch,
     }
 }
@@ -57,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state = splitmix64(state);
         state
     };
-    let (mut c, _) = Collection::open(&dir, config())?;
+    let (c, _) = Collection::open(&dir, config())?;
     loop {
         let r = rand();
         let id = r % IDS;

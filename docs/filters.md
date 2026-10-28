@@ -26,6 +26,12 @@ float column accepts integers, because JavaScript sends `10.0` as `10`.
 The reverse doesn't work: if a field's first value is `10`, a later `10.5`
 is rejected. Keyword and keyword-list fields are different types too.
 
+To fix a field's type up front, declare it in the collection's `schema`
+when creating it (`docs/api.md`, ADR 0011), e.g. `{"price": "float"}`:
+every segment then has that column from the start, so `10` and `10.5`
+are both accepted in any order. Undeclared fields keep the first-value
+rule.
+
 ## Filter expressions
 
 A filter is a JSON object with exactly one operator key:

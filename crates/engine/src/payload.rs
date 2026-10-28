@@ -1,9 +1,10 @@
 //! Per-segment payload store: one typed column per field, keyed by the
 //! dense row id (`u32`) the segment's index hands out.
 //!
-//! A field's type is fixed by its first value; a conflicting later value is
-//! an error, with one widening: a float column accepts JSON integers (JS
-//! clients can't send `10.0`). JSON `null` and `[]` mean "missing".
+//! A field's type is fixed by the collection's schema if it declares the
+//! field, else by its first value; a conflicting later value is an error,
+//! with one widening: a float column accepts JSON integers (JS clients
+//! can't send `10.0`). JSON `null` and `[]` mean "missing".
 //!
 //! Rows are append-only: a mutable segment inserts them in increasing order
 //! and an upsert is a tombstone plus a new row, so no column is ever
@@ -13,12 +14,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{Error, Result};
 
-/// A column's type, fixed by the first value the field gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A column's type, fixed by the schema or the first value the field gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Int,
     Float,
@@ -28,6 +31,11 @@ pub enum Kind {
     /// A non-empty array of strings (tags). Scalars and lists don't mix.
     KeywordList,
 }
+
+/// Declared field types (`{"price": "float"}`): every segment of the
+/// collection gets these columns up front, so the first value can't pick
+/// another type. Undeclared fields keep the first-value rule.
+pub type Schema = BTreeMap<String, Kind>;
 
 #[derive(Debug, Default)]
 pub struct PayloadStore {
@@ -141,12 +149,7 @@ impl Column {
         }
     }
 
-    fn accepts(&self, v: &Parsed) -> bool {
-        let (column, got) = (self.kind(), v.kind());
-        column == got || (column == Kind::Float && got == Kind::Int)
-    }
-
-    /// Call only after `accepts(v)`.
+    /// Call only after `accepts(self.kind(), v.kind())`.
     fn push(&mut self, row: u32, v: Parsed) {
         let r = row as usize;
         match (&mut self.data, v) {
@@ -186,6 +189,10 @@ impl Column {
     }
 }
 
+fn accepts(column: Kind, got: Kind) -> bool {
+    column == got || (column == Kind::Float && got == Kind::Int)
+}
+
 /// Sets `vals[r] = v`, filling skipped rows with the default.
 fn put<T: Default + Clone>(vals: &mut Vec<T>, r: usize, v: T) {
     vals.resize(r, T::default());
@@ -219,6 +226,14 @@ impl PayloadStore {
         PayloadStore::default()
     }
 
+    pub fn with_schema(schema: &Schema) -> PayloadStore {
+        let columns = schema
+            .iter()
+            .map(|(name, &kind)| (name.clone(), Column::new(kind)))
+            .collect();
+        PayloadStore { columns, len: 0 }
+    }
+
     /// One past the highest row inserted (rows skipped have no payload).
     pub fn len(&self) -> u32 {
         self.len
@@ -250,10 +265,28 @@ impl PayloadStore {
         Ok(())
     }
 
-    /// Whether `insert` would accept `payload` (row order aside), without
-    /// storing it. Lets a writer validate before logging the write.
-    pub fn check(&self, payload: &Value) -> Result<()> {
-        self.parse_all(payload).map(drop)
+    /// Whether `insert` would accept `payloads` one after another (row
+    /// order aside), without storing them. Lets a writer validate a whole
+    /// batch before logging it: a field new to the store gets its type
+    /// from its first value in the batch.
+    pub fn check(&self, payloads: &[Value]) -> Result<()> {
+        let mut new: HashMap<&str, Kind> = HashMap::new();
+        for p in payloads {
+            for (name, v) in self.parse_all(p)? {
+                if self.columns.contains_key(name) {
+                    continue; // checked by `parse_all`
+                }
+                let column = *new.entry(name).or_insert(v.kind());
+                if !accepts(column, v.kind()) {
+                    return Err(Error::TypeConflict {
+                        field: name.clone(),
+                        column,
+                        got: v.kind(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_all<'a>(&self, payload: &'a Value) -> Result<Vec<(&'a String, Parsed<'a>)>> {
@@ -266,7 +299,7 @@ impl PayloadStore {
         for (name, v) in fields {
             let Some(v) = parse(name, v)? else { continue };
             if let Some(col) = self.columns.get(name)
-                && !col.accepts(&v)
+                && !accepts(col.kind(), v.kind())
             {
                 return Err(Error::TypeConflict {
                     field: name.clone(),
@@ -346,6 +379,31 @@ mod tests {
         assert_eq!(e, Err(conflict("t", Kind::KeywordList, Kind::Keyword)));
         let e = s.insert(1, &json!({"k": true}));
         assert_eq!(e, Err(conflict("k", Kind::Keyword, Kind::Bool)));
+    }
+
+    #[test]
+    fn schema_fixes_types_and_check_sees_the_whole_batch() {
+        let schema = Schema::from([("price".into(), Kind::Float), ("tag".into(), Kind::Keyword)]);
+        let mut s = PayloadStore::with_schema(&schema);
+        assert_eq!(s.kind("price"), Some(Kind::Float));
+        assert_eq!(s.get(0), None);
+        s.check(&[json!({"price": 10}), json!({"price": 10.5})])
+            .unwrap();
+        s.insert(0, &json!({"price": 10})).unwrap();
+        s.insert(1, &json!({"price": 10.5})).unwrap();
+        assert!(s.check(&[json!({"tag": 1})]).is_err());
+        // Undeclared: the batch's first value fixes the type.
+        let e = s.check(&[json!({"n": 10}), json!({"n": 10.5})]);
+        assert_eq!(
+            e,
+            Err(Error::TypeConflict {
+                field: "n".into(),
+                column: Kind::Int,
+                got: Kind::Float
+            })
+        );
+        s.check(&[json!({"n": 1.5}), json!({"n": 2})]).unwrap();
+        assert_eq!(s.kind("n"), None, "check stores nothing");
     }
 
     #[test]

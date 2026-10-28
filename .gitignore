@@ -8,3 +8,4 @@
 *.fbin
 *.u8bin
 *.ibin
+__pycache__/
