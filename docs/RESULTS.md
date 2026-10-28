@@ -9,9 +9,25 @@ id-match figure is always recorded beside it. Warm cache unless noted.
 
 | Date | Task | Dataset | Index + params | Seed | recall@10 | p50 | p99 | QPS | Peak RSS | Peak phys_footprint | Disk | Build time | Commit |
 |------|------|---------|----------------|------|-----------|-----|-----|-----|----------|---------------------|------|------------|--------|
+| 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 **ef=64** | 42 | **0.9632** (0.9625) | **0.106 ms** | 0.138 ms | 9512 | 1257 MiB | 1256 MiB | – | **44.4 s** | 5839104 |
+| 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 ef=128 | 42 | 0.9894 (0.9888) | 0.192 ms | 0.244 ms | 5367 | 1257 MiB | 1256 MiB | – | 44.4 s | 5839104 |
+| 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 ef=256 | 42 | 0.9972 (0.9967) | 0.346 ms | 0.449 ms | 2988 | 1257 MiB | 1256 MiB | – | 44.4 s | 5839104 |
+| 2026-10-28 | 2.2 | SIFT1M | flat, exact, 10 threads per query | – | 1.0000 (0.9994) | 4.65 ms | 5.28 ms | 213 | 988 MiB | 988 MiB | – | 0.1 s | 5839104 |
 | 2026-10-28 | 1.7 | SIFT1M (1M base, 10k queries) | flat, exact, 1 thread | – | **1.0000** (id match 0.9994) | 7.82 ms | 9.39 ms | 126.7 | 499 MiB | 499 MiB | – | – | 8c51523 |
 | 2026-10-28 | 1.7 | siftsmall (10k base, 100 queries) | flat, exact, 1 thread | – | 1.0000 (id match 1.0000) | 0.16 ms | 0.28 ms | 5686 | 7 MiB | 6 MiB | – | – | 8c51523 |
 
+- **2026-10-28 Phase 2:** target "recall@10 ≥ 0.95 at p50 ≤ 2 ms, build
+  ≤ 10 min" **met** (0.9632 at 0.106 ms; 44.4 s). Full curve, ef 10–256:
+  `docs/results/sift1m-phase2.csv`. Queries run one at a time on one
+  thread; the build uses all 10.
+- **Memory caveat:** the harness keeps its own copy of the base vectors
+  (488 MiB) to recompute true distances, so the index's own share is peak
+  minus ~0.5 GB: ~0.77 GB for HNSW (vectors 488 MiB + layer-0 links
+  126 MiB + upper layers, locks, per-thread visited sets).
+- **Flat is memory-bound:** 10 threads are only 1.7× faster than 1
+  (7.82 → 4.65 ms). Each query streams 512 MB, and 512 MB / 4.65 ms ≈
+  110 GB/s, close to the M4's ~120 GB/s. More cores won't help it;
+  smaller vectors (int8, PQ) will.
 - **2026-10-28 SIFT1M flat:** Phase 1 target "brute force matches ground
   truth exactly" **met**. All 56 queries with an id mismatch return exactly
   the ground truth's 10 distances; the two just break equal-distance ties

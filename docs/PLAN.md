@@ -55,13 +55,18 @@ ANN cores are hand-written. Decisions layered on top of that
 0.9994, all ties); NEON f32 L2 4.4× scalar at dim 128.
 
 ## Phase 2: In-memory indexes
-- [ ] 2.1 `Index` trait: build, insert, search(query, k, params) → ids + distances.
-- [ ] 2.2 Flat (brute-force) index, multithreaded with rayon.
-- [ ] 2.3 HNSW: layered graph, configurable M, ef_construction, ef_search;
-      parallel build.
-- [ ] 2.4 Parameter sweep tool: recall vs latency curves written as CSV.
+- [x] 2.1 `Index` trait: build, insert, search(query, k, params) → ids + distances.
+      As built: `add(batch)` covers build and insert (dyn-compatible);
+      metrics L2 / inner product / cosine (normalized on insert).
+- [x] 2.2 Flat (brute-force) index, multithreaded with rayon.
+- [x] 2.3 HNSW: layered graph, configurable M, ef_construction, ef_search;
+      parallel build. Design in `docs/adr/0003-hnsw-concurrency.md`.
+- [x] 2.4 Parameter sweep tool: recall vs latency curves written as CSV
+      (`bench --ef a,b,c --csv out.csv`; curves in `docs/results/`).
 **Acceptance:** HNSW on SIFT1M reaches recall@10 ≥ 0.95 at p50 ≤ 2 ms
 single-threaded query; build ≤ 10 min.
+**Status (2026-10-28): met.** M=16, efc=200, ef=64: recall@10 0.9632 at
+p50 0.106 ms; build 44.4 s on 10 threads.
 
 ## Phase 3: Durability
 - [ ] 3.1 WAL: length-prefixed records (upsert/delete), CRC32 per record,

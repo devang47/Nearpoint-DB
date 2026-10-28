@@ -15,6 +15,15 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Index trait, flat, HNSW, sweeps; Phase 2 accepted (2.1–2.4)
+- **What:** `crates/index`: `Index` trait (`add`/`search`, three metrics),
+  rayon-parallel `Flat`, and `Hnsw` (parallel build, selection heuristic,
+  O(1)-reset visited set). `bench`: `--index hnsw`, `--m`, `--ef-construction`,
+  `--ef` sweep, `--csv`. ADR 0003; curve in `docs/results/sift1m-phase2.csv`.
+- **Why:** Phase 2. SIFT1M: recall@10 0.9632 at p50 0.106 ms (target ≥ 0.95
+  at ≤ 2 ms), build 44.4 s (target ≤ 10 min). A test caught a race that left
+  nodes unlinked on upper layers; fixed with hnswlib's approach (ADR 0003).
+
 ## 2026-10-28 — Bench harness; Phase 1 accepted (task 1.7)
 - **What:** `bench` binary (`--dataset siftsmall|sift1m --index flat --k
   --queries`): recall@k (tie-aware + id match), p50/p95/p99, single-thread
