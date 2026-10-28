@@ -51,6 +51,16 @@ pub fn l2_sq_i8(a: &[i8], b: &[i8]) -> u32 {
     unsafe { l2_sq_i8_udot(a, b) }
 }
 
+/// Same contract as [`scalar::pq4_scan`], bit-exact.
+pub fn pq4_scan(blocks: &[u8], lut: &[u8], out: &mut [u16]) {
+    let m = lut.len() / 16;
+    assert!(m > 0 && lut.len() == m * 16);
+    assert_eq!(blocks.len() / (m * 16) * scalar::PQ4_BLOCK, out.len());
+    assert!(blocks.len().is_multiple_of(m * 16));
+    // SAFETY: NEON is part of the aarch64 baseline, so it's always available.
+    unsafe { pq4_scan_tbl(blocks, lut, out) }
+}
+
 #[target_feature(enable = "neon")]
 fn l2_sq_f32(a: &[f32], b: &[f32]) -> f32 {
     let (ca, ta) = a.as_chunks::<16>();
@@ -86,6 +96,34 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         acc[3] = vfmaq_f32(acc[3], x.3, y.3);
     }
     sum_f32(acc) + scalar::dot(ta, tb)
+}
+
+// Per 16-byte group: split the nibbles, look both halves up in the
+// sub-quantizer's 16-entry table with TBL, and widen-add into four u16x8
+// accumulators (vectors 0-7, 8-15, 16-23, 24-31).
+#[target_feature(enable = "neon")]
+fn pq4_scan_tbl(blocks: &[u8], lut: &[u8], out: &mut [u16]) {
+    let m = lut.len() / 16;
+    let tables = lut.as_chunks::<16>().0;
+    let low = vdupq_n_u8(0xF);
+    let outs = out.as_chunks_mut::<32>().0;
+    for (block, o) in blocks.chunks_exact(m * 16).zip(outs) {
+        let mut acc = [vdupq_n_u16(0); 4];
+        for (g, t) in block.as_chunks::<16>().0.iter().zip(tables) {
+            // SAFETY: g and t are [u8; 16], exactly one register each.
+            let (g, t) = unsafe { (vld1q_u8(g.as_ptr()), vld1q_u8(t.as_ptr())) };
+            let lo = vqtbl1q_u8(t, vandq_u8(g, low));
+            let hi = vqtbl1q_u8(t, vshrq_n_u8::<4>(g));
+            acc[0] = vaddw_u8(acc[0], vget_low_u8(lo));
+            acc[1] = vaddw_high_u8(acc[1], lo);
+            acc[2] = vaddw_u8(acc[2], vget_low_u8(hi));
+            acc[3] = vaddw_high_u8(acc[3], hi);
+        }
+        for (dst, a) in o.as_chunks_mut::<8>().0.iter_mut().zip(acc) {
+            // SAFETY: dst is [u16; 8], exactly one register.
+            unsafe { vst1q_u16(dst.as_mut_ptr(), a) };
+        }
+    }
 }
 
 #[target_feature(enable = "neon")]
@@ -196,6 +234,21 @@ mod tests {
         fn cosine_matches_scalar((a, b) in f32_pair()) {
             let (got, want) = (cosine_distance(&a, &b), scalar::cosine_distance(&a, &b));
             prop_assert!(close(got, want, 1.0), "{got} vs {want}");
+        }
+
+        // m up to 300 includes sums that wrap u16 (m > 257), which both
+        // must do identically.
+        #[test]
+        fn pq4_scan_is_exact(
+            (blocks, lut) in (1usize..300, 0usize..4).prop_flat_map(|(m, nb)| {
+                (vec(any::<u8>(), nb * m * 16), vec(any::<u8>(), m * 16))
+            }),
+        ) {
+            let n = blocks.len() / lut.len() * 32;
+            let (mut got, mut want) = (vec![1u16; n], vec![2u16; n]);
+            pq4_scan(&blocks, &lut, &mut got);
+            scalar::pq4_scan(&blocks, &lut, &mut want);
+            prop_assert_eq!(got, want);
         }
     }
 

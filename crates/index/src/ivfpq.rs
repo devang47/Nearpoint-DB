@@ -4,6 +4,10 @@
 //! `nprobe` nearest lists with an ADC table built for its own residual in
 //! each list. Design in docs/adr/0009-ivf-pq.md.
 //!
+//! Codes are 8-bit (one table lookup per byte) or 4-bit, stored in the
+//! fast-scan block layout (`kernels::pq4_set`) and scanned 32 at a time
+//! with u8-quantized tables (`kernels::pq4_scan`).
+//!
 //! L2 only: `new` rejects other metrics.
 //!
 //! Building is `train` (k-means and PQ codebooks on a sample) then `add`;
@@ -23,7 +27,7 @@ pub struct Config {
     pub nlist: usize,
     /// PQ subspaces = bytes per code. Must divide `dim`.
     pub m: usize,
-    /// Bits per PQ sub-code: 8.
+    /// Bits per PQ sub-code: 8, or 4 for fast-scan (then `m <= 256`).
     pub nbits: u32,
     /// Train on a random sample of at most this many vectors.
     pub max_train: usize,
@@ -59,7 +63,8 @@ struct Quantizers {
 #[derive(Default)]
 struct List {
     ids: Vec<u32>,
-    /// PQ codes of the residuals, `m` bytes each, in `ids` order.
+    /// PQ codes of the residuals in `ids` order: `m` bytes each (8-bit),
+    /// or 4-bit fast-scan blocks of 32 vectors, the last one zero-padded.
     codes: Vec<u8>,
 }
 
@@ -73,8 +78,8 @@ impl IvfPq {
                 "need dim > 0, nlist > 0, m dividing dim",
             ));
         }
-        if cfg.nbits != 8 {
-            return Err(Error::InvalidConfig("nbits must be 8"));
+        if !(cfg.nbits == 8 || cfg.nbits == 4 && cfg.m <= 256) {
+            return Err(Error::InvalidConfig("nbits must be 8, or 4 with m <= 256"));
         }
         Ok(IvfPq {
             dim,
@@ -146,17 +151,51 @@ impl IvfPq {
         for &c in &cells {
             grow[c as usize] += 1;
         }
+        let four = self.cfg.nbits == 4;
         for (list, g) in self.lists.iter_mut().zip(grow) {
             list.ids.reserve_exact(g);
-            list.codes.reserve_exact(g * m);
+            if four {
+                let blocks = (list.ids.len() + g).div_ceil(kernels::PQ4_BLOCK);
+                list.codes.reserve_exact(blocks * m * 16 - list.codes.len());
+            } else {
+                list.codes.reserve_exact(g * m);
+            }
         }
         for (i, (&c, code)) in cells.iter().zip(codes.chunks_exact(m)).enumerate() {
             let list = &mut self.lists[c as usize];
+            let at = list.ids.len();
             list.ids.push((self.len + i) as u32);
-            list.codes.extend_from_slice(code);
+            if !four {
+                list.codes.extend_from_slice(code);
+                continue;
+            }
+            if at.is_multiple_of(kernels::PQ4_BLOCK) {
+                list.codes.resize(list.codes.len() + m * 16, 0);
+            }
+            kernels::pq4_set(&mut list.codes, at, code);
         }
         self.len += n;
     }
+}
+
+/// Quantizes a float ADC table (`m` rows of 16) to u8 for `pq4_scan`:
+/// each row minus its minimum, all scaled by one factor so the widest row
+/// spans 0..=255. Returns `(bias, step)`: a u16 sum `s` of quantized
+/// entries approximates the float sum as `bias + s * step`. With `m <= 256`
+/// the sum can't overflow u16.
+fn quantize_lut(table: &[f32], lut: &mut Vec<u8>) -> (f32, f32) {
+    let rows = table.as_chunks::<16>().0;
+    let lo = |r: &[f32; 16]| r.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = |r: &[f32; 16]| r.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let bias: f32 = rows.iter().map(lo).sum();
+    let span = rows.iter().map(|r| hi(r) - lo(r)).fold(0f32, f32::max);
+    let scale = if span > 0.0 { 255.0 / span } else { 1.0 };
+    lut.clear();
+    for r in rows {
+        let min = lo(r);
+        lut.extend(r.iter().map(|&x| ((x - min) * scale).round() as u8));
+    }
+    (bias, 1.0 / scale)
 }
 
 /// `v -= c`, component-wise.
@@ -239,6 +278,7 @@ impl Index for IvfPq {
             }
         };
         let mut residual = vec![0f32; self.dim];
+        let (mut lut, mut sums) = (Vec::new(), Vec::new());
         for cell in &cells {
             let list = &self.lists[cell.id as usize];
             if list.ids.is_empty() {
@@ -247,8 +287,17 @@ impl Index for IvfPq {
             residual.copy_from_slice(query);
             subtract(&mut residual, q.coarse.get(cell.id as usize));
             let table = q.pq.distance_table(&residual);
-            for (&id, code) in list.ids.iter().zip(list.codes.chunks_exact(self.cfg.m)) {
-                offer(id, quant::adc_distance(&table, code));
+            if self.cfg.nbits == 8 {
+                for (&id, code) in list.ids.iter().zip(list.codes.chunks_exact(self.cfg.m)) {
+                    offer(id, quant::adc_distance(&table, code));
+                }
+                continue;
+            }
+            let (bias, step) = quantize_lut(&table, &mut lut);
+            sums.resize(list.ids.len().next_multiple_of(kernels::PQ4_BLOCK), 0);
+            kernels::pq4_scan(&list.codes, &lut, &mut sums);
+            for (&id, &s) in list.ids.iter().zip(&sums) {
+                offer(id, bias + f32::from(s) * step);
             }
         }
         Ok(best.into_sorted_vec())
@@ -293,21 +342,59 @@ mod tests {
     fn probing_more_lists_finds_more() {
         let data = test_data::vectors(3000, DIM, 1);
         let queries = test_data::vectors(50, DIM, 2);
-        let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
-        assert_eq!(ivf.add(&data[..2000 * DIM]).unwrap(), 0..2000);
-        assert_eq!(ivf.add(&data[2000 * DIM..]).unwrap(), 2000..3000);
-        assert_eq!(ivf.lists.iter().map(|l| l.ids.len()).sum::<usize>(), 3000);
+        // 4-bit with m = 16 is the same 8 bytes per vector as 8-bit m = 8.
+        for cfg in [
+            cfg(),
+            Config {
+                nbits: 4,
+                m: 16,
+                ..cfg()
+            },
+        ] {
+            let mut ivf = IvfPq::new(DIM, Metric::L2, cfg).unwrap();
+            // Batches that end mid-block, so 4-bit appends into a
+            // partly filled block.
+            assert_eq!(ivf.add(&data[..2001 * DIM]).unwrap(), 0..2001);
+            assert_eq!(ivf.add(&data[2001 * DIM..]).unwrap(), 2001..3000);
+            assert_eq!(ivf.lists.iter().map(|l| l.ids.len()).sum::<usize>(), 3000);
 
-        let at = |nprobe| {
-            let p = SearchParams {
-                nprobe,
-                ..SearchParams::default()
+            let at = |nprobe| {
+                let p = SearchParams {
+                    nprobe,
+                    ..SearchParams::default()
+                };
+                recall(&ivf, &data, &queries, 10, &p)
             };
-            recall(&ivf, &data, &queries, 10, &p)
+            let (one, all) = (at(1), at(16));
+            assert!(one < all, "nbits {}: nprobe 1: {one}, 16: {all}", cfg.nbits);
+            assert!(all > 0.6, "nbits {}: {all}", cfg.nbits);
+        }
+    }
+
+    #[test]
+    fn four_bit_distances_track_the_float_tables() {
+        let data = test_data::vectors(2000, DIM, 7);
+        let mut ivf = IvfPq::new(DIM, Metric::L2, Config { nbits: 4, ..cfg() }).unwrap();
+        ivf.add(&data).unwrap();
+        let q = &data[5 * DIM..][..DIM];
+        let p = SearchParams {
+            nprobe: 16,
+            ..SearchParams::default()
         };
-        let (one, all) = (at(1), at(16));
-        assert!(one < all, "nprobe 1: {one}, nprobe 16: {all}");
-        assert!(all > 0.6, "{all}");
+        let quant = ivf.quant.as_ref().unwrap();
+        for h in ivf.search(q, 20, &p).unwrap() {
+            let v = &data[h.id as usize * DIM..][..DIM];
+            let c = quant.coarse.get(quant.coarse.assign(v).0 as usize);
+            let (mut r, mut rq) = (v.to_vec(), q.to_vec());
+            subtract(&mut r, c);
+            subtract(&mut rq, c);
+            let table = quant.pq.distance_table(&rq);
+            let want = quant::adc_distance(&table, &quant.pq.encode(&r));
+            let (_, step) = quantize_lut(&table, &mut Vec::new());
+            // Each of the m entries is off by at most half a step.
+            let bound = ivf.cfg.m as f32 * step / 2.0 + 1e-4 * want;
+            assert!((h.dist - want).abs() <= bound, "{h:?} vs {want} ± {bound}");
+        }
     }
 
     #[test]
@@ -366,6 +453,12 @@ mod tests {
         assert!(IvfPq::new(DIM, Metric::Cosine, cfg()).is_err());
         assert!(IvfPq::new(DIM, Metric::L2, Config { m: 5, ..cfg() }).is_err());
         assert!(IvfPq::new(DIM, Metric::L2, Config { nbits: 3, ..cfg() }).is_err());
+        let wide = Config {
+            nbits: 4,
+            m: 512,
+            ..cfg()
+        };
+        assert!(IvfPq::new(512, Metric::L2, wide).is_err()); // u16 sums could wrap
 
         let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
         let p = SearchParams::default();
