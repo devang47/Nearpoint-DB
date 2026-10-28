@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use rayon::prelude::*;
 
-use crate::{Hit, Index, Metric, Result, SearchParams, batch_ids, check_dim};
+use crate::{Error, Hit, Index, Metric, Result, SearchParams, batch_ids, blob, check_dim};
 
 /// Rows per rayon task: big enough to amortize scheduling, small enough
 /// that 1M rows give every core plenty of work (~61 tasks).
@@ -27,7 +27,43 @@ impl Flat {
             data: Vec::new(),
         }
     }
+
+    /// The stored vectors, row-major, in stored form (unit length for
+    /// cosine). This is what a segment's vector section holds.
+    pub fn vectors(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// The index blob: config only, since the vectors live in the
+    /// segment's vector section. Layout in docs/formats/segment.md.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24);
+        blob::put_header(&mut out, MAGIC, self.dim, self.metric);
+        blob::put_u64(&mut out, self.len() as u64);
+        out
+    }
+
+    /// Rebuilds a `Flat` from its blob and its vectors (in stored form, as
+    /// `vectors()` returned them; they are not normalized again). Takes
+    /// ownership, so loading from a mapped segment means one copy.
+    pub fn from_bytes(bytes: &[u8], vectors: Vec<f32>) -> Result<Flat> {
+        let mut r = blob::Reader::new(bytes);
+        let (dim, metric) = r.header(MAGIC)?;
+        let n = r.u64()?;
+        r.finish()?;
+        blob::check_vectors(&vectors, n, dim)?;
+        if n > u64::from(u32::MAX) {
+            return Err(Error::Corrupt("more vectors than u32 ids"));
+        }
+        Ok(Flat {
+            dim,
+            metric,
+            data: vectors,
+        })
+    }
 }
+
+const MAGIC: &[u8; 4] = b"NPFL";
 
 impl Index for Flat {
     fn dim(&self) -> usize {
@@ -151,6 +187,32 @@ mod tests {
         assert_eq!(ids(&hits), [1, 0, 2]);
         assert!(hits[0].dist < 1e-3);
         assert!((hits[2].dist - 1.0).abs() < 1e-6); // zero vector: distance 1
+    }
+
+    #[test]
+    fn blob_round_trip_and_corruption() {
+        let mut f = Flat::new(3, Metric::Cosine);
+        f.add(&test_data::vectors(50, 3, 4)).unwrap();
+        let bytes = f.to_bytes();
+        let g = Flat::from_bytes(&bytes, f.vectors().to_vec()).unwrap();
+        assert_eq!(
+            (g.dim(), g.metric(), g.vectors()),
+            (3, Metric::Cosine, f.vectors())
+        );
+        let q = [0.3, -0.2, 0.9];
+        let p = SearchParams::default();
+        assert_eq!(g.search(&q, 5, &p).unwrap(), f.search(&q, 5, &p).unwrap());
+
+        for len in 0..bytes.len() {
+            assert!(Flat::from_bytes(&bytes[..len], f.vectors().to_vec()).is_err());
+        }
+        assert!(Flat::from_bytes(&bytes, f.vectors()[3..].to_vec()).is_err());
+        let mut b = bytes.clone();
+        b[12] = 9; // metric code
+        assert_eq!(
+            Flat::from_bytes(&b, f.vectors().to_vec()).err(),
+            Some(Error::Corrupt("unknown metric"))
+        );
     }
 
     #[test]

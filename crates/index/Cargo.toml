@@ -13,6 +13,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+storage = { path = "../storage" } # end-to-end segment test only; storage never depends on index
 
 [lints]
 workspace = true

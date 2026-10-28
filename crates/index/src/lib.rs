@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::Range;
 
+mod blob;
 pub mod flat;
 pub mod hnsw;
 mod visited;
@@ -20,6 +21,10 @@ pub enum Error {
     DimMismatch { expected: usize, got: usize },
     #[error("index is full (u32 ids)")]
     Full,
+    #[error("corrupt index blob: {0}")]
+    Corrupt(&'static str),
+    #[error("index blob version {0} is not supported (this build reads up to {v})", v = blob::VERSION)]
+    UnsupportedBlobVersion(u32),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -36,6 +41,24 @@ pub enum Metric {
 }
 
 impl Metric {
+    /// The metric's code on disk (segment header, index blobs).
+    pub fn code(self) -> u32 {
+        match self {
+            Metric::L2 => 0,
+            Metric::InnerProduct => 1,
+            Metric::Cosine => 2,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Option<Metric> {
+        match code {
+            0 => Some(Metric::L2),
+            1 => Some(Metric::InnerProduct),
+            2 => Some(Metric::Cosine),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn distance(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
