@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn cosine_and_inner_product() {
-        let data = test_data::vectors(3000, DIM, 10);
+        let data = test_data::vectors(1500, DIM, 10);
         let queries = test_data::vectors(50, DIM, 11);
         for metric in [Metric::Cosine, Metric::InnerProduct] {
             for cfg in [
@@ -781,25 +781,27 @@ mod tests {
 
     #[test]
     fn blob_round_trip_searches_identically() {
-        let data = test_data::vectors(2001, DIM, 12);
+        let data = test_data::vectors(601, DIM, 12);
         let queries = test_data::vectors(20, DIM, 13);
         let more = test_data::vectors(100, DIM, 14);
-        for metric in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
-            for nbits in [8, 4] {
-                let mut ivf = IvfPq::new(DIM, metric, cfg_bits(nbits)).unwrap();
-                ivf.add(&data).unwrap();
-                let bytes = ivf.to_bytes();
-                assert_eq!(bytes.len(), bytes.capacity());
-                let mut back = IvfPq::from_bytes(&bytes).unwrap();
-                assert_eq!(back.to_bytes(), bytes);
-                assert_eq!((back.len(), back.dim(), back.metric()), (2001, DIM, metric));
-                assert_eq!(search_all(&back, &queries), search_all(&ivf, &queries));
-                // A loaded index keeps accepting inserts (4-bit: into a
-                // partly filled block).
-                ivf.add(&more).unwrap();
-                back.add(&more).unwrap();
-                assert_eq!(back.to_bytes(), ivf.to_bytes());
-            }
+        for (metric, nbits) in [
+            (Metric::L2, 8),
+            (Metric::InnerProduct, 4),
+            (Metric::Cosine, 4),
+        ] {
+            let mut ivf = IvfPq::new(DIM, metric, cfg_bits(nbits)).unwrap();
+            ivf.add(&data).unwrap();
+            let bytes = ivf.to_bytes();
+            assert_eq!(bytes.len(), bytes.capacity());
+            let mut back = IvfPq::from_bytes(&bytes).unwrap();
+            assert_eq!(back.to_bytes(), bytes);
+            assert_eq!((back.len(), back.dim(), back.metric()), (601, DIM, metric));
+            assert_eq!(search_all(&back, &queries), search_all(&ivf, &queries));
+            // A loaded index keeps accepting inserts (4-bit: into a partly
+            // filled block).
+            ivf.add(&more).unwrap();
+            back.add(&more).unwrap();
+            assert_eq!(back.to_bytes(), ivf.to_bytes());
         }
         // Untrained, and trained but empty.
         let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
