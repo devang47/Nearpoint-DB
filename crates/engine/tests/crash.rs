@@ -33,6 +33,10 @@ fn config() -> Config {
             seed: 7,
         },
         schema: Default::default(),
+        // Small, so background seals and merges run in most cycles.
+        seal_rows: 16,
+        ivf_rows: 1024,
+        max_merge_rows: 1_000_000,
         sync: SyncPolicy::Batch,
     }
 }
@@ -70,7 +74,7 @@ fn parse(line: &str) -> Op {
     match f[0] {
         "U" => Op::Upsert(n(1), n(2)),
         "D" => Op::Delete(n(1)),
-        "S" => Op::Seal,
+        "S" | "M" => Op::Seal, // seal or background step: no model change
         _ => panic!("bad child line {line:?}"),
     }
 }

@@ -15,6 +15,11 @@ cargo run --release -p server -- --data-dir ~/data/Nearpoint/db
 | `--data-dir` | `NEARPOINT_DATA_DIR` | (required) | data directory; created if missing; one server per directory (`LOCK`) |
 | `--bind` | `NEARPOINT_BIND` | `127.0.0.1:7700` | listen address |
 | `--sync` | `NEARPOINT_SYNC` | `batch` | WAL durability: `always`, `batch` (group commit) or `<n>ms` (fsync every n ms; a power loss can lose that window) |
+| `--build-threads` | `NEARPOINT_BUILD_THREADS` | `0` | threads for background index builds and compaction; 0 = half the cores, so builds don't starve searches |
+
+A background thread seals, rebuilds and compacts segments (ADR 0012):
+searches never wait for it, writes wait only for its short publish step.
+Failures are logged at `error` and retried.
 
 Logs go to stderr; `RUST_LOG` sets the level (default `info`). SIGINT or
 SIGTERM stops accepting connections, finishes requests in flight, syncs
@@ -41,7 +46,7 @@ Errors from Nearpoint are JSON: `{"error": "<message>"}`.
 
 | Status | When |
 |--------|------|
-| 400 | invalid input: wrong vector length, NaN/infinite component, payload type conflict, bad filter type, invalid config or name, `k`/`ef` over 10,000, malformed bulk body |
+| 400 | invalid input: wrong vector length, NaN/infinite component, payload type conflict, bad filter type, invalid config or name, `k`/`ef`/`nprobe`/`rerank` over 10,000, malformed bulk body |
 | 404 | no such collection, point, or the collection was dropped during the request |
 | 409 | collection already exists |
 | 413 | body over 256 MiB (plain text) |
@@ -64,7 +69,10 @@ Creates a collection. `name`: 1–64 characters of `A-Z a-z 0-9 _ -`.
   "dim": 128,
   "metric": "l2",
   "hnsw": {"m": 16, "ef_construction": 200, "seed": 42},
-  "schema": {"price": "float", "color": "keyword", "tags": "keyword_list"}
+  "schema": {"price": "float", "color": "keyword", "tags": "keyword_list"},
+  "seal_rows": 100000,
+  "ivf_rows": 1000000,
+  "max_merge_rows": 4000000
 }
 ```
 
@@ -73,7 +81,10 @@ Creates a collection. `name`: 1–64 characters of `A-Z a-z 0-9 _ -`.
 | `dim` | yes | vector dimension, > 0 |
 | `metric` | yes | `l2` (squared Euclidean), `inner_product` (negated dot) or `cosine` (1 − cos) |
 | `hnsw` | no | any of `m` (≥ 2, default 16), `ef_construction` (≥ 1, default 200), `seed` (default 42) |
-| `schema` | no | declared payload field types: `int`, `float`, `bool`, `keyword`, `keyword_list`. Undeclared fields take the type of their first value in each segment (`docs/filters.md`) |
+| `schema` | no | declared payload field types: `int`, `float`, `bool`, `keyword`, `keyword_list`. Undeclared fields take the type of their first value in each segment (`docs/filters.md`); segments whose undeclared fields differ in type are never merged, so declare fields you filter on |
+| `seal_rows` | no | the in-memory segment is sealed to disk once it has this many rows (default 100,000, ≥ 1) |
+| `ivf_rows` | no | sealed segments with at least this many rows are rebuilt as IVF-PQ, for `l2` and `cosine` (default 1,000,000, ≥ 1,024). `inner_product` collections stay HNSW and merge only below this size |
+| `max_merge_rows` | no | compaction never merges segments into one bigger than this (default 4,000,000, ≥ 1) |
 
 `201` with the collection description (below). `409` if it exists, `400`
 if invalid.
@@ -86,10 +97,16 @@ description:
 ```json
 {"name": "docs", "dim": 128, "metric": "l2",
  "hnsw": {"m": 16, "ef_construction": 200, "seed": 42},
- "schema": {"price": "float"}, "points": 1000000}
+ "schema": {"price": "float"}, "seal_rows": 100000, "ivf_rows": 1000000,
+ "max_merge_rows": 4000000, "points": 1000000,
+ "segments": [{"index": "ivf_pq", "rows": 1000000, "dead": 1200},
+              {"index": "mutable", "rows": 1200, "dead": 0}]}
 ```
 
-`points` is the live (not deleted) point count.
+`points` is the live (not deleted) point count. `segments` lists the
+current segments (`hnsw`, `ivf_pq`, then the in-memory `mutable` one) with
+their row counts, deleted or replaced rows included in `rows` and counted
+in `dead`.
 
 ### `GET /collections/{name}`
 
@@ -164,6 +181,8 @@ if none), `404` if missing or deleted.
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
   "ef": 128,
+  "nprobe": 32,
+  "rerank": 100,
   "filter": {"and": [{"eq": {"color": "red"}}, {"range": {"price": {"lt": 20}}}]},
   "with_payload": true,
   "with_vector": false
@@ -175,6 +194,8 @@ if none), `404` if missing or deleted.
 | `vector` | required | query, `dim` components |
 | `k` | 10 | results wanted, ≤ 10,000 |
 | `ef` | 64 | HNSW beam width (raised to `k`), ≤ 10,000; higher is slower and more accurate |
+| `nprobe` | 32 | IVF-PQ lists scanned per segment, ≤ 10,000 (capped at the segment's list count); higher is slower and more accurate |
+| `rerank` | 100 | IVF-PQ candidates re-scored with int8 vectors (at least `k`), ≤ 10,000 |
 | `filter` | none | filter expression, shape and semantics in `docs/filters.md`; applied during the search |
 | `with_payload` | false | include each hit's payload (`null` if none) |
 | `with_vector` | false | include each hit's stored vector |
@@ -192,9 +213,12 @@ compares a field with the wrong type (`docs/filters.md`).
 
 ### `POST /collections/{name}/seal`
 
-Writes the in-memory segment to disk and truncates the WAL (manual until
-Phase 6 seals automatically). Writes to the collection wait for it;
-searches don't. `200 {"sealed": true}`.
+Seals everything written so far: freezes the in-memory segment, writes
+it to disk, publishes it and truncates the WAL. Collections also seal on
+their own at `seal_rows`; this forces one (tests, before a backup).
+Writes go on while the files are written; searches never wait. It waits
+for a background build or compaction step in flight.
+`200 {"sealed": true}`.
 
 ## Examples
 

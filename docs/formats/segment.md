@@ -148,7 +148,10 @@ huge allocation.
 ### IVF-PQ blob v1
 
 Self-contained: loading and searching need no f32 vectors, so its segment
-is normally written with element type 1.
+can be written with element type 1. The engine (task 6.2) writes element
+type 0 anyway: `get` and `with_vector` read exact vectors from the mapped
+file (never copied into RAM), and Phase 8 can re-rank in f32 from it.
+Element type 1 is for Phase 9's compressed-only mode.
 
 | Offset | Type | Field |
 |--------|------|-------|

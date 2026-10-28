@@ -13,12 +13,18 @@
 //! (the commit point). Drop renames `<name>` to `.drop-<name>` (the commit
 //! point), then deletes it. A crash at any step leaves either the whole
 //! collection or a dot-directory the next open removes.
+//!
+//! One background thread runs `Collection::maintain` (seal, build,
+//! compaction; ADR 0012) over every collection, one step at a time, and
+//! sleeps when none had work. It stops when the Db is dropped.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use storage::framed;
 use storage::wal::SyncPolicy;
@@ -28,16 +34,74 @@ use crate::collection::{Collection, Config, Error, Result};
 const CONFIG: &str = "CONFIG";
 const CONFIG_MAGIC: [u8; 8] = *b"NPCOLCFG";
 const CONFIG_VERSION: u32 = 1;
+/// How long the background thread sleeps when no collection had work.
+const IDLE: Duration = Duration::from_millis(500);
+
+type Colls = RwLock<BTreeMap<String, Arc<Collection>>>;
 
 pub struct Db {
     dir: PathBuf,
     sync: SyncPolicy,
-    colls: RwLock<BTreeMap<String, Arc<Collection>>>,
+    colls: Arc<Colls>,
     /// Serializes create and drop, so the slow file work stays out of
     /// `colls`, which every request reads.
     admin: Mutex<()>,
+    /// Set to stop the background thread.
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
     /// Holds the exclusive lock on `<data>/LOCK` while the Db lives.
     _lock: File,
+}
+
+impl Drop for Db {
+    /// Stops the background thread after its step in flight.
+    fn drop(&mut self) {
+        *self.stop.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.stop.1.notify_all();
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// The background thread: one `maintain` step per collection per pass;
+/// errors are logged and retried after the idle wait.
+// ponytail: one thread, so one collection's long build delays the others'
+// seals; a thread per collection (or a queue) if that shows up.
+fn maintain_all(colls: &Colls, stop: &(Mutex<bool>, Condvar)) {
+    loop {
+        let list: Vec<_> = {
+            let colls = colls.read().unwrap_or_else(PoisonError::into_inner);
+            colls
+                .iter()
+                .map(|(n, c)| (n.clone(), Arc::clone(c)))
+                .collect()
+        };
+        let mut busy = false;
+        for (name, c) in list {
+            if *stop.0.lock().unwrap_or_else(PoisonError::into_inner) {
+                return;
+            }
+            match c.maintain() {
+                Ok(did) => busy |= did,
+                Err(Error::Closed) => {}
+                Err(e) => tracing::error!(collection = %name, "background step failed: {e}"),
+            }
+        }
+        let stopped = stop.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if *stopped {
+            return;
+        }
+        if !busy {
+            let (stopped, _) = stop
+                .1
+                .wait_timeout(stopped, IDLE)
+                .unwrap_or_else(PoisonError::into_inner);
+            if *stopped {
+                return;
+            }
+        }
+    }
 }
 
 impl Db {
@@ -72,11 +136,21 @@ impl Db {
             }
         }
         sync_dir(&dir)?;
+        let colls = Arc::new(RwLock::new(colls));
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = {
+            let (colls, stop) = (Arc::clone(&colls), Arc::clone(&stop));
+            std::thread::Builder::new()
+                .name("nearpoint-maintain".into())
+                .spawn(move || maintain_all(&colls, &stop))?
+        };
         Ok(Db {
             dir,
             sync,
-            colls: RwLock::new(colls),
+            colls,
             admin: Mutex::new(()),
+            stop,
+            worker: Some(worker),
             _lock: lock,
         })
     }
@@ -121,8 +195,9 @@ impl Db {
             .collect()
     }
 
-    /// Drops collection `name` and deletes its files. Writes still in
-    /// flight on it finish first; later ones fail with `Closed`.
+    /// Drops collection `name` and deletes its files. Writes and the
+    /// background step still in flight on it finish first; later writes
+    /// fail with `Closed`.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let _admin = self.admin.lock().unwrap_or_else(PoisonError::into_inner);
         let c = {
@@ -285,21 +360,58 @@ mod tests {
         assert!(!d.0.join("collections/a").exists());
     }
 
-    /// Committed v1 `CONFIG`: must keep loading.
+    /// Committed v1 `CONFIG` (written before the segment keys existed):
+    /// must keep loading, with the segment keys defaulted.
     #[test]
     fn v1_config_fixture_still_loads() {
         let d = TempDir::new("cfg");
         fs::create_dir_all(&d.0).unwrap();
-        let c = cfg(
-            json!({"dim": 4, "metric": "l2", "hnsw": {"m": 8, "ef_construction": 32, "seed": 7},
-                           "schema": {"tag": "keyword"}}),
-        );
-        let body = serde_json::to_vec(&c).unwrap();
-        let p = d.0.join(CONFIG);
-        framed::write(&p, CONFIG_MAGIC, CONFIG_VERSION, &body).unwrap();
         let fixture: &[u8] = include_bytes!("../testdata/config-v1");
-        assert_eq!(fs::read(&p).unwrap(), fixture);
+        fs::write(d.0.join(CONFIG), fixture).unwrap();
         let c = open_collection(&d.0, SyncPolicy::Batch).unwrap();
-        assert_eq!((c.config().dim, c.config().hnsw.seed), (4, 7));
+        let cfg = c.config();
+        assert_eq!((cfg.dim, cfg.hnsw.seed), (4, 7));
+        assert_eq!(cfg.schema["tag"], crate::Kind::Keyword);
+        assert_eq!(
+            (cfg.seal_rows, cfg.ivf_rows, cfg.max_merge_rows),
+            (100_000, 1_000_000, 4_000_000)
+        );
+        // New collections write the segment keys (still CONFIG v1: JSON
+        // keys are optional, so this is a compatible addition).
+        let v = serde_json::to_value(cfg).unwrap();
+        assert_eq!(v["seal_rows"], 100_000);
+        assert!(
+            serde_json::from_value::<Config>(json!({"dim": 4, "metric": "l2", "ivf_rows": 10}))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    /// The background thread seals a collection past `seal_rows`, and a
+    /// drop waits for its step in flight before deleting the directory.
+    #[test]
+    fn background_thread_seals_and_drop_waits() {
+        let d = TempDir::new("bg");
+        let db = Db::open(&d.0, SyncPolicy::Batch).unwrap();
+        let c = db
+            .create(
+                "bg",
+                cfg(json!({"dim": 2, "metric": "l2", "seal_rows": 10})),
+            )
+            .unwrap();
+        for i in 0..25u64 {
+            c.upsert(i, &[i as f32, 1.0], &Value::Null).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while c.segments().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "never sealed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(c.len(), 25);
+        db.drop_collection("bg").unwrap();
+        assert!(!d.0.join("collections/bg").exists());
+        assert!(matches!(c.maintain(), Ok(false)));
+        drop(db); // joins the thread
     }
 }

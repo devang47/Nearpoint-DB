@@ -1,6 +1,6 @@
 # Segment payload sidecar (v1)
 
-`<lsn>.payloads` next to `<lsn>.seg`: the JSON payload of each row of
+`<file>.payloads` next to `<file>.seg` (file id, `manifest.md`): the JSON payload of each row of
 that segment. Code: `crates/engine/src/collection.rs`
 (`encode_payloads`/`decode_payloads`). Framing (magic, version, length,
 CRC32, atomic write) as in `manifest.md`. All integers little-endian.

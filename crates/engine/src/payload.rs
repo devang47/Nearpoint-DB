@@ -328,6 +328,12 @@ impl PayloadStore {
         self.columns.get(field).map(Column::kind)
     }
 
+    /// Every column's type, so a rewritten segment can start with the same
+    /// columns (an inferred type must not change when rows are dropped).
+    pub(crate) fn kinds(&self) -> impl Iterator<Item = (&String, Kind)> {
+        self.columns.iter().map(|(name, c)| (name, c.kind()))
+    }
+
     pub(crate) fn column(&self, field: &str) -> Option<&Column> {
         self.columns.get(field)
     }

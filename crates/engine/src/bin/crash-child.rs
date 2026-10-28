@@ -1,7 +1,7 @@
 //! Writer for the SIGKILL crash test (task 3.4b, `tests/crash.rs`): opens
 //! the collection in `<dir>` and runs random upserts, deletes and seals
-//! until killed. Before each op it prints the op (`U <id> <ver>`, `D <id>`
-//! or `S`), and `ok` once the op is acknowledged.
+//! until killed. Before each op it prints the op (`U <id> <ver>`, `D <id>`,
+//! `S` or `M` for a background step), and `ok` once the op is acknowledged.
 //!
 //! Usage: `crash-child <dir> <seed>`. Vectors and payloads are derived
 //! from (id, ver); `tests/crash.rs` derives the same ones.
@@ -24,6 +24,10 @@ fn config() -> Config {
             seed: 7,
         },
         schema: Default::default(),
+        // Small, so background seals and merges run in most cycles.
+        seal_rows: 16,
+        ivf_rows: 1024,
+        max_merge_rows: 1_000_000,
         sync: SyncPolicy::Batch,
     }
 }
@@ -69,7 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("S");
                 c.seal()?;
             }
-            3..30 => {
+            3..10 => {
+                println!("M");
+                c.maintain()?;
+            }
+            10..35 => {
                 println!("D {id}");
                 c.delete(id)?;
             }
