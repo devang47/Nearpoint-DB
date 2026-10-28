@@ -12,6 +12,9 @@ pub(crate) struct Visited {
     /// Distances computed by searches on this thread so far. Searches bump
     /// it; benchmarks read it (`hnsw::distances`). Never reset.
     pub distances: u64,
+    /// Budgeted filtered walks on this thread that ran out and fell back
+    /// to brute force (`hnsw::fallbacks`). Never reset.
+    pub fallbacks: u64,
 }
 
 impl Visited {
@@ -40,7 +43,7 @@ impl Visited {
 
 thread_local! {
     pub(crate) static VISITED: RefCell<Visited> = const {
-        RefCell::new(Visited { stamps: Vec::new(), generation: 0, distances: 0 })
+        RefCell::new(Visited { stamps: Vec::new(), generation: 0, distances: 0, fallbacks: 0 })
     };
 }
 
@@ -54,6 +57,7 @@ mod tests {
             stamps: Vec::new(),
             generation: u32::MAX - 1,
             distances: 0,
+            fallbacks: 0,
         };
         v.reset(4);
         assert!(v.insert(2));

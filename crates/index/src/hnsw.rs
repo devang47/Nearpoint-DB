@@ -287,6 +287,10 @@ impl Hnsw {
     /// once it holds `ef` nodes all nearer than the nearest unexpanded one,
     /// or nothing is left to expand. Unfiltered callers pass `|_| true`,
     /// which compiles away.
+    ///
+    /// `budget` caps the distances this call computes: `None` if the walk
+    /// needed more (the caller falls back to brute force). Callers that
+    /// don't budget pass `u64::MAX`.
     fn search_layer(
         &self,
         q: &[f32],
@@ -294,11 +298,13 @@ impl Hnsw {
         ef: usize,
         layer: u8,
         keep: impl Fn(u32) -> bool,
-    ) -> BinaryHeap<Hit> {
+        budget: u64,
+    ) -> Option<BinaryHeap<Hit>> {
         VISITED.with_borrow_mut(|visited| {
             visited.reset(self.levels.len());
             let mut best = BinaryHeap::with_capacity(ef + 1);
             let mut todo = BinaryHeap::new();
+            let mut spent = 0u64;
             for &e in entries {
                 visited.insert(e.id);
                 if keep(e.id) {
@@ -320,6 +326,10 @@ impl Hnsw {
                     if !visited.insert(id) {
                         continue;
                     }
+                    if spent == budget {
+                        return None;
+                    }
+                    spent += 1;
                     visited.distances += 1;
                     let h = self.hit(q, id);
                     if best.len() < ef || best.peek().is_some_and(|far| h < *far) {
@@ -333,7 +343,7 @@ impl Hnsw {
                     }
                 }
             }
-            best
+            Some(best)
         })
     }
 
@@ -342,7 +352,8 @@ impl Hnsw {
     fn descend(&self, q: &[f32], entry: (u32, u8), stop: u8) -> Hit {
         let mut cur = self.hit(q, entry.0);
         for layer in (stop + 1..=entry.1).rev() {
-            if let Some(h) = self.search_layer(q, &[cur], 1, layer, |_| true).pop() {
+            let found = self.search_layer(q, &[cur], 1, layer, |_| true, u64::MAX);
+            if let Some(h) = found.and_then(|mut f| f.pop()) {
                 cur = h;
             }
         }
@@ -420,7 +431,8 @@ impl Hnsw {
         let mut cur = vec![self.descend(q, entry, level)];
         for layer in (0..=level.min(entry.1)).rev() {
             let mut found = self
-                .search_layer(q, &cur, self.cfg.ef_construction, layer, |_| true)
+                .search_layer(q, &cur, self.cfg.ef_construction, layer, |_| true, u64::MAX)
+                .unwrap_or_default()
                 .into_sorted_vec();
             found.retain(|h| h.id != node);
             // m links out on every layer; layer 0's 2m capacity is headroom
@@ -443,7 +455,7 @@ impl Hnsw {
 
     /// The plan `search` picks: brute force when the filter is small
     /// enough that scanning it computes fewer distances than a graph walk
-    /// would (ADR 0010).
+    /// would, else a budgeted walk (ADR 0010).
     pub fn plan(&self, k: usize, params: &SearchParams) -> Plan {
         match params.filter {
             Some(f) if brute_force_wins(f.len(), params.ef.max(k), self.len()) => Plan::BruteForce,
@@ -466,25 +478,30 @@ impl Hnsw {
         };
         let q = self.metric.prepare(query);
         let n = self.len() as u32;
-        if plan == Plan::BruteForce {
-            let hits = match params.filter {
-                Some(f) => top_k(f.range(..n).map(|id| self.hit(&q, id)), k),
-                None => top_k((0..n).map(|id| self.hit(&q, id)), k),
+        let count = params
+            .filter
+            .map_or(u64::from(n), |f| f.range_cardinality(..n));
+        if plan != Plan::BruteForce {
+            let start = self.descend(&q, entry, 0);
+            let ef = params.ef.max(k);
+            // Budget = the brute-force cost (see `Plan::Graph`).
+            let budget = if plan == Plan::Graph { count } else { u64::MAX };
+            let walk = match params.filter {
+                None => self.search_layer(&q, &[start], ef, 0, |_| true, u64::MAX),
+                Some(f) => self.search_layer(&q, &[start], ef, 0, |id| f.contains(id), budget),
             };
-            let count = params
-                .filter
-                .map_or(u64::from(n), |f| f.range_cardinality(..n));
-            VISITED.with_borrow_mut(|v| v.distances += count);
-            return Ok(hits);
+            if let Some(best) = walk {
+                let mut hits = best.into_sorted_vec();
+                hits.truncate(k);
+                return Ok(hits);
+            }
+            VISITED.with_borrow_mut(|v| v.fallbacks += 1);
         }
-        let start = self.descend(&q, entry, 0);
-        let ef = params.ef.max(k);
-        let mut hits = match params.filter {
-            None => self.search_layer(&q, &[start], ef, 0, |_| true),
-            Some(f) => self.search_layer(&q, &[start], ef, 0, |id| f.contains(id)),
-        }
-        .into_sorted_vec();
-        hits.truncate(k);
+        let hits = match params.filter {
+            Some(f) => top_k(f.range(..n).map(|id| self.hit(&q, id)), k),
+            None => top_k((0..n).map(|id| self.hit(&q, id)), k),
+        };
+        VISITED.with_borrow_mut(|v| v.distances += count);
         Ok(hits)
     }
 }
@@ -492,8 +509,19 @@ impl Hnsw {
 /// How a search finds its results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
-    /// Walk the graph, keeping only nodes in the filter (if any).
+    /// Walk the graph, keeping only nodes in the filter (if any). A
+    /// filtered walk may compute at most as many layer-0 distances as the
+    /// filter has ids; if it needs more it stops and brute-forces the
+    /// filter instead (`fallbacks` counts these). That bounds any filter,
+    /// however correlated, at 2x the cheaper of walk and brute force:
+    /// walks under the budget cost what they cost, walks over it cost
+    /// budget + brute force = 2x brute force. A larger budget raises that
+    /// worst case to (1 + c)x; a smaller one aborts walks that were
+    /// cheaper than brute force (ADR 0010, 7.5 addendum).
     Graph,
+    /// The filtered walk without a budget: runs to the end however many
+    /// distances it takes. For benchmarks and tests of the walk itself.
+    FullWalk,
     /// Exact: the distance to every id in the filter (or every id).
     BruteForce,
 }
@@ -517,6 +545,12 @@ fn brute_force_wins(filtered: u64, ef: usize, len: usize) -> bool {
 /// around a search.
 pub fn distances() -> u64 {
     VISITED.with_borrow(|v| v.distances)
+}
+
+/// Budgeted walks (`Plan::Graph`) on this thread that ran out of budget
+/// and fell back to brute force. Benchmarks diff it around a search.
+pub fn fallbacks() -> u64 {
+    VISITED.with_borrow(|v| v.fallbacks)
 }
 
 fn stripes() -> Box<[Mutex<()>]> {
@@ -857,7 +891,7 @@ mod tests {
                 filter: Some(&filter),
                 ..SearchParams::default()
             };
-            for plan in [Plan::Graph, Plan::BruteForce] {
+            for plan in [Plan::Graph, Plan::FullWalk, Plan::BruteForce] {
                 let mut hits = 0;
                 for q in qs.as_chunks::<16>().0 {
                     let truth = f.search(q, 10, &p).unwrap();
@@ -898,6 +932,66 @@ mod tests {
         assert!((64..5_000).contains(&(distances() - before)));
     }
 
+    /// Distances and fallbacks one search adds to the thread's counters.
+    fn cost(h: &Hnsw, q: &[f32], p: &SearchParams, plan: Plan) -> (Vec<Hit>, u64, u64) {
+        let (d, f) = (distances(), fallbacks());
+        let hits = h.search_with(q, 10, p, plan).unwrap();
+        (hits, distances() - d, fallbacks() - f)
+    }
+
+    #[test]
+    fn correlated_filter_falls_back_to_exact() {
+        let (h, f, data) = build(5_000, 16, Metric::L2, 1);
+        let q = test_data::vectors(1, 16, 9);
+        // The 10% of ids farthest from the query: the walk has to cross
+        // the graph to reach any match, then fill `ef` with them.
+        let mut far: Vec<Hit> = (0..h.len() as u32)
+            .map(|id| Hit {
+                id,
+                dist: -Metric::L2.distance(&q, &data[id as usize * 16..][..16]),
+            })
+            .collect();
+        far.sort_unstable();
+        let filter: RoaringBitmap = far[..500].iter().map(|h| h.id).collect();
+        let p = SearchParams {
+            ef: 64,
+            filter: Some(&filter),
+            ..SearchParams::default()
+        };
+        let (_, walked, _) = cost(&h, &q, &p, Plan::FullWalk);
+        assert!(walked > 2 * 500, "walk only computed {walked} distances");
+
+        let (hits, spent, fell_back) = cost(&h, &q, &p, Plan::Graph);
+        assert_eq!(fell_back, 1);
+        assert_eq!(hits, f.search(&q, 10, &p).unwrap());
+        // Budget (500) plus the scan (500), plus the upper-layer descent.
+        assert!(spent <= 2 * 500 + 100, "spent {spent}");
+    }
+
+    #[test]
+    fn uniform_filters_dont_fall_back() {
+        let (h, _, _) = build(5_000, 16, Metric::L2, 1);
+        let qs = test_data::vectors(50, 16, 99);
+        // Filters big enough that the planner walks.
+        for step in [2, 3] {
+            let filter = every(step, 1, h.len());
+            let p = SearchParams {
+                ef: 64,
+                filter: Some(&filter),
+                ..SearchParams::default()
+            };
+            assert_eq!(h.plan(10, &p), Plan::Graph);
+            for q in qs.as_chunks::<16>().0 {
+                let (graph, _, fell_back) = cost(&h, q, &p, Plan::Graph);
+                assert_eq!(fell_back, 0, "step {step}");
+                assert_eq!(graph, h.search_with(q, 10, &p, Plan::FullWalk).unwrap());
+            }
+        }
+        // Unfiltered searches have no budget.
+        let (_, _, fell_back) = cost(&h, &qs[..16], &SearchParams::default(), Plan::Graph);
+        assert_eq!(fell_back, 0);
+    }
+
     proptest::proptest! {
         #[test]
         fn filtered_search_stays_in_the_filter(
@@ -913,10 +1007,13 @@ mod tests {
             let p = SearchParams { ef: 32, filter: Some(&filter), ..SearchParams::default() };
             let exact = f.search(&q, k, &p).unwrap();
             proptest::prop_assert_eq!(&h.search_with(&q, k, &p, Plan::BruteForce).unwrap(), &exact);
-            let walk = h.search_with(&q, k, &p, Plan::Graph).unwrap();
+            let walk = h.search_with(&q, k, &p, Plan::FullWalk).unwrap();
             proptest::prop_assert!(walk.len() <= exact.len());
             proptest::prop_assert!(walk.iter().all(|g| filter.contains(g.id)));
             proptest::prop_assert!(walk.is_sorted());
+            // The budgeted walk either finishes (same walk) or falls back.
+            let graph = h.search_with(&q, k, &p, Plan::Graph).unwrap();
+            proptest::prop_assert!(graph == walk || graph == exact);
         }
     }
 
