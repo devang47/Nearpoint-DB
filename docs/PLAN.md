@@ -27,10 +27,11 @@ ANN cores are hand-written. Decisions layered on top of that
       (`unsafe_code`, `clippy::unwrap_used`, `undocumented_unsafe_blocks`).
       Stub the docs `AGENTS.md` expects: `docs/RESULTS.md`, `docs/formats/`,
       `docs/adr/`, `docs/api.md`.
-- [ ] 1.2 Dataset loaders: fvecs/ivecs/bvecs (texmex) and
-      .fbin/.u8bin/.ibin (big-ann-benchmarks: u32 count, u32 dim, data).
+- [x] 1.2 Dataset loaders: fvecs/ivecs/bvecs (texmex) and
+      .fbin/.u8bin/.i8bin/.ibin (big-ann-benchmarks: u32 count, u32 dim, data).
       Support reading the first N vectors only (the 1B files' header still
       says 1B, so N must override the header count).
+      Plus the big-ann ground-truth .ibin (ids then distances).
 - [ ] 1.3 `tools/fetch-dataset.sh` (curl + tar) for SIFT10K (siftsmall)
       and SIFT1M into ~/data/Nearpoint/; checks `df -h` first, resumable
       (`curl -C -`), verifies sizes after extraction.

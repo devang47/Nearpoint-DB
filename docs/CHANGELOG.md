@@ -15,6 +15,15 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Dataset loaders (task 1.2)
+- **What:** `crates/bench` gains a library with `dataset::{read_xvecs,
+  read_bin, read_bin_ground_truth}` reading texmex and big-ann files straight
+  into a row-major `Vectors<T>`; optional first-N limit. Added `.i8bin`
+  (SPACEV is int8) and the big-ann ground-truth layout.
+- **Why:** task 1.2. Every size is validated against the file length before
+  allocating, so corrupt headers and wrong element types fail loudly, and a
+  byte-range prefix of a 1B file loads with an explicit limit.
+
 ## 2026-10-28 — Scaffold workspace (task 1.1) and refine stack
 - **What:** Cargo workspace with 7 stub crates; pinned toolchain,
   `target-cpu=native`, workspace lints, `scripts/check.sh`, GitHub Actions CI;
