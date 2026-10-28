@@ -8,6 +8,12 @@ publish.workspace = true
 [dependencies]
 bytemuck.workspace = true
 thiserror.workspace = true
+index = { path = "../index" }
+kernels = { path = "../kernels" }
+storage = { path = "../storage" }
+# binary only
+anyhow.workspace = true
+clap.workspace = true
 
 [lints]
 workspace = true
