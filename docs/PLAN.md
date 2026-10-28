@@ -98,20 +98,25 @@ seal step and on torn WAL appends.
 ## Phase 4: Server and CRUD
 Runs on one mutable segment + WAL per collection; Phase 6 generalizes to
 many segments.
-- [ ] 4.1 Collections: name, dim, metric, config; persisted manifest.
+- [x] 4.1 Collections: name, dim, metric, config; persisted manifest.
       Server config via clap flags + env vars (no config-file format yet).
-- [ ] 4.2 Upsert, delete (tombstone bitmap), get-by-id.
-- [ ] 4.3 Concurrency: many readers + one writer per collection;
+- [x] 4.2 Upsert, delete (tombstone bitmap), get-by-id.
+- [x] 4.3 Concurrency: many readers + one writer per collection;
       readers clone an `Arc<Snapshot>` of the segment list (std `RwLock`
       around the `Arc`, held only for the clone).
-- [ ] 4.4 axum HTTP/JSON API: create/list/drop collection, upsert
+- [x] 4.4 axum HTTP/JSON API: create/list/drop collection, upsert
       (batch), delete, search, get. OpenAPI-style doc in docs/api.md.
       Plus a raw-binary bulk-upsert endpoint (length-prefixed f32 blocks)
       so million-vector loads don't pay JSON parsing cost.
-- [ ] 4.5 Minimal Python client in `clients/python/` (stdlib `urllib`
+- [x] 4.5 Minimal Python client in `clients/python/` (stdlib `urllib`
       only, no pip installs) for testing.
 **Acceptance:** concurrent insert + search load test runs 30 min with
 no errors; deleted ids never appear in results.
+**Status (2026-10-28): met.** `loadtest` 1,800 s: 2 writers (1.7M
+inserted, 34k replace and 34k delete requests), 4 readers (25.1M
+searches, a third filtered), a seal every 60 s; 0 errors, 0 violations.
+Design in ADR 0011. Server RSS grew ~20 MiB/min to 603 MiB: dead rows
+stay in RAM until compaction (6.3).
 
 ## Phase 5: Quantization and IVF-PQ
 - [x] 5.1 k-means (k-means++ init, multithreaded, trains on a sample).
@@ -137,6 +142,9 @@ steady-state size (~24%); see RESULTS.md for why both are given.
 - [ ] 6.1 Mutable segment (HNSW in RAM) sealing at configurable size.
 - [ ] 6.2 Background builder: sealed segment → on-disk HNSW (small)
       or IVF-PQ (large) segment, swapped in atomically.
+      IVF-PQ only for L2/cosine for now: inner product reaches 0.84 at
+      nprobe 64 / rerank 200 and ~0.94 even with rerank 5000 (int8
+      re-rank ceiling; needs f32 re-rank, Phase 8).
 - [ ] 6.3 Compaction policy: merge small segments, drop tombstoned vectors.
 - [ ] 6.4 Query fan-out across segments with parallel search and top-k merge.
 **Acceptance:** 4-hour soak test with mixed insert/delete/search; recall
@@ -149,9 +157,15 @@ and p99 latency stay within 10% of the start.
 - [x] 7.3 Filter applied during graph traversal and IVF scanning.
 - [x] 7.4 Planner: brute-force over the bitmap when selectivity is very low
       (`filtered² ≤ 8·ef·len`, ADR 0010).
+- [ ] 7.5 Walk budget: stop a filtered walk after ~`filtered` distance
+      computations and brute-force the bitmap instead, so correlated
+      filters can't blow up p99 (measured: far 10% filter, p99 75 ms).
 **Acceptance:** recall@10 ≥ 0.9 at filter selectivity 1%, 10%, and 50%.
-**Status (2026-10-28): met for HNSW on SIFT1M** (uniform random filters):
-1.0000 / 0.9973 / 0.9810 at ef 64. Correlated filters not yet measured.
+**Status (2026-10-28): met for HNSW on SIFT1M**: uniform filters
+1.0000 / 0.9973 / 0.9810 at ef 64; correlated ("far") filters 1.0000 /
+0.9991 / 0.9906. But a far 10% filter walks ~110k nodes: p99 75 ms vs
+6 ms for brute force. Follow-up: cap the walk at `filtered` distances,
+then brute-force (ADR 0010 addendum).
 
 ## Phase 8: Scale to 100M
 - [ ] 8.1 Memory budget per component; enforce limits and expose metrics

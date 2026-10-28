@@ -15,6 +15,53 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Parallel round 3: server and CRUD, index/storage groundwork
+- **What:** scaffold commit (server dependencies in Cargo.lock), then two
+  branches built in parallel worktrees and merged: Phase 4 (4.1–4.5) and
+  index/storage groundwork for Phases 6 and 8 (entries below). After the
+  merge, on a quiet machine: 1,000-cycle crash run, SIFT1M bulk-loaded
+  through the API (recall checked after a restart), HNSW and IVF-PQ
+  (L2/IP/cosine) re-runs, correlated-filter sweep, the 30-minute Phase 4
+  load test, and HNSW 10M after the memory fixes (peak 10.7 → 8.5 GB). New PLAN task 7.5 (walk
+  budget) and a 6.2 note (IVF-PQ only for L2/cosine for now).
+- **Why:** engine/server and index/storage are disjoint, so they ran side
+  by side; timings were taken only after the merge.
+
+## 2026-10-28 — Server and CRUD (tasks 4.1–4.5)
+- **What:** `engine::Db` registry over a data directory (`LOCK` via
+  `File::try_lock`, `collections/<name>/CONFIG` framed JSON v1, crash-safe
+  create/drop by rename); `Collection` methods take `&self`: one writer,
+  readers search an `Arc<Snapshot>` of per-segment views with
+  copy-on-write tombstones and a visible-row cutoff; `upsert_batch`/
+  `delete_batch` validate the whole batch and log it with one sync
+  (`Wal::append_batch`); optional payload `schema` in the collection
+  config. `crates/server`: axum JSON API (collections, upsert, binary bulk
+  upsert, delete, get, search with ef/filter/payload/vector, seal, health),
+  `Error::Unknown` → 503; `loadtest` binary. `clients/python/nearpoint.py`
+  (stdlib) with live-server tests. Docs: `docs/api.md`,
+  `docs/formats/manifest.md` (CONFIG), ADR 0011.
+- **Why:** Phase 4 acceptance: the 30-minute concurrent load test passed
+  with 0 errors and 0 deleted ids returned. Searches never wait on a
+  writer's fsync; batches share one fsync (single durable writes cap at
+  ~270/s). `docs/adr/0011-server-and-concurrency.md`.
+
+## 2026-10-28 — IVF-PQ serialization and metrics, segment v2, HNSW memory, correlated filters
+- **What:** `IvfPq::to_bytes`/`from_bytes` (blob `NPIV` v1, fully
+  validated, random-corruption proptest); segment format v2 adds element
+  type 1 (no f32 vector section) and blob kind IvfPq, v1 still read
+  (fixtures for both). IVF-PQ supports cosine (normalize, L2, distance/2)
+  and inner product (`<q,c> + Σ <q_j, r̂_j>` via `Pq::dot_table`, SQ re-rank
+  by dot). `Hnsw::reserve` and 4096 striped node locks instead of a
+  `Mutex` per node; the bench reserves before batched adds. Bench
+  `--metric ip|cosine`; `filtered --filter far`. ADR 0003/0006/0009/0010
+  addenda; docs/formats/segment.md.
+- **Why:** Phase 6 seals large segments as IVF-PQ and must persist them;
+  Phase 9 can't afford f32 vectors on disk. A per-node mutex cost ~80 B
+  per vector on macOS and batched adds regrew every array (SIFT1M HNSW
+  bench peak 1,922 → 1,231 MiB), which Phase 8's 10 GB budget can't carry.
+  Correlated filters were 7.3's known gap: recall holds (≥ 0.99) but a
+  far 10% filter's walk has a 75 ms p99 (task 7.5).
+
 ## 2026-10-28 — Parallel round 2: recovery, IVF-PQ, filtered search
 - **What:** scaffold commit (`SearchParams` gains `filter`, `nprobe`,
   `rerank`; `ivfpq`/`collection` stubs; `index` → `quant`/`roaring`,

@@ -9,6 +9,11 @@ id-match figure is always recorded beside it. Warm cache unless noted.
 
 | Date | Task | Dataset | Index + params | Seed | recall@10 | p50 | p99 | QPS | Peak RSS | Peak phys_footprint | Disk | Build time | Commit |
 |------|------|---------|----------------|------|-----------|-----|-----|-----|----------|---------------------|------|------------|--------|
+| 2026-10-28 | HNSW memory | BIGANN 10M | hnsw M=16 efc=200 ef=64, reserve + striped locks (memory-bound, see note) | 42 | 0.9154 (0.9153) | *0.285 ms* | *6.26 ms* | *1045* | 7231 MiB | **8501 MiB** | – | 714.9 s | 8f67ec3 |
+| 2026-10-28 | HNSW memory | BIGANN 10M | same, ef=128 | 42 | 0.9666 (0.9665) | *0.291 ms* | *4.47 ms* | *2082* | 7231 MiB | 8501 MiB | – | 714.9 s | 8f67ec3 |
+| 2026-10-28 | 4.4 | SIFT1M via HTTP API (1k queries) | hnsw M=16 efc=200 ef=64, bulk-loaded, sealed, server restarted | 42 | id match 0.9574 | 0.266 ms (client) | 0.482 ms | – | 717 MiB (server after reopen) | – | – | load 44.2 s | 8f67ec3 |
+| 2026-10-28 | HNSW memory | SIFT1M | hnsw M=16 efc=200 ef=64, reserve + striped locks | 42 | 0.9607 (0.9600) | 0.107 ms | 0.140 ms | 9420 | 1231 MiB | **1231 MiB** | – | 42.9 s | 8f67ec3 |
+| 2026-10-28 | HNSW memory | SIFT1M | same, ef=128 | 42 | 0.9879 (0.9872) | 0.194 ms | 0.247 ms | 5305 | 1231 MiB | 1231 MiB | – | 42.9 s | 8f67ec3 |
 | 2026-10-28 | 5.4–5.6 | BIGANN 10M (10k queries) | ivfpq nlist=4096 m=16 8-bit **nprobe=32 rerank=100** | 42 | **0.9175** (0.9175) | **0.593 ms** | 1.520 ms | 1486 | 2822 MiB | 2791 MiB | – | 159.9 s | dcabd5e |
 | 2026-10-28 | 5.4–5.6 | BIGANN 10M | ivfpq nlist=4096 m=16 8-bit nprobe=64 rerank=200 | 42 | 0.9631 (0.9631) | 1.110 ms | 2.607 ms | 807 | 2822 MiB | 2791 MiB | – | 159.9 s | dcabd5e |
 | 2026-10-28 | 5.5 | BIGANN 10M | ivfpq nlist=4096 m=32 **4-bit** nprobe=32 rerank=200 | 42 | **0.9155** (0.9154) | **0.214 ms** | 0.410 ms | 4286 | 2832 MiB | 2813 MiB | – | 131.0 s | dcabd5e |
@@ -74,6 +79,22 @@ id-match figure is always recorded beside it. Warm cache unless noted.
 - The Mac slept during some runs (`pmset` log); `Instant` stops during
   sleep, so per-query timings are unaffected, but wall times in logs
   are not comparable.
+
+- **2026-10-28 HNSW memory fixes** (`Hnsw::reserve`, 4096 striped locks
+  instead of a mutex per node): SIFT1M peak 1,922 → **1,231 MiB** (build +
+  index 732 MiB), recall and latency unchanged. BIGANN 10M: peak
+  phys_footprint 10,670 → **8,501 MiB**, under the 10 GB budget (build +
+  index 7,269 MiB vs ~6.7 GB estimated steady state at ~666 B/vector).
+  Build 879 → 715 s. Its latencies are still memory-bound and only
+  indicative: with ~8.5 GB in the process on a 16 GB machine, swap stayed
+  at ~5.7 GB, and ef=128 (p50 0.291 ms) was barely slower than ef=64
+  (0.285 ms) with multi-ms p99s. HNSW for 10M+ vectors stays impractical
+  here; IVF-PQ is the large-segment index (Phase 6.2).
+- **2026-10-28 API path:** SIFT1M bulk-loaded through `POST
+  /points/bulk` (Python client, 50k batches) in 44.2 s (~22.6k vectors/s,
+  HNSW built during the load), sealed in ~1 s, reopened in ~0.2 s.
+  Recall over HTTP after the restart: id-match 0.9574 at ef 64, the same
+  as in-process. Latency is client-side (HTTP + JSON + Python).
 
 ## Kernel microbenchmarks
 
@@ -165,6 +186,51 @@ brute force over the bitmap. Quiet machine, commit dcabd5e. Full table:
 - First run of the 0.5 / ef 64 walk had p99 3.85 ms vs 0.27 ms on the
   repeat: a one-off stall, not reproducible.
 
+### 2026-10-28 — correlated ("far") filters, commit 8f67ec3
+
+`filtered --filter random,far --selectivity 0.01,0.1,0.5`. The far filter
+keeps the base vectors farthest from the query set's centroid. ef 64,
+1,000 queries. Full table: `docs/results/sift1m-filtered-far.csv`.
+
+| Filter | Selectivity | Plan (auto) | recall@10 | p50 | p99 | Walk distances | Brute p50 / p99 |
+|--------|-------------|-------------|-----------|-----|-----|----------------|-----------------|
+| random | 1% | brute | 1.0000 | 0.175 ms | 0.20 ms | 45,797 | 0.175 / 0.20 ms |
+| random | 10% | walk | 0.9990 | 0.735 ms | 1.04 ms | 8,023 | 7.30 / 7.66 ms |
+| random | 50% | walk | 0.9811 | 0.197 ms | 0.26 ms | 2,187 | 14.3 / 17.4 ms |
+| far | 1% | brute | 1.0000 | 0.152 ms | 0.18 ms | 293,740 | 0.152 / 0.18 ms |
+| far | **10%** | walk | 0.9991 | 4.58 ms | **74.7 ms** | 110,794 | 5.54 / 6.01 ms |
+| far | 50% | walk | 0.9906 | 0.223 ms | 10.6 ms | 10,829 | 12.4 / 14.3 ms |
+
+- **Recall holds** for correlated filters (≥ 0.99 at 1/10/50%), so the
+  Phase 7 target stands.
+- **Latency doesn't:** the planner sizes by cardinality only, so at far
+  10% it walks, and some queries visit most of the graph (p99 75 ms,
+  12× brute force's). New task 7.5: cap the walk at ~`filtered` distance
+  computations, then brute-force.
+
+## IVF-PQ metrics (round 3)
+
+`bench --index ivfpq --metric l2|ip|cosine`, SIFT1M, nlist 1024, 10k
+queries, ground truth by brute force with `Flat` for ip/cosine. Quiet
+machine, commit 8f67ec3. Full sweep: `docs/results/sift1m-ivfpq-metrics.csv`.
+
+### 2026-10-28
+
+| Codes | nprobe / rerank | L2 | cosine | inner product | p50 (L2) |
+|-------|-----------------|----|--------|---------------|----------|
+| m=16 8-bit | 16 / 100 | 0.9167 | 0.9171 | 0.7161 | 0.172 ms |
+| m=16 8-bit | 32 / 200 | 0.9657 | 0.9668 | 0.8301 | 0.338 ms |
+| m=16 8-bit | 64 / 200 | 0.9797 | 0.9806 | 0.8410 | 0.605 ms |
+| m=32 4-bit | 32 / 200 | 0.9540 | 0.9547 | 0.7183 | 0.128 ms |
+| m=32 4-bit | 64 / 200 | 0.9661 | 0.9664 | 0.7245 | 0.194 ms |
+
+- Cosine tracks L2, but SIFT's norms are nearly constant (506–511), so
+  this doesn't stress cosine.
+- **Inner product misses 0.9** at every swept setting; more probes barely
+  help, more re-rank does (agent run, 1k queries: 0.9247 at 64 / 1000,
+  0.9427 at 1024 / 5000). The int8 re-rank is the ceiling. IVF-PQ is for
+  L2/cosine collections until an f32 re-rank exists (PLAN 6.2 note).
+
 ## Crash recovery (tasks 3.3–3.4)
 
 `cargo test --release -p engine --test crash -- --ignored --nocapture`,
@@ -182,6 +248,28 @@ write. Fresh collection every 25 cycles.
 - **Phase 3 target "1,000 randomized crash/restart cycles, zero lost
   acknowledged writes": met.** SIGKILL keeps the page cache, so this
   tests the process; power-loss safety rests on F_FULLFSYNC (3.1).
+
+## Server load test (task 4.4, Phase 4 acceptance)
+
+`server --data-dir ~/data/Nearpoint/db-accept` (sync batch) + `loadtest
+--secs 1800 --seal-secs 60`, dim 32, 2 writers (each round: insert 50,
+replace, delete) at 10 rounds/s, 4 readers (a third filtered). Commit
+8f67ec3, quiet machine.
+
+### 2026-10-28
+
+| Duration | Writes | Searches | Errors | Violations | Search p50 / p99 / max | Server RSS |
+|----------|--------|----------|--------|------------|------------------------|------------|
+| 1,800 s | 34,130 insert, replace, delete requests each; 29 seals | 25.06M (8.35M filtered), ~13.9k/s | **0** | **0** | 0.27 / 0.66 / 34.2 ms | 3 → 603 MiB |
+
+- **Phase 4 target "30 min, no errors, deleted ids never appear": met.**
+  A violation is a hit whose delete was acknowledged before the search
+  was sent; the agent showed the checker catches a disabled tombstone
+  update (668k violations).
+- RSS grew linearly (~20 MiB/min) with only ~40k live points: replaced
+  and deleted rows stay in RAM until compaction (6.3). A 4-hour soak
+  (Phase 6) needs compaction first.
+- 1,000-cycle crash test on the merged code: passed, 121 s.
 
 ## Quantization quality (tasks 5.1–5.3)
 
