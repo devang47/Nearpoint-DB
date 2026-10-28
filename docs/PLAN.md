@@ -42,7 +42,7 @@ ANN cores are hand-written. Decisions layered on top of that
       `cfg(target_arch)` (scalar on other arches); int8 dot via `SDOT`
       behind `cfg(target_feature = "dotprod")`. Proptest vs scalar
       (tolerance 1e-4 relative for f32; exact for int8).
-- [ ] 1.6 Criterion benches for all kernels at dims 96, 128, 768.
+- [x] 1.6 Criterion benches for all kernels at dims 96, 128, 768.
 - [ ] 1.7 Bench harness: recall@k vs ground truth, p50/p95/p99 latency,
       QPS, peak RSS and peak phys_footprint. Fixed RNG seeds, recorded in
       every result row.

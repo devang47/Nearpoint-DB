@@ -15,6 +15,13 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-28 — Kernel benchmarks (task 1.6)
+- **What:** `crates/kernels/benches/kernels.rs` (criterion): scalar vs NEON for
+  all five kernels at dims 96/128/768. First numbers in `docs/RESULTS.md`.
+- **Why:** task 1.6 and half of Phase 1's acceptance: f32 L2 is 4.4× scalar at
+  dim 128 (target ≥4×). int8 gains are small because LLVM already vectorizes
+  the integer reference loops; recorded as such.
+
 ## 2026-10-28 — NEON distance kernels (task 1.5)
 - **What:** `crates/kernels/src/neon.rs`: f32 L2/dot (16 floats per iteration,
   4 accumulators) and cosine (via three `dot`s); int8 dot via SDOT and int8 L2

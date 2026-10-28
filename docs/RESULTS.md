@@ -5,3 +5,39 @@ Missed targets are recorded as missed. Never tune the benchmark to hide one.
 
 | Date | Task | Dataset | Index + params | Seed | recall@10 | p50 | p99 | QPS | Peak RSS | Peak phys_footprint | Disk | Build time | Commit |
 |------|------|---------|----------------|------|-----------|-----|-----|-----|----------|---------------------|------|------------|--------|
+
+## Kernel microbenchmarks
+
+`cargo bench -p kernels`, criterion point estimates per call (ns), two
+vectors resident in L1. Speedup = scalar / NEON.
+
+### 2026-10-28 — task 1.6, kernels at commit b2ced1a
+Mac mini M4 (Mac16,10), 16 GB, macOS 26.6.1, Rust 1.98.1, `target-cpu=native`.
+
+| Kernel | dim | scalar | NEON | speedup |
+|--------|-----|--------|------|---------|
+| l2_sq (f32) | 96 | 20.2 | 5.45 | 3.7× |
+| l2_sq (f32) | **128** | 31.5 | 7.11 | **4.4×** |
+| l2_sq (f32) | 768 | 340 | 49.2 | 6.9× |
+| dot (f32) | 96 | 20.3 | 5.71 | 3.6× |
+| dot (f32) | 128 | 34.9 | 6.91 | 5.0× |
+| dot (f32) | 768 | 340 | 38.9 | 8.7× |
+| cosine (f32) | 96 | 43.2 | 11.0 | 3.9× |
+| cosine (f32) | 128 | 60.7 | 14.3 | 4.2× |
+| cosine (f32) | 768 | 457 | 94.2 | 4.9× |
+| l2_sq_i8 | 96 | 2.88 | 1.99 | 1.4× |
+| l2_sq_i8 | 128 | 3.70 | 2.30 | 1.6× |
+| l2_sq_i8 | 768 | 19.0 | 10.6 | 1.8× |
+| dot_i8 | 96 | 2.52 | 1.74 | 1.4× |
+| dot_i8 | 128 | 2.13 | 2.08 | 1.0× |
+| dot_i8 | 768 | 10.9 | 11.0 | 1.0× |
+
+- **Phase 1 target "NEON ≥4× scalar at dim 128": met** for f32 L2 (4.4×);
+  dot 5.0×, cosine 4.2×. Below 4× at dim 96 (3.6–3.9×).
+- **int8 "scalar" is not really scalar.** Integer addition is associative,
+  so LLVM auto-vectorizes the reference loops (float sums it must leave
+  sequential). The int8 speedups are hand-NEON vs compiler-NEON, not vs
+  scalar. At dim 768 both int8 dots run at ~140 B/ns, about the L1 load
+  bandwidth of two 16-byte streams, so neither can go much faster.
+- `dot/scalar/128` had a wide interval (30.8–41.5 ns); re-measure before
+  leaning on that single ratio.
