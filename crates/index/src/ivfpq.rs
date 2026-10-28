@@ -29,7 +29,9 @@ use std::ops::Range;
 use quant::{Centroids, KMeans, Pq, PqConfig, Sq};
 use rayon::prelude::*;
 
-use crate::{Error, Hit, Index, Metric, Result, SearchParams, batch_ids, check_dim};
+use crate::{Error, Hit, Index, Metric, Result, SearchParams, batch_ids, blob, check_dim};
+
+const MAGIC: &[u8; 4] = b"NPIV";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -105,6 +107,141 @@ impl IvfPq {
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// The index blob: config, quantizers, every list and the SQ codes. It
+    /// is the whole index: no f32 vectors are needed to load or search it,
+    /// so its segment can be written without them. Layout in
+    /// docs/formats/segment.md.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        blob::put_header(&mut out, MAGIC, self.dim, self.metric);
+        let c = &self.cfg;
+        for x in [
+            c.nlist,
+            c.m,
+            c.nbits as usize,
+            usize::from(self.quant.is_some()),
+        ] {
+            blob::put_u32(&mut out, x as u32);
+        }
+        blob::put_u64(&mut out, c.max_train as u64);
+        blob::put_u64(&mut out, c.seed);
+        blob::put_u64(&mut out, self.len as u64);
+        let Some(q) = &self.quant else {
+            return out;
+        };
+        let floats = q.coarse.as_slice().len()
+            + q.pq
+                .codebooks()
+                .iter()
+                .map(|b| b.as_slice().len())
+                .sum::<usize>()
+            + self.dim
+            + 1;
+        let lists: usize = self
+            .lists
+            .iter()
+            .map(|l| 4 + 4 * l.ids.len() + l.codes.len())
+            .sum();
+        out.reserve_exact(4 * floats + lists + self.sq_codes.len());
+        blob::put_f32s(&mut out, q.coarse.as_slice());
+        for b in q.pq.codebooks() {
+            blob::put_f32s(&mut out, b.as_slice());
+        }
+        blob::put_f32s(&mut out, q.sq.min());
+        blob::put_f32s(&mut out, &[q.sq.scale()]);
+        for l in &self.lists {
+            blob::put_u32(&mut out, l.ids.len() as u32);
+        }
+        for l in &self.lists {
+            for &id in &l.ids {
+                blob::put_u32(&mut out, id);
+            }
+            out.extend_from_slice(&l.codes);
+        }
+        out.extend_from_slice(bytemuck::cast_slice(&self.sq_codes));
+        out
+    }
+
+    /// Rebuilds an index from `to_bytes` output. Everything is validated
+    /// (config, quantizer shapes, list sizes, every id in `0..len` exactly
+    /// once), so a corrupt blob is an error here, never a panic or an
+    /// out-of-bounds read in a later search. Allocations are bounded by the
+    /// bytes actually present.
+    pub fn from_bytes(bytes: &[u8]) -> Result<IvfPq> {
+        let mut r = blob::Reader::new(bytes);
+        let (dim, metric) = r.header(MAGIC)?;
+        let (nlist, m, nbits, trained) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+        let (max_train, seed, n) = (r.u64()?, r.u64()?, r.u64()?);
+        let cfg = Config {
+            nlist: nlist as usize,
+            m: m as usize,
+            nbits,
+            max_train: usize::try_from(max_train).map_err(|_| Error::Corrupt("bad config"))?,
+            seed,
+        };
+        let mut ivf = IvfPq::new(dim, metric, cfg).map_err(|_| Error::Corrupt("bad config"))?;
+        if n > u64::from(u32::MAX) {
+            return Err(Error::Corrupt("more vectors than u32 ids"));
+        }
+        let n = n as usize;
+        match (trained, n) {
+            (0, 0) => {
+                r.finish()?;
+                return Ok(ivf);
+            }
+            (1, _) => {}
+            _ => return Err(Error::Corrupt("bad trained flag")),
+        }
+
+        let (nlist, m) = (cfg.nlist, cfg.m);
+        let (ksub, dsub) = (1usize << nbits, dim / m);
+        let coarse = Centroids::from_vec(dim, r.f32s(nlist * dim)?)?;
+        let books = (0..m)
+            .map(|_| Ok(Centroids::from_vec(dsub, r.f32s(ksub * dsub)?)?))
+            .collect::<Result<Vec<_>>>()?;
+        let pq = Pq::from_codebooks(books)?;
+        let min = r.f32s(dim)?;
+        let sq = Sq::from_parts(min, f32::from_bits(r.u32()?))
+            .map_err(|_| Error::Corrupt("bad SQ parameters"))?;
+        let counts: Vec<usize> = r
+            .take_n(nlist, 4)?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c) as usize)
+            .collect();
+        if counts.iter().sum::<usize>() != n {
+            return Err(Error::Corrupt(
+                "list sizes do not add up to the vector count",
+            ));
+        }
+        for count in counts {
+            let ids = r.take_n(count, 4)?.as_chunks::<4>().0;
+            let ids = ids.iter().map(|&c| u32::from_le_bytes(c)).collect();
+            let code_bytes = if nbits == 8 {
+                count * m
+            } else {
+                count.div_ceil(kernels::PQ4_BLOCK) * m * 16
+            };
+            let codes = r.take(code_bytes)?.to_vec();
+            ivf.lists.push(List { ids, codes });
+        }
+        ivf.sq_codes = bytemuck::cast_slice(r.take_n(n, dim)?).to_vec();
+        r.finish()?;
+
+        // Search indexes the SQ codes by id, so every id must be < n.
+        let mut seen = vec![false; n];
+        for &id in ivf.lists.iter().flat_map(|l| &l.ids) {
+            match seen.get_mut(id as usize) {
+                Some(s) if !*s => *s = true,
+                _ => return Err(Error::Corrupt("list ids are not each of 0..len once")),
+            }
+        }
+        ivf.quant = Some(Quantizers { coarse, pq, sq });
+        ivf.len = n;
+        Ok(ivf)
     }
 
     /// Trains the coarse quantizer, PQ codebooks and SQ ranges on (a sample
@@ -616,6 +753,189 @@ mod tests {
             ..p
         };
         assert!(ivf.search(&data[..DIM], 10, &p).unwrap().is_empty());
+    }
+
+    /// Results for each query with and without re-rank and a filter.
+    fn search_all(ivf: &IvfPq, queries: &[f32]) -> Vec<Vec<Hit>> {
+        let odd: RoaringBitmap = (1..10_000).step_by(2).collect();
+        let mut out = Vec::new();
+        for q in queries.as_chunks::<DIM>().0 {
+            for (rerank, filter) in [(0, None), (50, None), (50, Some(&odd))] {
+                let p = SearchParams {
+                    nprobe: 4,
+                    rerank,
+                    filter,
+                    ..SearchParams::default()
+                };
+                out.push(ivf.search(q, 10, &p).unwrap());
+            }
+        }
+        out
+    }
+
+    /// 8-bit m = 8, or 4-bit m = 16 (the same 8 bytes per vector).
+    fn cfg_bits(nbits: u32) -> Config {
+        let m = if nbits == 4 { 16 } else { 8 };
+        Config { nbits, m, ..cfg() }
+    }
+
+    #[test]
+    fn blob_round_trip_searches_identically() {
+        let data = test_data::vectors(2001, DIM, 12);
+        let queries = test_data::vectors(20, DIM, 13);
+        let more = test_data::vectors(100, DIM, 14);
+        for metric in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
+            for nbits in [8, 4] {
+                let mut ivf = IvfPq::new(DIM, metric, cfg_bits(nbits)).unwrap();
+                ivf.add(&data).unwrap();
+                let bytes = ivf.to_bytes();
+                assert_eq!(bytes.len(), bytes.capacity());
+                let mut back = IvfPq::from_bytes(&bytes).unwrap();
+                assert_eq!(back.to_bytes(), bytes);
+                assert_eq!((back.len(), back.dim(), back.metric()), (2001, DIM, metric));
+                assert_eq!(search_all(&back, &queries), search_all(&ivf, &queries));
+                // A loaded index keeps accepting inserts (4-bit: into a
+                // partly filled block).
+                ivf.add(&more).unwrap();
+                back.add(&more).unwrap();
+                assert_eq!(back.to_bytes(), ivf.to_bytes());
+            }
+        }
+        // Untrained, and trained but empty.
+        let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
+        let back = IvfPq::from_bytes(&ivf.to_bytes()).unwrap();
+        assert!(back.is_empty() && back.quant.is_none());
+        ivf.train(&data).unwrap();
+        let back = IvfPq::from_bytes(&ivf.to_bytes()).unwrap();
+        assert!(back.is_empty() && back.quant.is_some());
+        assert_eq!(back.to_bytes(), ivf.to_bytes());
+        assert!(
+            back.search(&data[..DIM], 5, &SearchParams::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn end_to_end_through_a_segment_file_without_vectors() {
+        use storage::segment::{self, BlobKind, Segment, SegmentData};
+        let data = test_data::vectors(1500, DIM, 15);
+        let queries = test_data::vectors(20, DIM, 16);
+        let mut ivf = IvfPq::new(DIM, Metric::Cosine, cfg_bits(4)).unwrap();
+        ivf.add(&data).unwrap();
+        let ids: Vec<u64> = (0..ivf.len() as u64).map(|i| 5_000_000 + i).collect();
+        let dir = std::env::temp_dir().join(format!("nearpoint-ivf-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ivf.seg");
+        segment::write(
+            &path,
+            &SegmentData {
+                dim: DIM,
+                metric: ivf.metric().code(),
+                vectors: &[], // the blob is the whole index
+                ids: &ids,
+                blob_kind: BlobKind::IvfPq,
+                blob: &ivf.to_bytes(),
+            },
+        )
+        .unwrap();
+
+        let seg = Segment::open(&path).unwrap();
+        assert_eq!(seg.blob_kind(), BlobKind::IvfPq);
+        assert!(seg.vectors().is_empty());
+        assert_eq!(Metric::from_code(seg.metric()), Some(Metric::Cosine));
+        let back = IvfPq::from_bytes(seg.index_blob()).unwrap();
+        assert_eq!(search_all(&back, &queries), search_all(&ivf, &queries));
+        let p = SearchParams {
+            rerank: 10,
+            ..SearchParams::default()
+        };
+        let hit = back.search(&data[42 * DIM..][..DIM], 1, &p).unwrap()[0];
+        assert_eq!(seg.ids()[hit.id as usize], 5_000_042);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn small_blob(nbits: u32) -> Vec<u8> {
+        let cfg = Config {
+            nlist: 4,
+            ..cfg_bits(nbits)
+        };
+        let mut ivf = IvfPq::new(DIM, Metric::L2, cfg).unwrap();
+        ivf.add(&test_data::vectors(300, DIM, 17)).unwrap(); // 8-bit PQ needs 256
+        ivf.to_bytes()
+    }
+
+    #[test]
+    fn corrupt_blobs_are_errors() {
+        let bytes = small_blob(8);
+        let load = |b: &[u8]| IvfPq::from_bytes(b).err();
+        for len in 0..bytes.len() {
+            assert!(load(&bytes[..len]).is_some(), "truncated to {len}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(load(&longer).is_some());
+
+        let ivf = IvfPq::from_bytes(&bytes).unwrap();
+        let (nlist, m, n) = (4, 8, 300);
+        let scale_at = 56 + 4 * (nlist * DIM + m * 256 * (DIM / m) + DIM);
+        let ids_at = scale_at + 4 + 4 * nlist; // list 0's first id
+        assert!(!ivf.lists[0].ids.is_empty());
+        let second = ivf.lists[0].ids[1];
+        let at = |off: usize, v: u32| {
+            let mut b = bytes.clone();
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            b
+        };
+        for (b, what) in [
+            (at(20, 5), "bad config"), // m doesn't divide dim
+            (at(24, 3), "bad config"), // nbits
+            (at(28, 2), "bad trained flag"),
+            (at(28, 0), "bad trained flag"), // untrained but not empty
+            (
+                at(48, n + 1),
+                "list sizes do not add up to the vector count",
+            ),
+            (at(scale_at, 0), "bad SQ parameters"),
+            (at(scale_at, f32::NAN.to_bits()), "bad SQ parameters"),
+            (at(ids_at, n), "list ids are not each of 0..len once"),
+            (at(ids_at, second), "list ids are not each of 0..len once"),
+        ] {
+            assert_eq!(load(&b), Some(Error::Corrupt(what)));
+        }
+        assert_eq!(load(&at(4, 2)), Some(Error::UnsupportedBlobVersion(2)));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn random_corruption_never_panics(
+            four in proptest::bool::ANY,
+            flips in proptest::collection::vec((0usize..1 << 20, 1u8..=255), 1..8),
+            cut in 0usize..1 << 20,
+        ) {
+            static BLOBS: std::sync::LazyLock<[Vec<u8>; 2]> =
+                std::sync::LazyLock::new(|| [small_blob(8), small_blob(4)]);
+            let mut b = BLOBS[usize::from(four)].clone();
+            for (pos, x) in flips {
+                let i = pos % b.len();
+                b[i] ^= x;
+            }
+            if cut % 4 == 0 {
+                b.truncate(cut % b.len());
+            }
+            if let Ok(mut ivf) = IvfPq::from_bytes(&b) {
+                // Whatever loads must be searchable and extendable.
+                let dim = ivf.dim();
+                let qs = test_data::vectors(3, dim, 3);
+                for q in qs.chunks_exact(dim) {
+                    for rerank in [0, 20] {
+                        let p = SearchParams { nprobe: 2, rerank, ..SearchParams::default() };
+                        let _ = ivf.search(q, 10, &p);
+                    }
+                }
+                let _ = ivf.add(&qs);
+            }
+        }
     }
 
     #[test]

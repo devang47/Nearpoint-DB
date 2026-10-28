@@ -1,4 +1,6 @@
-//! Segment file format v1 (task 3.2). See docs/formats/segment.md.
+//! Segment file format v2 (v1: task 3.2). See docs/formats/segment.md.
+//! v2 adds element type "none": a segment without f32 vectors (an IVF-PQ
+//! segment whose index keeps its own codes). v1 files still load.
 //!
 //! A sealed segment is immutable: it is written once to `<name>.tmp`,
 //! synced, renamed into place, and never modified after that (only
@@ -20,15 +22,17 @@ compile_error!("segment files are little-endian and their sections are mapped in
 
 /// First and last 8 bytes of every segment file.
 pub const MAGIC: [u8; 8] = *b"NPSEGMT\0";
-/// The format version this build writes and the newest it reads.
-pub const VERSION: u32 = 1;
+/// The format version this build writes and the newest it reads (it
+/// also reads v1).
+pub const VERSION: u32 = 2;
 
 const HEADER_LEN: usize = 64;
 const FOOTER_LEN: usize = 96;
 /// Every section starts on a multiple of this (from the start of the file).
 const ALIGN: u64 = 64;
-/// Element type code for f32 vectors, the only one v1 has.
+/// Element type codes: f32 vectors (v1, v2), or no vector section (v2).
 const ELEM_F32: u32 = 0;
+const ELEM_NONE: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -36,7 +40,7 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("not a segment file (bad magic)")]
     BadMagic,
-    #[error("segment format version {0} is not supported (this build reads up to {VERSION})")]
+    #[error("segment format version {0} is not supported (this build reads 1..={VERSION})")]
     UnsupportedVersion(u32),
     #[error("segment element type {0} is not supported")]
     UnsupportedElementType(u32),
@@ -57,6 +61,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum BlobKind {
     Flat,
     Hnsw,
+    IvfPq,
 }
 
 impl BlobKind {
@@ -64,6 +69,7 @@ impl BlobKind {
         match self {
             BlobKind::Flat => 0,
             BlobKind::Hnsw => 1,
+            BlobKind::IvfPq => 2,
         }
     }
 
@@ -71,6 +77,7 @@ impl BlobKind {
         match code {
             0 => Some(BlobKind::Flat),
             1 => Some(BlobKind::Hnsw),
+            2 => Some(BlobKind::IvfPq),
             _ => None,
         }
     }
@@ -83,7 +90,8 @@ pub struct SegmentData<'a> {
     /// `index::Metric::code()`; not interpreted by storage.
     pub metric: u32,
     /// Row-major, `ids.len() * dim` long, in the form the index stores
-    /// them (e.g. normalized for cosine).
+    /// them (e.g. normalized for cosine). Empty with a non-empty `ids`:
+    /// the segment has no vector section (the index blob is all there is).
     pub vectors: &'a [f32],
     /// External id of each vector; dense index id `i` is `ids[i]`.
     pub ids: &'a [u64],
@@ -102,10 +110,16 @@ struct Layout {
     blob: Range<usize>,
 }
 
-/// Where the sections go for these sizes; `None` on overflow.
-fn sections(dim: u64, count: u64, blob_len: u64) -> Option<[Range<u64>; 3]> {
+/// Where the sections go for these sizes; `None` on overflow. Without
+/// vectors the vector section is empty.
+fn sections(dim: u64, count: u64, vectors: bool, blob_len: u64) -> Option<[Range<u64>; 3]> {
     let v_start = HEADER_LEN as u64;
-    let v_end = v_start.checked_add(count.checked_mul(dim)?.checked_mul(4)?)?;
+    let v_len = if vectors {
+        count.checked_mul(dim)?.checked_mul(4)?
+    } else {
+        0
+    };
+    let v_end = v_start.checked_add(v_len)?;
     let i_start = v_end.checked_next_multiple_of(ALIGN)?;
     let i_end = i_start.checked_add(count.checked_mul(8)?)?;
     let b_start = i_end.checked_next_multiple_of(ALIGN)?;
@@ -143,7 +157,7 @@ fn parse(b: &[u8]) -> Result<Layout> {
         return Err(Error::Truncated);
     }
     let version = le_u32(b, 8);
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(Error::UnsupportedVersion(version));
     }
     let footer = &b[b.len() - FOOTER_LEN..];
@@ -159,7 +173,7 @@ fn parse(b: &[u8]) -> Result<Layout> {
     }
 
     let elem = le_u32(header, 12);
-    if elem != ELEM_F32 {
+    if !(elem == ELEM_F32 || elem == ELEM_NONE && version >= 2) {
         return Err(Error::UnsupportedElementType(elem));
     }
     let dim = le_u32(header, 16);
@@ -171,12 +185,12 @@ fn parse(b: &[u8]) -> Result<Layout> {
         return Err(Error::Corrupt("dim is zero"));
     }
 
-    // The section table is redundant with the header (v1 has one layout
-    // per size), so it must match exactly, and the footer must follow the
-    // blob directly.
+    // The section table is redundant with the header (one layout per
+    // size and element type), so it must match exactly, and the footer
+    // must follow the blob directly.
     let blob_len = le_u64(footer, 56 + 8);
-    let expected =
-        sections(u64::from(dim), count, blob_len).ok_or(Error::Corrupt("section sizes"))?;
+    let expected = sections(u64::from(dim), count, elem == ELEM_F32, blob_len)
+        .ok_or(Error::Corrupt("section sizes"))?;
     for (i, want) in expected.iter().enumerate() {
         let at = 8 + 24 * i;
         let off = le_u64(footer, at);
@@ -235,14 +249,16 @@ pub fn write(path: &Path, seg: &SegmentData<'_>) -> Result<()> {
     if seg.dim == 0 || u32::try_from(seg.dim).is_err() {
         return Err(Error::InvalidInput("dim must be in 1..=u32::MAX"));
     }
-    if Some(seg.vectors.len()) != count.checked_mul(seg.dim) {
+    let vectors = !(seg.vectors.is_empty() && count > 0);
+    if vectors && Some(seg.vectors.len()) != count.checked_mul(seg.dim) {
         return Err(Error::InvalidInput("vectors.len() != ids.len() * dim"));
     }
-    let secs = sections(seg.dim as u64, count as u64, seg.blob.len() as u64)
+    let secs = sections(seg.dim as u64, count as u64, vectors, seg.blob.len() as u64)
         .ok_or(Error::InvalidInput("segment too large"))?;
 
     let tmp = tmp_path(path);
-    let res = write_file(&tmp, seg, &secs).and_then(|()| Ok(fs::rename(&tmp, path)?));
+    let elem = if vectors { ELEM_F32 } else { ELEM_NONE };
+    let res = write_file(&tmp, seg, &secs, elem).and_then(|()| Ok(fs::rename(&tmp, path)?));
     if res.is_err() {
         let _ = fs::remove_file(&tmp); // best effort; the error is what matters
     }
@@ -255,11 +271,11 @@ pub fn write(path: &Path, seg: &SegmentData<'_>) -> Result<()> {
     Ok(())
 }
 
-fn write_file(tmp: &Path, seg: &SegmentData<'_>, secs: &[Range<u64>; 3]) -> Result<()> {
+fn write_file(tmp: &Path, seg: &SegmentData<'_>, secs: &[Range<u64>; 3], elem: u32) -> Result<()> {
     let mut header = [0u8; HEADER_LEN];
     header[..8].copy_from_slice(&MAGIC);
     header[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&ELEM_F32.to_le_bytes());
+    header[12..16].copy_from_slice(&elem.to_le_bytes());
     header[16..20].copy_from_slice(&(seg.dim as u32).to_le_bytes());
     header[20..24].copy_from_slice(&seg.metric.to_le_bytes());
     header[24..32].copy_from_slice(&(seg.ids.len() as u64).to_le_bytes());
@@ -339,7 +355,8 @@ impl Segment {
         self.len() == 0
     }
 
-    /// Row-major vectors, viewed in place in the map (no copy).
+    /// Row-major vectors, viewed in place in the map (no copy). Empty if
+    /// the segment was written without them (and isn't empty).
     pub fn vectors(&self) -> &[f32] {
         bytemuck::cast_slice(&self.map[self.layout.vectors.clone()]) // alignment checked in open
     }
@@ -434,21 +451,25 @@ mod tests {
     fn every_flipped_bit_is_detected() {
         let o = Owned::new(10, 3, 37);
         let img = image("flip", &o, 3);
-        assert!(parse(&img).is_ok());
-        let mut bad = img.clone();
-        for byte in 0..img.len() {
-            for bit in 0..8 {
-                bad[byte] ^= 1 << bit;
-                assert!(parse(&bad).is_err(), "flip at byte {byte} bit {bit}");
-                bad[byte] ^= 1 << bit;
-            }
-        }
+        assert_every_flip_detected(&img);
         // Each section's CRC names the section.
         let lay = parse(&img).unwrap();
         for (r, name) in [lay.vectors, lay.ids, lay.blob].iter().zip(SECTION_NAMES) {
             let mut bad = img.clone();
             bad[r.start + 1] ^= 0x10;
             assert!(matches!(parse(&bad), Err(Error::Checksum(n)) if n == name));
+        }
+    }
+
+    fn assert_every_flip_detected(img: &[u8]) {
+        assert!(parse(img).is_ok());
+        let mut bad = img.to_vec();
+        for byte in 0..img.len() {
+            for bit in 0..8 {
+                bad[byte] ^= 1 << bit;
+                assert!(parse(&bad).is_err(), "flip at byte {byte} bit {bit}");
+                bad[byte] ^= 1 << bit;
+            }
         }
     }
 
@@ -489,9 +510,11 @@ mod tests {
         let mut bad = img.clone();
         bad[0] = b'X';
         assert!(matches!(parse(&bad), Err(Error::BadMagic)));
-        let mut newer = img.clone();
-        newer[8..12].copy_from_slice(&2u32.to_le_bytes());
-        assert!(matches!(parse(&newer), Err(Error::UnsupportedVersion(2))));
+        for v in [0, VERSION + 1] {
+            let mut bad = img.clone();
+            bad[8..12].copy_from_slice(&v.to_le_bytes());
+            assert!(matches!(parse(&bad), Err(Error::UnsupportedVersion(x)) if x == v));
+        }
     }
 
     #[test]
@@ -527,14 +550,81 @@ mod tests {
     }
 
     /// A v1 file committed to the repo: the format must keep reading it.
-    /// Built from `Owned::new(3, 2, 5)` with dim 2.
+    /// Built from `Owned::new(3, 2, 5)` with dim 2. This build writes the
+    /// same bytes except the version and the two CRCs it changes.
     #[test]
-    fn v1_fixture_still_loads_and_writes_identically() {
+    fn v1_fixture_still_loads() {
         let fixture: &[u8] = include_bytes!("../testdata/segment-v1.seg");
         let o = Owned::new(3, 2, 5);
-        assert_eq!(image("fixture", &o, 2), fixture);
+        let mut v1 = image("fixture", &o, 2);
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        recrc(&mut v1);
+        assert_eq!(v1, fixture);
         let path = tmp_dir("fixture-open").join("f.seg");
         fs::write(&path, fixture).unwrap();
         check_contents(&Segment::open(&path).unwrap(), &o, 2);
+    }
+
+    /// Recomputes the header and footer CRCs after editing an image.
+    fn recrc(img: &mut [u8]) {
+        let f = img.len() - FOOTER_LEN;
+        let h = crc32fast::hash(&img[..HEADER_LEN]);
+        img[f..f + 4].copy_from_slice(&h.to_le_bytes());
+        let c = crc32fast::hash(&img[f..f + 84]);
+        img[f + 84..f + 88].copy_from_slice(&c.to_le_bytes());
+    }
+
+    /// v2: a segment without vectors. Committed as a fixture, built from
+    /// `Owned::new(3, 2, 5)` with dim 2 and no vectors.
+    #[test]
+    fn segment_without_vectors() {
+        let dir = tmp_dir("bare");
+        let o = Owned::new(10, 3, 37);
+        let path = dir.join("s.seg");
+        write(
+            &path,
+            &SegmentData {
+                vectors: &[],
+                ..o.data(3)
+            },
+        )
+        .unwrap();
+        let s = Segment::open(&path).unwrap();
+        assert!(s.vectors().is_empty());
+        assert_eq!((s.len(), s.ids()), (10, &o.ids[..]));
+        assert_eq!(s.index_blob(), &o.blob[..]);
+        let img = fs::read(&path).unwrap();
+        assert_eq!(le_u32(&img, 12), ELEM_NONE);
+        assert_every_flip_detected(&img);
+        // v1 has no "no vectors" element type.
+        let mut v1 = img.clone();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        recrc(&mut v1);
+        assert!(matches!(parse(&v1), Err(Error::UnsupportedElementType(1))));
+        // Vectors of the wrong length are still an error.
+        let bad = SegmentData {
+            vectors: &o.vectors[3..],
+            ..o.data(3)
+        };
+        assert!(matches!(write(&path, &bad), Err(Error::InvalidInput(_))));
+
+        let o = Owned::new(3, 2, 5);
+        let path = dir.join("fixture.seg");
+        write(
+            &path,
+            &SegmentData {
+                vectors: &[],
+                ..o.data(2)
+            },
+        )
+        .unwrap();
+        let fixture: &[u8] = include_bytes!("../testdata/segment-v2.seg");
+        assert_eq!(fs::read(&path).unwrap(), fixture);
+        let s = Segment::open(&path).unwrap();
+        assert_eq!(
+            (s.len(), s.ids(), s.index_blob()),
+            (3, &o.ids[..], &o.blob[..])
+        );
+        assert!(s.vectors().is_empty());
     }
 }
