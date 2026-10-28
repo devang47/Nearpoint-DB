@@ -12,11 +12,17 @@
 //! `params.rerank > 0` the best `max(k, rerank)` PQ candidates are re-scored
 //! against them (f32 query vs decoded code) and those distances returned.
 //!
-//! L2 only: `new` rejects other metrics.
+//! Metrics. Cells, residuals and codes are always L2 (k-means, PQ).
+//! Cosine normalizes vectors on insert and queries on search, then runs as
+//! L2: on unit vectors `|q - x|² = 2 (1 - cos)`, so distances are halved on
+//! the way out. Inner product probes the lists with the largest `<q, c>`
+//! and scores `<q, c + r> = <q, c> + <q, r>`: one table of sub-vector dot
+//! products per query, plus the list's `<q, c>` (negated: nearer = smaller).
 //!
 //! Building is `train` (k-means and PQ codebooks on a sample) then `add`;
 //! `add` on an untrained index trains on that first batch.
 
+use std::borrow::Cow;
 use std::collections::BinaryHeap;
 use std::ops::Range;
 
@@ -53,6 +59,7 @@ impl Default for Config {
 
 pub struct IvfPq {
     dim: usize,
+    metric: Metric,
     cfg: Config,
     quant: Option<Quantizers>,
     lists: Vec<List>,
@@ -77,9 +84,6 @@ struct List {
 
 impl IvfPq {
     pub fn new(dim: usize, metric: Metric, cfg: Config) -> Result<Self> {
-        if metric != Metric::L2 {
-            return Err(Error::InvalidConfig("IVF-PQ supports only the L2 metric"));
-        }
         if dim == 0 || cfg.nlist == 0 || cfg.m == 0 || !dim.is_multiple_of(cfg.m) {
             return Err(Error::InvalidConfig(
                 "need dim > 0, nlist > 0, m dividing dim",
@@ -90,6 +94,7 @@ impl IvfPq {
         }
         Ok(IvfPq {
             dim,
+            metric,
             cfg,
             quant: None,
             lists: Vec::new(),
@@ -111,7 +116,13 @@ impl IvfPq {
         }
         batch_ids(self.dim, 0, data)?;
         let (dim, cfg) = (self.dim, self.cfg);
-        let x = quant::sample(data, dim, cfg.max_train, cfg.seed);
+        let mut x = quant::sample(data, dim, cfg.max_train, cfg.seed).into_owned();
+        if self.metric == Metric::Cosine {
+            x.par_chunks_exact_mut(dim).for_each(|v| {
+                let unit = self.metric.prepare(v).into_owned();
+                v.copy_from_slice(&unit);
+            });
+        }
         let coarse = KMeans {
             max_train: usize::MAX, // already sampled
             seed: cfg.seed,
@@ -119,7 +130,7 @@ impl IvfPq {
         }
         .train(&x)?;
         let sq = Sq::train(&x, dim, usize::MAX, cfg.seed)?;
-        let mut residuals = x.into_owned();
+        let mut residuals = x;
         residuals
             .par_chunks_exact_mut(dim)
             .for_each(|v| subtract(v, coarse.get(coarse.assign(v).0 as usize)));
@@ -140,15 +151,21 @@ impl IvfPq {
         let n = vectors.len() / dim;
         let mut cells = vec![0u32; n];
         let mut codes = vec![0u8; n * m];
+        let start = self.sq_codes.len();
+        self.sq_codes.resize(start + n * dim, 0);
+        let metric = self.metric;
         vectors
             .par_chunks_exact(dim)
             .zip(cells.par_iter_mut())
             .zip(codes.par_chunks_exact_mut(m))
+            .zip(self.sq_codes[start..].par_chunks_exact_mut(dim))
             .for_each_init(
                 || vec![0f32; dim],
-                |r, ((v, cell), code)| {
-                    *cell = q.coarse.assign(v).0;
-                    r.copy_from_slice(v);
+                |r, (((v, cell), code), sq)| {
+                    let v = metric.prepare(v);
+                    *cell = q.coarse.assign(&v).0;
+                    q.sq.encode_into(&v, sq);
+                    r.copy_from_slice(&v);
                     subtract(r, q.coarse.get(*cell as usize));
                     q.pq.encode_into(r, code);
                 },
@@ -183,12 +200,6 @@ impl IvfPq {
             }
             kernels::pq4_set(&mut list.codes, at, code);
         }
-        let start = self.sq_codes.len();
-        self.sq_codes.resize(start + n * dim, 0);
-        self.sq_codes[start..]
-            .par_chunks_exact_mut(dim)
-            .zip(vectors.par_chunks_exact(dim))
-            .for_each(|(code, v)| q.sq.encode_into(v, code));
         self.len += n;
     }
 }
@@ -226,7 +237,7 @@ impl Index for IvfPq {
     }
 
     fn metric(&self) -> Metric {
-        Metric::L2
+        self.metric
     }
 
     fn len(&self) -> usize {
@@ -250,10 +261,10 @@ impl Index for IvfPq {
     }
 
     /// Scans the `params.nprobe` nearest lists for the `max(k,
-    /// params.rerank)` nearest by ADC distance (the squared L2 to the PQ
-    /// reconstruction). Ids not in `params.filter` are skipped while
+    /// params.rerank)` nearest by ADC distance (the metric's distance to
+    /// the PQ reconstruction). Ids not in `params.filter` are skipped while
     /// scanning. With `params.rerank > 0` those candidates are re-scored
-    /// with their SQ codes (squared L2 to the int8 reconstruction); the `k`
+    /// with their SQ codes (distance to the int8 reconstruction); the `k`
     /// nearest are returned either way.
     fn search(&self, query: &[f32], k: usize, params: &SearchParams) -> Result<Vec<Hit>> {
         check_dim(self.dim, query.len())?;
@@ -263,7 +274,11 @@ impl Index for IvfPq {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let query = &*self.metric.prepare(query);
+        let ip = self.metric == Metric::InnerProduct;
 
+        // A cell's distance is the query's to its centroid: L2, or for
+        // inner product `-<q, c>`, which is also that list's ADC offset.
         let mut cells: Vec<Hit> = q
             .coarse
             .as_slice()
@@ -271,7 +286,11 @@ impl Index for IvfPq {
             .enumerate()
             .map(|(i, c)| Hit {
                 id: i as u32,
-                dist: kernels::l2_sq(query, c),
+                dist: if ip {
+                    -kernels::dot(query, c)
+                } else {
+                    kernels::l2_sq(query, c)
+                },
             })
             .collect();
         let nprobe = params.nprobe.clamp(1, cells.len());
@@ -296,6 +315,10 @@ impl Index for IvfPq {
                 best.pop();
             }
         };
+        // Inner product: `-<q_j, centroid>` per subspace, the same for
+        // every list.
+        let ip_table: Option<Vec<f32>> =
+            ip.then(|| q.pq.dot_table(query).iter().map(|x| -x).collect());
         let mut residual = vec![0f32; self.dim];
         let (mut lut, mut sums) = (Vec::new(), Vec::new());
         for cell in &cells {
@@ -303,12 +326,17 @@ impl Index for IvfPq {
             if list.ids.is_empty() {
                 continue;
             }
-            residual.copy_from_slice(query);
-            subtract(&mut residual, q.coarse.get(cell.id as usize));
-            let table = q.pq.distance_table(&residual);
+            let (base, table) = match &ip_table {
+                Some(t) => (cell.dist, Cow::Borrowed(t.as_slice())),
+                None => {
+                    residual.copy_from_slice(query);
+                    subtract(&mut residual, q.coarse.get(cell.id as usize));
+                    (0.0, Cow::Owned(q.pq.distance_table(&residual)))
+                }
+            };
             if self.cfg.nbits == 8 {
                 for (&id, code) in list.ids.iter().zip(list.codes.chunks_exact(self.cfg.m)) {
-                    offer(id, quant::adc_distance(&table, code));
+                    offer(id, base + quant::adc_distance(&table, code));
                 }
                 continue;
             }
@@ -316,32 +344,44 @@ impl Index for IvfPq {
             sums.resize(list.ids.len().next_multiple_of(kernels::PQ4_BLOCK), 0);
             kernels::pq4_scan(&list.codes, &lut, &mut sums);
             for (&id, &s) in list.ids.iter().zip(&sums) {
-                offer(id, bias + f32::from(s) * step);
+                offer(id, base + bias + f32::from(s) * step);
             }
         }
 
         let mut hits = best.into_vec();
         if params.rerank > 0 {
-            // |q - decode(c)|² = scale² · |(q - min) / scale - 128 - c|²: the
-            // query goes into code units once, then each candidate is one
-            // i8 -> f32 widening and an f32 L2 kernel call.
-            let scale = q.sq.scale();
+            // decode(c) = (c + 128) · scale + min, so
+            //   |q - decode(c)|² = scale² · |(q - min) / scale - 128 - c|²
+            //   <q, decode(c)>   = scale · <q, c> + 128 · scale · Σq + <q, min>.
+            // The query-only parts are computed once; each candidate is one
+            // i8 -> f32 widening and one f32 kernel call.
+            let (scale, min) = (q.sq.scale(), q.sq.min());
             let qs: Vec<f32> = query
                 .iter()
-                .zip(q.sq.min())
+                .zip(min)
                 .map(|(&x, &lo)| (x - lo) / scale - 128.0)
                 .collect();
+            let offset = 128.0 * scale * query.iter().sum::<f32>() + kernels::dot(query, min);
             let mut code = vec![0f32; self.dim];
             for h in &mut hits {
                 let c = &self.sq_codes[h.id as usize * self.dim..][..self.dim];
                 for (f, &b) in code.iter_mut().zip(c) {
                     *f = f32::from(b);
                 }
-                h.dist = kernels::l2_sq(&qs, &code) * scale * scale;
+                h.dist = if ip {
+                    -(kernels::dot(query, &code) * scale + offset)
+                } else {
+                    kernels::l2_sq(&qs, &code) * scale * scale
+                };
             }
         }
         hits.sort_unstable();
         hits.truncate(k);
+        if self.metric == Metric::Cosine {
+            for h in &mut hits {
+                h.dist *= 0.5; // |q - x|² / 2 = 1 - cos for unit q and x
+            }
+        }
         Ok(hits)
     }
 }
@@ -363,9 +403,10 @@ mod tests {
         }
     }
 
-    /// Mean fraction of the exact top-k that `index` returns.
+    /// Mean fraction of the exact top-k (under the index's metric) that
+    /// `index` returns.
     fn recall(index: &dyn Index, data: &[f32], queries: &[f32], k: usize, p: &SearchParams) -> f64 {
-        let mut exact = Flat::new(DIM, Metric::L2);
+        let mut exact = Flat::new(DIM, index.metric());
         exact.add(data).unwrap();
         let mut hits = 0;
         for q in queries.as_chunks::<DIM>().0 {
@@ -507,6 +548,54 @@ mod tests {
     }
 
     #[test]
+    fn cosine_and_inner_product() {
+        let data = test_data::vectors(3000, DIM, 10);
+        let queries = test_data::vectors(50, DIM, 11);
+        for metric in [Metric::Cosine, Metric::InnerProduct] {
+            for cfg in [
+                cfg(),
+                Config {
+                    nbits: 4,
+                    m: 16,
+                    ..cfg()
+                },
+            ] {
+                let mut ivf = IvfPq::new(DIM, metric, cfg).unwrap();
+                ivf.add(&data).unwrap();
+                let p = |nprobe, rerank| SearchParams {
+                    nprobe,
+                    rerank,
+                    ..SearchParams::default()
+                };
+                let (few, plain, reranked) = (
+                    recall(&ivf, &data, &queries, 10, &p(2, 0)),
+                    recall(&ivf, &data, &queries, 10, &p(16, 0)),
+                    recall(&ivf, &data, &queries, 10, &p(16, 200)),
+                );
+                let what = format!("{metric:?} nbits {}", cfg.nbits);
+                assert!(few < plain && plain > 0.5, "{what}: {few} {plain}");
+                assert!(reranked > 0.9, "{what}: {plain} -> {reranked}");
+
+                // Re-ranked distances are the metric's, up to the SQ error
+                // e = |decode(code) - v| <= scale / 2 per component.
+                let e = ivf.quant.as_ref().unwrap().sq.scale() / 2.0 * (DIM as f32).sqrt();
+                for q in queries.as_chunks::<DIM>().0.iter().take(5) {
+                    let qn = metric.prepare(q);
+                    let bound = match metric {
+                        Metric::InnerProduct => kernels::dot(q, q).sqrt() * e,
+                        _ => e + e * e / 2.0, // (2|q - v| e + e²) / 2, |q - v| <= 1
+                    } + 1e-4;
+                    for h in ivf.search(q, 10, &p(16, 50)).unwrap() {
+                        let v = &data[h.id as usize * DIM..][..DIM];
+                        let want = metric.distance(&qn, &metric.prepare(v));
+                        assert!((h.dist - want).abs() <= bound, "{what}: {h:?} vs {want}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn filter_skips_ids_while_scanning() {
         let data = test_data::vectors(2000, DIM, 4);
         let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
@@ -531,7 +620,6 @@ mod tests {
 
     #[test]
     fn config_and_input_errors() {
-        assert!(IvfPq::new(DIM, Metric::Cosine, cfg()).is_err());
         assert!(IvfPq::new(DIM, Metric::L2, Config { m: 5, ..cfg() }).is_err());
         assert!(IvfPq::new(DIM, Metric::L2, Config { nbits: 3, ..cfg() }).is_err());
         let wide = Config {

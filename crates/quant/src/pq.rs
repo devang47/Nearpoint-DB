@@ -196,9 +196,31 @@ impl Pq {
         }
         t
     }
+
+    /// Like `distance_table`, but entry `j * ksub + c` is the dot product
+    /// of query sub-vector j with centroid c, so summing a code's entries
+    /// (`adc_distance`) gives `<query, decode(code)>`.
+    pub fn dot_table(&self, query: &[f32]) -> Vec<f32> {
+        assert_eq!(query.len(), self.dim);
+        let (dsub, ksub) = (self.dsub(), self.ksub());
+        let mut t = vec![0f32; self.m() * ksub];
+        for ((tj, bt), q) in t
+            .chunks_exact_mut(ksub)
+            .zip(self.books_t.chunks_exact(dsub * ksub))
+            .zip(query.chunks_exact(dsub))
+        {
+            for (col, &x) in bt.chunks_exact(ksub).zip(q) {
+                for (o, &c) in tj.iter_mut().zip(col) {
+                    *o += x * c;
+                }
+            }
+        }
+        t
+    }
 }
 
-/// ADC: squared L2 from the table's query to `decode(code)`.
+/// ADC: squared L2 from the table's query to `decode(code)` (or, with a
+/// `dot_table`, the dot product with it).
 pub fn adc_distance(table: &[f32], code: &[u8]) -> f32 {
     let ksub = table.len() / code.len();
     debug_assert_eq!(table.len(), code.len() * ksub);
@@ -307,6 +329,12 @@ mod tests {
             let adc = adc_distance(&pq.distance_table(&q), &code);
             let exact = kernels::l2_sq(&q, &pq.decode(&code));
             prop_assert!((adc - exact).abs() <= 1e-4 * exact.max(1.0), "{adc} vs {exact}");
+            let dot = adc_distance(&pq.dot_table(&q), &code);
+            let x = pq.decode(&code);
+            let exact = kernels::dot(&q, &x);
+            // Terms of both signs cancel, so bound by their magnitudes.
+            let mag: f32 = q.iter().zip(&x).map(|(a, b)| (a * b).abs()).sum();
+            prop_assert!((dot - exact).abs() <= 1e-4 * mag.max(1.0), "{dot} vs {exact}");
         }
     }
 }
