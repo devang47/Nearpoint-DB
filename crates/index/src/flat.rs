@@ -1,39 +1,89 @@
-//! Exact brute-force search. Task 2.2 wraps this in the `Index` trait and
-//! parallelizes it; the bench harness uses it as the exactness baseline.
+//! Exact brute-force index. Each query is split across threads with rayon;
+//! it's the exactness baseline for every approximate index.
 
-use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ops::Range;
 
-/// A search hit: vector id and squared L2 distance.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Hit {
-    pub id: u32,
-    pub dist: f32,
+use rayon::prelude::*;
+
+use crate::{Hit, Index, Metric, Result, SearchParams, batch_ids, check_dim};
+
+/// Rows per rayon task: big enough to amortize scheduling, small enough
+/// that 1M rows give every core plenty of work (~61 tasks).
+const ROWS_PER_TASK: usize = 16_384;
+
+pub struct Flat {
+    dim: usize,
+    metric: Metric,
+    data: Vec<f32>,
 }
 
-// Max-heap order: farther first; on equal distance the larger id is
-// "farther", so ties keep the smaller id (the usual ground-truth convention).
-impl Eq for Hit {}
-impl Ord for Hit {
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.dist.total_cmp(&o.dist).then(self.id.cmp(&o.id))
+impl Flat {
+    pub fn new(dim: usize, metric: Metric) -> Self {
+        assert!(dim > 0);
+        Flat {
+            dim,
+            metric,
+            data: Vec::new(),
+        }
     }
 }
-impl PartialOrd for Hit {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
+
+impl Index for Flat {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    fn len(&self) -> usize {
+        self.data.len() / self.dim
+    }
+
+    fn add(&mut self, vectors: &[f32]) -> Result<Range<u32>> {
+        let ids = batch_ids(self.dim, self.len(), vectors)?;
+        self.data.reserve(vectors.len());
+        for v in vectors.chunks_exact(self.dim) {
+            self.data.extend_from_slice(&self.metric.prepare(v));
+        }
+        Ok(ids)
+    }
+
+    fn search(&self, query: &[f32], k: usize, _: &SearchParams) -> Result<Vec<Hit>> {
+        check_dim(self.dim, query.len())?;
+        let q = self.metric.prepare(query);
+        Ok(self
+            .data
+            .par_chunks(self.dim * ROWS_PER_TASK)
+            .enumerate()
+            .map(|(t, rows)| {
+                top_k(
+                    rows,
+                    self.dim,
+                    self.metric,
+                    &q,
+                    k,
+                    (t * ROWS_PER_TASK) as u32,
+                )
+            })
+            .reduce(Vec::new, |mut a, b| {
+                a.extend(b);
+                a.sort_unstable();
+                a.truncate(k);
+                a
+            }))
     }
 }
 
-/// The `k` nearest rows of `data` (row-major, `dim` columns) to `query`
-/// by squared L2, nearest first.
-pub fn search(data: &[f32], dim: usize, query: &[f32], k: usize) -> Vec<Hit> {
-    assert_eq!(query.len(), dim);
+/// The `k` nearest of `rows` to `q`, nearest first; ids start at `first_id`.
+fn top_k(rows: &[f32], dim: usize, metric: Metric, q: &[f32], k: usize, first_id: u32) -> Vec<Hit> {
     let mut heap = BinaryHeap::with_capacity(k + 1);
-    for (id, row) in data.chunks_exact(dim).enumerate() {
+    for (i, row) in rows.chunks_exact(dim).enumerate() {
         let hit = Hit {
-            id: id as u32,
-            dist: kernels::l2_sq(query, row),
+            id: first_id + i as u32,
+            dist: metric.distance(q, row),
         };
         if heap.len() < k {
             heap.push(hit);
@@ -49,28 +99,31 @@ pub fn search(data: &[f32], dim: usize, query: &[f32], k: usize) -> Vec<Hit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Error, test_data};
 
-    #[test]
-    fn nearest_first_and_ties_keep_smaller_id() {
-        // Rows at x = 0, 3, 1, 1, 5 (dim 1); query at 0.
-        let data = [0.0, 3.0, 1.0, 1.0, 5.0];
-        let ids = |k| {
-            search(&data, 1, &[0.0], k)
-                .iter()
-                .map(|h| h.id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(3), [0, 2, 3]);
-        assert_eq!(ids(2), [0, 2]); // id 3 ties id 2 and loses
-        assert_eq!(ids(10), [0, 2, 3, 1, 4]); // k > n returns all
-        assert!(search(&data, 1, &[0.0], 0).is_empty());
+    fn ids(hits: &[Hit]) -> Vec<u32> {
+        hits.iter().map(|h| h.id).collect()
     }
 
     #[test]
-    fn matches_a_full_sort() {
-        let dim = 7;
-        let data: Vec<f32> = (0..dim * 500).map(|i| ((i * 37) % 101) as f32).collect();
-        let q: Vec<f32> = (0..dim).map(|i| i as f32 * 9.0).collect();
+    fn nearest_first_and_ties_keep_smaller_id() {
+        let mut f = Flat::new(1, Metric::L2);
+        assert_eq!(f.add(&[0.0, 3.0, 1.0, 1.0, 5.0]).unwrap(), 0..5);
+        let p = SearchParams::default();
+        assert_eq!(ids(&f.search(&[0.0], 3, &p).unwrap()), [0, 2, 3]);
+        assert_eq!(ids(&f.search(&[0.0], 2, &p).unwrap()), [0, 2]); // id 3 ties, loses
+        assert_eq!(ids(&f.search(&[0.0], 10, &p).unwrap()), [0, 2, 3, 1, 4]);
+        assert!(f.search(&[0.0], 0, &p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parallel_search_matches_a_full_sort_across_tasks() {
+        // > ROWS_PER_TASK rows so the reduce actually merges several tasks.
+        let (dim, n) = (8, ROWS_PER_TASK * 2 + 123);
+        let data = test_data::vectors(n, dim, 1);
+        let q = test_data::vectors(1, dim, 2);
+        let mut f = Flat::new(dim, Metric::L2);
+        f.add(&data).unwrap();
         let mut all: Vec<Hit> = data
             .chunks_exact(dim)
             .enumerate()
@@ -80,6 +133,36 @@ mod tests {
             })
             .collect();
         all.sort();
-        assert_eq!(search(&data, dim, &q, 25), all[..25]);
+        let got = f.search(&q, 25, &SearchParams::default()).unwrap();
+        assert_eq!(ids(&got), ids(&all[..25]));
+    }
+
+    #[test]
+    fn metrics() {
+        let p = SearchParams::default();
+        let mut ip = Flat::new(2, Metric::InnerProduct);
+        ip.add(&[1.0, 0.0, 10.0, 0.0, -5.0, 0.0]).unwrap();
+        assert_eq!(ids(&ip.search(&[1.0, 0.0], 3, &p).unwrap()), [1, 0, 2]);
+
+        // Cosine ignores magnitude: [10, 0.1] is nearly parallel to [1, 0].
+        let mut cos = Flat::new(2, Metric::Cosine);
+        cos.add(&[0.0, 1.0, 10.0, 0.1, 0.0, 0.0]).unwrap();
+        let hits = cos.search(&[3.0, 0.0], 3, &p).unwrap();
+        assert_eq!(ids(&hits), [1, 0, 2]);
+        assert!(hits[0].dist < 1e-3);
+        assert!((hits[2].dist - 1.0).abs() < 1e-6); // zero vector: distance 1
+    }
+
+    #[test]
+    fn rejects_wrong_dims() {
+        let mut f = Flat::new(3, Metric::L2);
+        assert_eq!(
+            f.add(&[1.0; 4]),
+            Err(Error::DimMismatch {
+                expected: 3,
+                got: 1
+            })
+        );
+        assert!(f.search(&[1.0; 2], 1, &SearchParams::default()).is_err());
     }
 }

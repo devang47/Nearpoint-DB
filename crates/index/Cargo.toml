@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 kernels = { path = "../kernels" }
+rayon.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

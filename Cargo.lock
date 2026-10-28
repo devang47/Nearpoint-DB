@@ -97,6 +97,7 @@ dependencies = [
  "clap",
  "index",
  "kernels",
+ "rayon",
  "storage",
  "thiserror",
 ]
@@ -483,6 +484,8 @@ name = "index"
 version = "0.1.0"
 dependencies = [
  "kernels",
+ "rayon",
+ "thiserror",
 ]
 
 [[package]]
