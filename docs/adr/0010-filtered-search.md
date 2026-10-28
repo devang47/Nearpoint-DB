@@ -118,3 +118,53 @@ far from most queries. SIFT1M, M=16, efc=200, 1000 queries, forced walk
 - Not measured: filters correlated *with* the query (matches near it),
   which only help the walk, and per-query filters (the bench uses one
   filter for all queries).
+
+## Addendum (2026-10-29): walk budget (task 7.5)
+The 10% far filter's p99 (75 ms against ~6 ms for brute force) made the
+budget above worth building.
+
+- **Budget = the filter's cardinality** (ids `< len`), counted in layer-0
+  distances computed by this query's walk. The count is a local in
+  `search_layer`, not the per-thread bench counter, and the upper-layer
+  descent (a few dozen distances) is outside it. When the walk would
+  compute distance `filtered + 1` it stops, and `search_with` brute-forces
+  the whole bitmap. That result is exact, and distances already computed
+  are thrown away. Reusing them would save at most half the fallback's
+  cost, and only on the slow path.
+- **Why 1x and not c·x:** a walk that finishes under budget costs what it
+  costs (at most `filtered`, so no more than brute force). A walk that runs
+  out costs `filtered` + `filtered` = 2x brute force. So every filtered
+  search costs at most about 2x the cheaper plan, without estimating
+  correlation. With budget `c · filtered` the worst case is (1 + c)x. A
+  smaller budget would abort walks that were going to beat brute force.
+  1 is the smallest budget that never does this when the walk is the
+  cheaper plan.
+- **What changes:** `Plan::Graph` (what the planner picks above the
+  brute-force threshold) is now the budgeted walk. `Plan::FullWalk` is the
+  old unbudgeted walk, kept for benches and tests. The up-front planner and
+  unfiltered searches are unchanged (unfiltered walks have no budget).
+  `hnsw::fallbacks()` is a per-thread counter of budgeted walks that fell
+  back. The `filtered` bench prints it next to mean distances, and
+  `--plan walk` runs the unbudgeted walk.
+
+SIFT1M, M=16, efc=200, 1000 queries, `--plan auto,walk`, tie-aware
+recall@10, mean distances per query, fallbacks out of 1000:
+
+| filter | sel | ef  | auto: recall | auto: dists | fallbacks | walk: dists |
+|--------|-----|-----|-------------:|------------:|----------:|------------:|
+| random | 1%  | 64  | 1.0000 (brute) | 9,975   | –   | 45,772  |
+| random | 10% | 64  | 0.9987 | 8,015   | 0   | 8,015   |
+| random | 10% | 128 | 0.9998 | 13,829  | 0   | 13,829  |
+| random | 50% | 64  | 0.9826 | 2,180   | 0   | 2,180   |
+| far    | 1%  | 64  | 1.0000 (brute) | 10,000  | –   | 293,807 |
+| far    | 10% | 64  | 0.9996 | 86,923  | 349 | 110,804 |
+| far    | 10% | 128 | 0.9997 | 99,629  | 412 | 129,006 |
+| far    | 50% | 64  | 0.9923 | 10,810  | 0   | 10,810  |
+| far    | 50% | 128 | 0.9980 | 15,650  | 0   | 15,650  |
+
+Uniform filters never fall back, so their results and costs are the same
+as before. On the far 10% filter, a third to two fifths of the queries
+fall back. The mean drops by about 22%, and by construction no query
+computes more than 2 · 100k distances plus the descent. This report has no
+per-query maximum, and latency is measured separately. Recall is
+unchanged: a fallback is exact.

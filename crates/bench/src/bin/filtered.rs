@@ -2,7 +2,8 @@
 //! filter kind and selectivity picks a subset of the base ids, computes
 //! exact filtered ground truth by brute force over it, and runs the queries
 //! one at a time with that filter. Reports recall, the distances each
-//! search computed and which plan ran, per (filter, selectivity, ef, plan).
+//! search computed, which plan ran and how many budgeted walks fell back to
+//! brute force, per (filter, selectivity, ef, plan).
 //!
 //! Filter kinds: `random` keeps a seeded uniform random subset; `far` keeps
 //! the base vectors farthest from the queries' centroid, so the matches are
@@ -10,7 +11,7 @@
 //! a filtered graph walk).
 //!
 //! `cargo run --release -p bench --bin filtered -- --dataset sift1m \
-//!     --selectivity 0.01,0.1,0.5 --ef 64,128 --plan auto,graph --filter random,far`
+//!     --selectivity 0.01,0.1,0.5 --ef 64,128 --plan auto,walk --filter random,far`
 
 use std::fs::File;
 use std::io::Write;
@@ -39,8 +40,9 @@ struct Args {
     /// HNSW search beam widths, comma-separated.
     #[arg(long, value_delimiter = ',', default_value = "64,128")]
     ef: Vec<usize>,
-    /// Plans to run: `auto` is what `search` picks; `graph` and `brute`
-    /// force one side of the planner's threshold.
+    /// Plans to run: `auto` is what `search` picks; `graph` (budgeted walk)
+    /// and `brute` force one side of the planner's threshold; `walk` is
+    /// the walk without a budget.
     #[arg(long, value_delimiter = ',', default_value = "auto")]
     plan: Vec<PlanArg>,
     /// Filter kinds, comma-separated: `random` (uniform) and/or `far`
@@ -85,6 +87,7 @@ enum FilterKind {
 enum PlanArg {
     Auto,
     Graph,
+    Walk,
     Brute,
 }
 
@@ -166,20 +169,23 @@ fn main() -> Result<()> {
                 let plan = match plan {
                     PlanArg::Auto => index.plan(args.k, &params),
                     PlanArg::Graph => Plan::Graph,
+                    PlanArg::Walk => Plan::FullWalk,
                     PlanArg::Brute => Plan::BruteForce,
                 };
                 let r = run(&index, &base, &query, &truth, &params, args.k, plan)?;
                 let label = match plan {
                     Plan::Graph => "graph",
+                    Plan::FullWalk => "walk",
                     Plan::BruteForce => "brute",
                 };
                 println!(
                     "{tag:<6} sel={s:<6} n={:<7} ef={ef:<4} {label:<5} recall@{k}={:.4} (id {:.4}) \
-                     dists={:<8.0} p50={:.3}ms p99={:.3}ms qps={:.0}",
+                     dists={:<8.0} fallbacks={:<5} p50={:.3}ms p99={:.3}ms qps={:.0}",
                     filter.len(),
                     r.recall,
                     r.id_recall,
                     r.distances,
+                    r.fallbacks,
                     ms(r.p50),
                     ms(r.p99),
                     r.qps,
@@ -289,6 +295,8 @@ struct Run {
     id_recall: f64,
     /// Mean distances computed per search (`hnsw::distances`).
     distances: f64,
+    /// Searches whose walk ran out of budget (`hnsw::fallbacks`).
+    fallbacks: u64,
     p50: Duration,
     p99: Duration,
     qps: f64,
@@ -308,7 +316,7 @@ fn run(
     // result counts if its true distance, recomputed from the base vectors,
     // is <= the k-th true filtered neighbour's.
     let (mut id_hits, mut tie_hits, mut wanted) = (0usize, 0usize, 0usize);
-    let distances = hnsw::distances();
+    let (distances, fallbacks) = (hnsw::distances(), hnsw::fallbacks());
     let started = Instant::now();
     for (i, truth) in truth.iter().enumerate() {
         let q = query.row(i);
@@ -333,6 +341,7 @@ fn run(
         recall: tie_hits as f64 / n,
         id_recall: id_hits as f64 / n,
         distances,
+        fallbacks: hnsw::fallbacks() - fallbacks,
         p50: pct(0.50),
         p99: pct(0.99),
         qps: query.len() as f64 / total.as_secs_f64(),
