@@ -240,8 +240,25 @@ impl PayloadStore {
             return Err(bad_row);
         }
         let next = row.checked_add(1).ok_or(bad_row)?;
+        for (name, v) in self.parse_all(payload)? {
+            self.columns
+                .entry(name.clone())
+                .or_insert_with(|| Column::new(v.kind()))
+                .push(row, v);
+        }
+        self.len = next;
+        Ok(())
+    }
+
+    /// Whether `insert` would accept `payload` (row order aside), without
+    /// storing it. Lets a writer validate before logging the write.
+    pub fn check(&self, payload: &Value) -> Result<()> {
+        self.parse_all(payload).map(drop)
+    }
+
+    fn parse_all<'a>(&self, payload: &'a Value) -> Result<Vec<(&'a String, Parsed<'a>)>> {
         let fields = match payload {
-            Value::Null => &Map::new(),
+            Value::Null => return Ok(Vec::new()),
             Value::Object(m) => m,
             _ => return Err(Error::NotAnObject),
         };
@@ -259,14 +276,7 @@ impl PayloadStore {
             }
             parsed.push((name, v));
         }
-        for (name, v) in parsed {
-            self.columns
-                .entry(name.clone())
-                .or_insert_with(|| Column::new(v.kind()))
-                .push(row, v);
-        }
-        self.len = next;
-        Ok(())
+        Ok(parsed)
     }
 
     /// The payload of `row` as a JSON object, or `None` if it has no fields.
