@@ -47,6 +47,22 @@ pub fn peak_memory() -> io::Result<PeakMemory> {
     })
 }
 
+/// Marks the calling thread as background work (QoS "utility"): macOS
+/// then favors the efficiency cores for it and lets interactive threads
+/// (searches) go first on the performance cores. Best effort: an error
+/// only means the thread keeps its default class.
+#[cfg(target_os = "macos")]
+pub fn set_background_qos() -> io::Result<()> {
+    // SAFETY: affects only the calling thread's scheduling class; takes
+    // no pointers.
+    let rc =
+        unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +77,25 @@ mod tests {
         let after = peak_memory().unwrap();
         assert!(after.phys_footprint >= before.phys_footprint.max(256 * MB));
         assert!(after.rss >= 256 * MB);
+    }
+
+    #[test]
+    fn background_qos_applies() {
+        std::thread::spawn(|| {
+            set_background_qos().unwrap();
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            // SAFETY: valid out-pointers for this thread's own QoS.
+            let rc = unsafe {
+                libc::pthread_get_qos_class_np(
+                    libc::pthread_self(),
+                    &mut class,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, 0);
+            assert!(matches!(class, libc::qos_class_t::QOS_CLASS_UTILITY));
+        })
+        .join()
+        .unwrap();
     }
 }
