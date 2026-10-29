@@ -24,8 +24,9 @@
 //! by brute force over the model. One line per window, also appended to
 //! `--csv`: reader search p50/p99 and searches/s, write requests/s, live
 //! count, recall@10, server RSS (`--server-pid`), writer pause. The run
-//! ends at the last full window, then compares the first and last windows:
-//! PASS if recall fell and p99 rose by at most `--max-drift` (relative).
+//! ends at the last full window, then compares the medians of the first
+//! and last `--drift-windows` windows (at most half each): PASS if recall
+//! fell and p99 rose by at most `--max-drift` (relative).
 //! A drift FAIL sets the exit code only with `--fail-on-drift`.
 //!
 //! ```text
@@ -95,6 +96,9 @@ struct Args {
     /// Soak: allowed relative recall drop and p99 rise, first vs last window.
     #[arg(long, default_value_t = 0.10)]
     max_drift: f64,
+    /// Soak: compare the medians of this many first and last windows.
+    #[arg(long, default_value_t = 10)]
+    drift_windows: u64,
     /// Soak: exit non-zero when the drift check fails.
     #[arg(long)]
     fail_on_drift: bool,
@@ -839,14 +843,31 @@ fn main() -> anyhow::Result<()> {
     }
     let mut drift_ok = true;
     if args.live > 0 {
-        match (windows.first(), windows.last()) {
-            (Some(f), Some(l)) if windows.len() >= 2 => {
+        // Medians of the first and last `--drift-windows`: one window's p99
+        // swings ±40% with whatever background build overlaps it.
+        let k = (args.drift_windows.max(1) as usize).min(windows.len() / 2);
+        let median = |ws: &[Window], f: fn(&Window) -> f64| {
+            let mut v: Vec<f64> = ws.iter().map(f).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        match k {
+            1.. => {
+                let (head, tail) = (&windows[..k], &windows[windows.len() - k..]);
+                let f = Window {
+                    recall: median(head, |w| w.recall),
+                    p99: median(head, |w| w.p99),
+                };
+                let l = Window {
+                    recall: median(tail, |w| w.recall),
+                    p99: median(tail, |w| w.p99),
+                };
                 let recall = l.recall / f.recall - 1.0;
                 let p99 = l.p99 / f.p99 - 1.0;
                 // NaN (no samples) fails too.
                 drift_ok = recall >= -args.max_drift && p99 <= args.max_drift;
                 println!(
-                    "drift, first vs last window: recall@10 {:.4} -> {:.4} ({:+.1}%), \
+                    "drift, median of first vs last {k} windows: recall@10 {:.4} -> {:.4} ({:+.1}%), \
                      p99 {:.2} -> {:.2} ms ({:+.1}%), max {:.0}%: {}",
                     f.recall,
                     l.recall,
@@ -858,7 +879,7 @@ fn main() -> anyhow::Result<()> {
                     if drift_ok { "PASS" } else { "FAIL" }
                 );
             }
-            _ => {
+            0 => {
                 drift_ok = false;
                 println!("drift: FAIL, fewer than 2 windows (need secs >= 2 * probe-secs)");
             }
