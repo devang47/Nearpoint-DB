@@ -145,11 +145,7 @@ impl Db {
             let (colls, stop) = (Arc::clone(&colls), Arc::clone(&stop));
             std::thread::Builder::new()
                 .name("nearpoint-maintain".into())
-                .spawn(move || {
-                    // Copies and file writes of builds: background, like the pool.
-                    let _ = storage::sys::set_background_qos();
-                    maintain_all(&colls, &stop)
-                })?
+                .spawn(move || maintain_all(&colls, &stop))?
         };
         Ok(Db {
             dir,

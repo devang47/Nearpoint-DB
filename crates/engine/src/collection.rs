@@ -195,11 +195,6 @@ fn build_pool() -> Result<&'static rayon::ThreadPool> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .thread_name(|i| format!("nearpoint-build-{i}"))
-        // Builds yield the performance cores to searches (soak: build
-        // windows had ~1.6x the p99 of quiet ones).
-        .start_handler(|_| {
-            let _ = storage::sys::set_background_qos();
-        })
         .build()
         .map_err(io::Error::other)?;
     Ok(BUILD_POOL.get_or_init(|| pool))
