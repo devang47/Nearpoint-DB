@@ -149,6 +149,12 @@ steady-state size (~24%); see RESULTS.md for why both are given.
 - [x] 6.4 Query fan-out across segments with parallel search and top-k merge.
 **Acceptance:** 4-hour soak test with mixed insert/delete/search; recall
 and p99 latency stay within 10% of the start.
+**Status (2026-10-29): not met (p99).** 4-hour soak, 1M live dim-32
+points, 26.7M inserts and deletes: recall drift −0.2%, 0 violations, RSS
+flat (dead rows are compacted away), but p99 rose 1.29 → 1.82 ms (+41%)
+over the first ~2 h, then plateaued; 1 client-side transport error.
+Next: rerun with per-window segment logging to attribute the rise
+(segment count vs background builds), fix, re-soak.
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).

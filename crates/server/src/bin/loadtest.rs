@@ -23,7 +23,8 @@
 //! searches at default params and scores them against the exact top 10,
 //! by brute force over the model. One line per window, also appended to
 //! `--csv`: reader search p50/p99 and searches/s, write requests/s, live
-//! count, recall@10, server RSS (`--server-pid`), writer pause. The run
+//! count, recall@10, server RSS (`--server-pid`), writer pause, sealed
+//! segments (`<index>:<rows>`). The run
 //! ends at the last full window, then compares the medians of the first
 //! and last `--drift-windows` windows (at most half each): PASS if recall
 //! fell and p99 rose by at most `--max-drift` (relative).
@@ -113,6 +114,8 @@ struct Args {
 struct Http {
     addr: String,
     conn: Option<BufReader<TcpStream>>,
+    /// When the last reply on `conn` finished, for error reports.
+    last: Option<Instant>,
 }
 
 impl Http {
@@ -120,6 +123,7 @@ impl Http {
         Http {
             addr: addr.to_owned(),
             conn: None,
+            last: None,
         }
     }
 
@@ -130,11 +134,16 @@ impl Http {
         ctype: &str,
         body: &[u8],
     ) -> anyhow::Result<(u16, Vec<u8>)> {
+        let idle = match (&self.conn, self.last) {
+            (Some(_), Some(t)) => format!("reused connection idle {} ms", t.elapsed().as_millis()),
+            _ => "new connection".to_owned(),
+        };
         let res = self.try_call(method, path, ctype, body);
+        self.last = Some(Instant::now());
         if res.is_err() {
             self.conn = None; // reconnect next time
         }
-        res
+        res.with_context(|| format!("{method} {path} ({idle})"))
     }
 
     fn try_call(
@@ -273,7 +282,7 @@ impl State {
 
     fn error(&self, what: impl std::fmt::Display) {
         if self.errors.fetch_add(1, SeqCst) < 20 {
-            eprintln!("error: {what}");
+            eprintln!("error: {what:#}"); // `#`: anyhow context chain
         }
     }
 
@@ -613,8 +622,9 @@ fn exact_top10(queries: &[Vec<f32>], models: &[&Live], dim: usize) -> Vec<Vec<u6
 
 /// Soak probe: pauses the writers, so the client model is exactly the
 /// server's live set, checks the live count and measures recall@10 at
-/// default search params. Returns (live points, recall@10, pause ms).
-fn probe(st: &State, http: &mut Http, rng: &mut u64) -> (usize, f64, f64) {
+/// default search params. Returns (live points, recall@10, pause ms, the
+/// sealed segments as `<index>:<rows>` joined by spaces).
+fn probe(st: &State, http: &mut Http, rng: &mut u64) -> (usize, f64, f64, String) {
     let a = &st.args;
     let t = Instant::now();
     let pause = st.pause.write().unwrap_or_else(|e| e.into_inner());
@@ -625,12 +635,23 @@ fn probe(st: &State, http: &mut Http, rng: &mut u64) -> (usize, f64, f64) {
         .collect();
     let models: Vec<&Live> = guards.iter().map(|g| &**g).collect();
     let n: usize = models.iter().map(|m| m.ids.len()).sum();
+    let mut segs = String::new();
     match http.json("GET", &st.path(""), &json!(null)) {
-        Ok(info) if info["points"].as_u64() == Some(n as u64) => {}
-        Ok(info) => st.violation(format!(
-            "server has {} live points, the client {n}",
-            info["points"]
-        )),
+        Ok(info) => {
+            if info["points"].as_u64() != Some(n as u64) {
+                st.violation(format!(
+                    "server has {} live points, the client {n}",
+                    info["points"]
+                ));
+            }
+            let all = info["segments"].as_array().cloned().unwrap_or_default();
+            segs = all
+                .iter()
+                .filter(|s| s["index"] != "mutable")
+                .map(|s| format!("{}:{}", s["index"].as_str().unwrap_or("?"), s["rows"]))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
         Err(e) => st.error(e),
     }
     let (mut queries, mut got) = (Vec::new(), Vec::new());
@@ -658,7 +679,7 @@ fn probe(st: &State, http: &mut Http, rng: &mut u64) -> (usize, f64, f64) {
         wanted += t.len();
     }
     let recall = found as f64 / wanted.max(1) as f64;
-    (n, recall, t.elapsed().as_secs_f64() * 1000.0)
+    (n, recall, t.elapsed().as_secs_f64() * 1000.0, segs)
 }
 
 /// Resident set size of `pid` in MiB, via `ps` (KiB).
@@ -704,7 +725,7 @@ fn soak(st: &State, start: Instant) -> anyhow::Result<Vec<Window>> {
     {
         writeln!(
             f,
-            "t_s,live,searches_per_s,writes_per_s,p50_ms,p99_ms,recall10,rss_mib,pause_ms,errors,violations"
+            "t_s,live,searches_per_s,writes_per_s,p50_ms,p99_ms,recall10,rss_mib,pause_ms,errors,violations,segments"
         )?;
     }
     let sum = |ops: &HashMap<&str, u64>, keys: &[&str]| -> u64 {
@@ -720,9 +741,8 @@ fn soak(st: &State, start: Instant) -> anyhow::Result<Vec<Window>> {
         std::thread::sleep(
             (start + Duration::from_secs(i * probe_secs)).saturating_duration_since(Instant::now()),
         );
-        // A fresh connection per probe: the server (hyper) closes
-        // keep-alive connections idle for 30 s, and probes are further apart.
-        let (live, recall, pause_ms) = probe(st, &mut Http::new(&a.addr), &mut rng);
+        // A fresh connection per probe, rather than one idle for a window.
+        let (live, recall, pause_ms, segs) = probe(st, &mut Http::new(&a.addr), &mut rng);
         let (ops, mut lat) = {
             let mut s = st.stats.lock().unwrap_or_else(|e| e.into_inner());
             (s.ops.clone(), std::mem::take(&mut s.lat))
@@ -740,13 +760,13 @@ fn soak(st: &State, start: Instant) -> anyhow::Result<Vec<Window>> {
         println!(
             "{t:>6} s: live {live}, search/s {sps:.0}, writes/s {wps:.0}, p50 {p50:.2} ms, \
              p99 {p99:.2} ms, recall@10 {recall:.4}, rss {} MiB, pause {pause_ms:.0} ms, \
-             errors {errors}, violations {violations}",
+             errors {errors}, violations {violations}, segments [{segs}]",
             rss.map_or("-".into(), |r| format!("{r:.0}"))
         );
         if let Some(f) = &mut csv {
             writeln!(
                 f,
-                "{t},{live},{sps:.1},{wps:.1},{p50:.3},{p99:.3},{recall:.4},{},{pause_ms:.0},{errors},{violations}",
+                "{t},{live},{sps:.1},{wps:.1},{p50:.3},{p99:.3},{recall:.4},{},{pause_ms:.0},{errors},{violations},{segs}",
                 rss.map_or(String::new(), |r| format!("{r:.1}"))
             )?;
         }

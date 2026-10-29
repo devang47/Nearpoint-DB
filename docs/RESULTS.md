@@ -301,6 +301,48 @@ replace, delete) at 10 rounds/s, 4 readers (a third filtered). Commit
   (Phase 6) needs compaction first.
 - 1,000-cycle crash test on the merged code: passed, 121 s.
 
+## Phase 6 soak (4 hours, steady state)
+
+`loadtest --secs 14400 --live 1000000 --dim 32 --probe-secs 60
+--probe-queries 1000 --drift-windows 30 --seal-secs 0`, collection config
+`seal_rows 100000, ivf_rows 400000, max_merge_rows 1600000`, server
+`--build-threads 4`, commit 3bbb0b7 + loadtest fixes. 1M live points
+(uniform random, dim 32, L2) held constant: 2 writers × 10 rounds/s,
+each inserting 50, deleting 50 and replacing 5; 4 readers (a third
+filtered). Every 60 s a probe pauses the writers and scores 1,000 k=10
+searches (default nprobe 32 / rerank 100, ef 64) against exact top 10
+over the client's model. Quiet machine, `caffeinate -dims`. Per-window
+CSV: `docs/results/soak-4h-1m-dim32.csv`.
+
+### 2026-10-29
+
+| Hours | p50 (median) | **p99 (median)** | searches/s | recall@10 | RSS median (max) |
+|-------|-------------:|-----------------:|-----------:|----------:|-----------------:|
+| 0–0.3 | 0.61 ms | 1.30 ms | 6,184 | 0.7783 | 561 (826) MiB |
+| 0.3–1 | 0.62 ms | 1.21 ms | 6,110 | 0.7757 | 570 (979) MiB |
+| 1–2 | 0.62 ms | 1.47 ms | 5,950 | 0.7740 | 575 (779) MiB |
+| 2–3 | 0.65 ms | 1.65 ms | 5,600 | 0.7760 | 405 (836) MiB |
+| 3–4 | 0.66 ms | 1.70 ms | 5,500 | 0.7780 | 420 (753) MiB |
+
+- Totals: 26.7 M points inserted and deleted, 1.3 M replaced, 80.6 M
+  searches; **0 violations** (no acknowledged-deleted id returned, live
+  count matched the model at all 240 probes); **1 error**: a client-side
+  broken pipe at 7,982 s (unattributed; the loadtest now labels errors
+  with the request and connection idle time).
+- **Recall: met.** Median of the first vs last 30 windows 0.7791 →
+  0.7772 (−0.2%). The absolute value is low because uniform random 32-d
+  data is hard for both HNSW (ef 64, efc 100) and PQ; drift is the target.
+- **p99: missed.** 1.29 → 1.82 ms (+41%, limit 10%). It rises over the
+  first ~2 h and then plateaus; p50 only +11%, throughput −13%. Not yet
+  attributed: the final segment layout was lost (loadtest drops the
+  collection), so the loadtest now logs the sealed segments per window.
+  Suspects: more sealed segments at steady state (each IVF-PQ segment
+  pays nprobe 32 + rerank 100) and builds on 4 of 10 cores overlapping
+  the windows.
+- **Memory: fixed.** RSS flat to falling (561 → ~410 MiB median) over
+  26.7 M deletes; the Phase 4 run grew ~20 MiB/min with dead rows. Peaks
+  (≤ 979 MiB) are merges in flight.
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.
