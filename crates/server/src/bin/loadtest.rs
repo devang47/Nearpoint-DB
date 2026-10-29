@@ -686,7 +686,7 @@ struct Window {
 
 /// Soak mode's main loop: a probe and a report line per window until the
 /// last full window. Returns the windows.
-fn soak(st: &State, http: &mut Http, start: Instant) -> anyhow::Result<Vec<Window>> {
+fn soak(st: &State, start: Instant) -> anyhow::Result<Vec<Window>> {
     let a = &st.args;
     let mut csv = match &a.csv {
         Some(p) => {
@@ -720,7 +720,9 @@ fn soak(st: &State, http: &mut Http, start: Instant) -> anyhow::Result<Vec<Windo
         std::thread::sleep(
             (start + Duration::from_secs(i * probe_secs)).saturating_duration_since(Instant::now()),
         );
-        let (live, recall, pause_ms) = probe(st, http, &mut rng);
+        // A fresh connection per probe: the server (hyper) closes
+        // keep-alive connections idle for 30 s, and probes are further apart.
+        let (live, recall, pause_ms) = probe(st, &mut Http::new(&a.addr), &mut rng);
         let (ops, mut lat) = {
             let mut s = st.stats.lock().unwrap_or_else(|e| e.into_inner());
             (s.ops.clone(), std::mem::take(&mut s.lat))
@@ -803,7 +805,7 @@ fn main() -> anyhow::Result<()> {
             s.spawn(|| sealer(&st));
         }
         if args.live > 0 {
-            let windows = soak(&st, &mut http, start);
+            let windows = soak(&st, start);
             st.stop.store(true, SeqCst);
             return windows;
         }

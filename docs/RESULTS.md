@@ -208,6 +208,36 @@ keeps the base vectors farthest from the query set's centroid. ef 64,
   12× brute force's). New task 7.5: cap the walk at ~`filtered` distance
   computations, then brute-force.
 
+### 2026-10-29 — walk budget (task 7.5), commit 3bbb0b7
+
+`filtered --dataset sift1m --selectivity 0.01,0.1,0.5 --ef 64,128 --plan
+auto,walk,brute --filter far,random`; `auto` = the planner + budgeted walk
+(`graph` when it walks), `walk` = the old unbudgeted walk. Same index and
+queries as above; quiet machine, `caffeinate -dims`. Full table:
+`docs/results/sift1m-filtered-budget.csv`.
+
+| Filter | Sel. | ef | recall@10 auto | p50 auto | **p99 auto** | p99 unbudgeted | brute p99 | Fallbacks / 1000 | Mean dists auto (unbudgeted) |
+|--------|------|----|---------------:|---------:|-------------:|---------------:|----------:|-----------------:|-----------------------------:|
+| far | 10% | 64 | 0.9997 | 4.41 ms | **18.1 ms** | 71.5 ms | 5.74 ms | 349 | 86,775 (110,269) |
+| far | 10% | 128 | 0.9998 | 6.57 ms | **18.1 ms** | 77.0 ms | 5.53 ms | 412 | 99,484 (128,389) |
+| far | 50% | 64 | 0.9933 | 0.230 ms | 10.9 ms | 9.63 ms | 13.3 ms | 0 | 10,762 |
+| random | 10% | 64 | 0.9986 | 0.713 ms | 1.02 ms | 1.03 ms | 7.30 ms | 0 | 7,965 |
+| random | 50% | 64 | 0.9817 | 0.207 ms | 3.38 ms* | 0.258 ms | 14.8 ms | 0 | 2,169 |
+
+- **Far 10% p99: 72 → 18 ms (4×)**, recall unchanged. 35–41% of those
+  queries run out of budget and brute-force.
+- **Bounded, but 3.1× brute force, not the ≈2× ADR 0010 predicted.** The
+  budget counts distances, and a walk distance costs ~2.3× a scan
+  distance (random access, heap, visited set): a fallback query spends
+  ~12 ms walking 100k distances, then 5.5 ms scanning. Weighting the
+  budget (≈ `filtered` / 2.3) would bring it to ~2×; follow-up, not
+  tuned here.
+- Uniform filters never fall back: same distances and recall as the
+  unbudgeted walk. 1% filters are brute force up front, as before.
+- \* random 50% ef 64 p99 3.38 ms vs 0.258 ms for the identical
+  unbudgeted walk (0 fallbacks, same distances): a one-off stall like
+  the 2026-10-28 one; ef 128 is 0.458 vs 0.451 ms.
+
 ## IVF-PQ metrics (round 3)
 
 `bench --index ivfpq --metric l2|ip|cosine`, SIFT1M, nlist 1024, 10k

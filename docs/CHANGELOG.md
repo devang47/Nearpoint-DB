@@ -15,6 +15,77 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-29 — Parallel round 4: segments and compaction, walk budget, soak harness
+- **What:** scaffold commit (rayon in engine), three branches built in
+  parallel worktrees and merged: Phase 6 (6.1–6.4), task 7.5, and a soak
+  mode for `loadtest` (entries below). A read-only review of the Phase 6
+  merge found edge-case bugs, fixed in one commit (entry below). After
+  the merge, on a quiet machine under `caffeinate -dims`: the 7.5
+  filtered sweep, then the 4-hour Phase 6 soak.
+- **Why:** Phase 6 lives in `engine`, 7.5 in `index/hnsw.rs`, the soak
+  harness in `server/src/bin/loadtest.rs`: disjoint, so they ran side by
+  side; timings only after the merge.
+
+## 2026-10-29 — Phase 6 review fixes
+- **What:** upserts and queries reject components beyond ±1e15 and zero
+  `cosine` vectors; `Sq::train` errors on a non-finite or zero scale and a
+  failed IVF-PQ build falls back to HNSW; PQ m = largest divisor of dim
+  ≤ max(16, dim/8), and dims with no split into ≤ 16-dim subspaces (primes)
+  stay HNSW; merges also capped at 2 GiB of f32 input; `Config::validate`
+  requires `seal_rows ≤ cap / 2`; a rewrite syncs the WAL before building;
+  the Db thread catches a panicking `maintain`; `segments()` skips the
+  mutable segment's lock (ADR 0012 addendum).
+- **Why:** the worst case: one vector with a huge finite range made the
+  int8 scale infinite, the IVF-PQ segment published fine and then refused
+  to load, so the whole database would not open. The others: a poisoned
+  WAL left a new orphan file pair per retry; configs that could never
+  merge; prime/wide dims getting 1-byte or 48-dim PQ codes; wide-vector
+  merges blowing the 10 GB budget; one panic stopping all maintenance.
+
+## 2026-10-29 — Segments and compaction (tasks 6.1–6.4)
+- **What:** `crates/engine`: the mutable segment seals at `seal_rows`
+  (default 100k) with segment files written outside the writer lock; a
+  background step (`Collection::maintain`, driven by one `Db` thread)
+  rewrites sealed segments: drops rows when ≥ 25% are dead, rebuilds
+  segments of ≥ `ivf_rows` (default 1M) as IVF-PQ for L2/cosine (f32
+  kept in the file, served from the mmap), and merges 4 segments of a
+  size tier up to `max_merge_rows` (4M); builds on a dedicated rayon pool
+  (`--build-threads`, default half the cores). The id map points at
+  stable segment keys, so a merge remaps only moved ids. Sealed segments
+  are searched in parallel and merged to top k. Manifest v2 (per-segment
+  file ids from a counter; v1 still read). `SearchOptions`/search JSON
+  gain `nprobe` (32) and `rerank` (100); collection info lists segments.
+  ADR 0012, docs/formats/manifest.md, docs/api.md.
+- **Why:** Phase 6. Seals no longer stall writers for the file write;
+  dead rows no longer stay in RAM forever (server RSS grew ~20 MiB/min in
+  the Phase 4 load test); big segments become IVF-PQ instead of an HNSW
+  that would not fit (10M swaps on 16 GB). Every manifest publish syncs
+  the WAL first, so no tombstone or dropped row rests on a record that
+  isn't durable.
+
+## 2026-10-29 — Filtered walk budget (task 7.5)
+- **What:** `index/hnsw.rs`: a filtered layer-0 walk stops after
+  `filtered` (the bitmap's cardinality) distance computations of its own
+  and brute-forces the bitmap instead; `Plan::FullWalk` keeps the old walk
+  for benches; per-thread `hnsw::fallbacks()` counter; `filtered` bench
+  prints fallbacks and takes `--plan walk`. ADR 0010 addendum.
+- **Why:** a correlated 10% filter walked ~110k nodes (p99 75 ms vs 6 ms
+  brute force) because the planner only sees cardinality. The budget
+  bounds any filter without estimating correlation: measured p99 72 →
+  18 ms on SIFT1M far 10%, recall unchanged (RESULTS.md).
+
+## 2026-10-29 — Load test soak mode
+- **What:** `loadtest --live N`: preload N points, then keep the live
+  count at N (each round inserts and deletes `--batch`); every
+  `--probe-secs` pause writers, check the server's live count, and score
+  `--probe-queries` k=10 searches against exact brute-force top 10 over
+  the client's model; per-window p50/p99, throughput, recall, server RSS,
+  `--csv`; at the end compare medians of the first and last
+  `--drift-windows` windows against `--max-drift`.
+- **Why:** Phase 6 acceptance (recall and p99 within 10% over 4 hours).
+  Medians, not single windows: a 3-minute smoke run showed one window's
+  p99 swinging ±40% with whichever background build overlapped it.
+
 ## 2026-10-28 — Parallel round 3: server and CRUD, index/storage groundwork
 - **What:** scaffold commit (server dependencies in Cargo.lock), then two
   branches built in parallel worktrees and merged: Phase 4 (4.1–4.5) and

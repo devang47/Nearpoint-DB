@@ -139,14 +139,14 @@ m=32 nprobe 32 rerank 200 → 0.9155 at p50 0.21 ms. IVF-PQ build + index
 steady-state size (~24%); see RESULTS.md for why both are given.
 
 ## Phase 6: Segments and compaction
-- [ ] 6.1 Mutable segment (HNSW in RAM) sealing at configurable size.
-- [ ] 6.2 Background builder: sealed segment → on-disk HNSW (small)
+- [x] 6.1 Mutable segment (HNSW in RAM) sealing at configurable size.
+- [x] 6.2 Background builder: sealed segment → on-disk HNSW (small)
       or IVF-PQ (large) segment, swapped in atomically.
       IVF-PQ only for L2/cosine for now: inner product reaches 0.84 at
       nprobe 64 / rerank 200 and ~0.94 even with rerank 5000 (int8
       re-rank ceiling; needs f32 re-rank, Phase 8).
-- [ ] 6.3 Compaction policy: merge small segments, drop tombstoned vectors.
-- [ ] 6.4 Query fan-out across segments with parallel search and top-k merge.
+- [x] 6.3 Compaction policy: merge small segments, drop tombstoned vectors.
+- [x] 6.4 Query fan-out across segments with parallel search and top-k merge.
 **Acceptance:** 4-hour soak test with mixed insert/delete/search; recall
 and p99 latency stay within 10% of the start.
 
@@ -157,9 +157,11 @@ and p99 latency stay within 10% of the start.
 - [x] 7.3 Filter applied during graph traversal and IVF scanning.
 - [x] 7.4 Planner: brute-force over the bitmap when selectivity is very low
       (`filtered² ≤ 8·ef·len`, ADR 0010).
-- [ ] 7.5 Walk budget: stop a filtered walk after ~`filtered` distance
+- [x] 7.5 Walk budget: stop a filtered walk after ~`filtered` distance
       computations and brute-force the bitmap instead, so correlated
       filters can't blow up p99 (measured: far 10% filter, p99 75 ms).
+      As built: budget = `filtered` distances; far 10% p99 72 → 18 ms
+      (3.1× brute force, not ≈2×: a walk distance costs ~2.3× a scan one).
 **Acceptance:** recall@10 ≥ 0.9 at filter selectivity 1%, 10%, and 50%.
 **Status (2026-10-28): met for HNSW on SIFT1M**: uniform filters
 1.0000 / 0.9973 / 0.9810 at ef 64; correlated ("far") filters 1.0000 /
