@@ -344,6 +344,44 @@ CSV: `docs/results/soak-4h-1m-dim32.csv`.
   13.3 M deletes; the Phase 4 run grew ~20 MiB/min with dead rows. Peaks
   (≤ 979 MiB) are merges in flight.
 
+### 2026-10-29 — p99 diagnosis and quantizer reuse
+
+Same settings, `--drift-windows 15`, the loadtest now logging the sealed
+segment layout per window. Diagnostic run: 2 h at commit 0b0a75e
+(`docs/results/soak-diag-2h.csv`); fix run: 1 h at 9bfe09c
+(`docs/results/soak-quantizer-reuse-1h.csv`).
+
+- **Cause:** uniform deletes (~925/s) push every big IVF-PQ segment past
+  the 25% dead-row rewrite threshold in ~4.5 min, so the whole 1M set
+  was rebuilt every 300 s, for the full 2 h (the cycle never sped up),
+  each time retraining k-means + PQ on 4 of 10 cores. p99 median 1.27 ms
+  in quiet windows, 1.98 ms in windows overlapping such a build. Hourly
+  medians were flat (1.28, 1.30 ms): no degradation over time. The
+  drift check compares 15–30-window medians, and the share of build
+  windows in each set depends on the cycle's phase and shape (+21% here,
+  +41% in the 4-hour run).
+- **Fix:** a rewrite or merge with an IVF-PQ input reuses its trained
+  quantizers and only encodes (`IvfPq::empty_clone`), retraining only if
+  nlist would more than double.
+
+| First hour | Before (retrain) | After (reuse) |
+|------------|-----------------:|--------------:|
+| windows with p99 > 1.8 ms (of 59) | 20 | **11** |
+| p99 mean / max | 1.58 / 2.42 ms | **1.42 / 2.25 ms** |
+| p99 median | 1.28 ms | 1.35 ms |
+| p50 median | 0.63 ms | 0.60 ms |
+| searches/s median | 5,987 | 6,192 |
+| recall@10 median | 0.7763 | 0.7846 |
+| drift check | +21.0% (2 h) FAIL | −10.5% PASS |
+| errors / reconnects | 1 / – | 0 / 0 |
+
+- Spike windows halved, not gone. The rest line up with HNSW merges
+  (4 × 100k → ~330k HNSW built from scratch) and the remaining IVF-PQ
+  rewrites: background builds still share the CPU with searches.
+- The diagnostic run's one error was a keep-alive connection closed
+  0 ms after the previous reply (now retried once, counted as a
+  reconnect; 0 in the fix run).
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

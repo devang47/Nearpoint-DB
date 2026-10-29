@@ -153,8 +153,11 @@ and p99 latency stay within 10% of the start.
 points, 13.3M inserts + 13.3M deletes: recall drift −0.2%, 0 violations, RSS
 flat (dead rows are compacted away), but p99 rose 1.29 → 1.82 ms (+41%)
 over the first ~2 h, then plateaued; 1 client-side transport error.
-Next: rerun with per-window segment logging to attribute the rise
-(segment count vs background builds), fix, re-soak.
+Diagnosis (2 h soak with segment logging): no degradation over time;
+p99 tracks background builds (a full IVF-PQ retrain every 300 s under
+uniform deletes: 1.98 vs 1.27 ms p99), and the drift check aliases with
+that cycle. Reusing trained quantizers halved the spike windows (1 h);
+HNSW merges still spike. Next: keep builds off the search cores, re-soak.
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).

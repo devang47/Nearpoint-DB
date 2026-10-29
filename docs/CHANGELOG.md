@@ -15,6 +15,19 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-29 — Compaction reuses IVF-PQ quantizers; soak p99 diagnosis
+- **What:** `IvfPq::empty_clone` (same config + trained quantizers, no
+  vectors); engine rewrites and merges with an IVF-PQ input build on the
+  biggest one's quantizers unless nlist would more than double.
+  `loadtest` retries once when a reused connection closes before any
+  reply byte (counted as `reconnects`). Results in RESULTS.md.
+- **Why:** a 2 h diagnostic soak showed p99 tracks background builds,
+  not time: under uniform deletes the whole 1M set was rebuilt (and
+  retrained) every 300 s, p99 1.98 vs 1.27 ms in quiet windows. Reuse
+  halved the spike windows (20 → 11 per hour). The one error per run was
+  a keep-alive connection the server had closed; every loadtest request
+  is idempotent, and RFC 9112 §9.3.1 allows the retry.
+
 ## 2026-10-29 — Parallel round 4: segments and compaction, walk budget, soak harness
 - **What:** scaffold commit (rayon in engine), three branches built in
   parallel worktrees and merged: Phase 6 (6.1–6.4), task 7.5, and a soak
