@@ -157,7 +157,8 @@ Diagnosis (2 h soak with segment logging): no degradation over time;
 p99 tracks background builds (a full IVF-PQ retrain every 300 s under
 uniform deletes: 1.98 vs 1.27 ms p99), and the drift check aliases with
 that cycle. Reusing trained quantizers halved the spike windows (1 h);
-HNSW merges still spike. Next: keep builds off the search cores, re-soak.
+HNSW merges still spike; running builds at utility QoS traded peaks for
+duration (reverted). Next: 4-hour re-soak with quantizer reuse.
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).

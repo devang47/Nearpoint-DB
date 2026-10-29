@@ -378,6 +378,12 @@ segment layout per window. Diagnostic run: 2 h at commit 0b0a75e
 - Spike windows halved, not gone. The rest line up with HNSW merges
   (4 × 100k → ~330k HNSW built from scratch) and the remaining IVF-PQ
   rewrites: background builds still share the CPU with searches.
+- **Tried and reverted: builds at macOS utility QoS** (commit 4cf4a72,
+  1 h, `docs/results/soak-qos-1h.csv`), so they favor the efficiency
+  cores. Windows with p99 > 1.8 ms 11 → 7 and max 2.25 → 2.00 ms, but
+  builds ran longer and windows > 1.5 ms went 20 → 24: p99 mean 1.42 →
+  1.49, median 1.35 → 1.44 ms, searches/s −5%, drift +5.0% (PASS).
+  Peaks traded for duration; not worth the extra `unsafe`.
 - The diagnostic run's one error was a keep-alive connection closed
   0 ms after the previous reply (now retried once, counted as a
   reconnect; 0 in the fix run).

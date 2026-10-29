@@ -15,6 +15,14 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-29 — Tried: background builds at utility QoS (reverted)
+- **What:** `storage::sys::set_background_qos` on the build pool and the
+  maintenance thread (4cf4a72), measured in a 1 h soak, then reverted.
+- **Why reverted:** fewer worst windows (p99 > 1.8 ms: 11 → 7) but
+  builds on the efficiency cores ran longer, raising mean and median p99
+  (1.42 → 1.49, 1.35 → 1.44 ms) and cutting searches/s 5%. Not a clear
+  win for new `unsafe` code. Numbers in RESULTS.md.
+
 ## 2026-10-29 — Compaction reuses IVF-PQ quantizers; soak p99 diagnosis
 - **What:** `IvfPq::empty_clone` (same config + trained quantizers, no
   vectors); engine rewrites and merges with an IVF-PQ input build on the
