@@ -109,6 +109,21 @@ struct Args {
     collection_config: Option<String>,
 }
 
+/// The connection was closed before any reply byte (see `Http::call`).
+#[derive(Debug)]
+struct Stale;
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connection closed before a reply")
+    }
+}
+
+impl std::error::Error for Stale {}
+
+/// Requests retried after a `Stale` reused connection.
+static RECONNECTS: AtomicU64 = AtomicU64::new(0);
+
 /// One keep-alive HTTP/1.1 connection; enough for this server's replies
 /// (always `content-length`, never chunked).
 struct Http {
@@ -138,7 +153,17 @@ impl Http {
             (Some(_), Some(t)) => format!("reused connection idle {} ms", t.elapsed().as_millis()),
             _ => "new connection".to_owned(),
         };
-        let res = self.try_call(method, path, ctype, body);
+        let reused = self.conn.is_some();
+        let mut res = self.try_call(method, path, ctype, body);
+        // RFC 9112 §9.3.1: a server may close an idle keep-alive connection;
+        // a request that fails on a reused one before any reply byte is
+        // retried once on a new one. Every request here is idempotent
+        // (searches, gets, upserts and deletes by id).
+        if reused && matches!(&res, Err(e) if e.is::<Stale>()) {
+            RECONNECTS.fetch_add(1, SeqCst);
+            self.conn = None;
+            res = self.try_call(method, path, ctype, body);
+        }
         self.last = Some(Instant::now());
         if res.is_err() {
             self.conn = None; // reconnect next time
@@ -169,10 +194,13 @@ impl Http {
             body.len()
         );
         let s = conn.get_mut();
-        s.write_all(head.as_bytes())?;
-        s.write_all(body)?;
         let mut line = String::new();
-        conn.read_line(&mut line)?;
+        if s.write_all(head.as_bytes()).is_err()
+            || s.write_all(body).is_err()
+            || conn.read_line(&mut line)? == 0
+        {
+            return Err(Stale.into());
+        }
         let status: u16 = line
             .split(' ')
             .nth(1)
@@ -908,7 +936,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let (errors, violations) = (st.errors.load(SeqCst), st.violations.load(SeqCst));
-    println!("errors {errors}, violations {violations}");
+    println!(
+        "errors {errors}, violations {violations}, reconnects {}",
+        RECONNECTS.load(SeqCst)
+    );
     if errors + violations > 0 {
         bail!("FAIL");
     }

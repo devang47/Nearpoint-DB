@@ -944,6 +944,15 @@ impl Collection {
         let d = self.cfg.dim;
         let (mut ids, mut vectors, mut src) = (Vec::new(), Vec::new(), Vec::new());
         let segs: Vec<_> = inputs.iter().map(|&i| read(&snap.segs[i].seg)).collect();
+        // The biggest IVF-PQ input's quantizers, to skip retraining.
+        let template = segs
+            .iter()
+            .filter_map(|s| match &s.index {
+                SegIndex::IvfPq(ivf, _) => Some((s.ids.len(), ivf)),
+                SegIndex::Hnsw(_) => None,
+            })
+            .max_by_key(|&(n, _)| n)
+            .map(|(_, ivf)| ivf.empty_clone());
         let mut kinds = self.cfg.schema.clone();
         for seg in &segs {
             merge_kinds(&mut kinds, &seg.payloads);
@@ -969,7 +978,7 @@ impl Collection {
         let built = if ids.is_empty() {
             None
         } else {
-            Some(self.build(file, ids, vectors, payloads)?)
+            Some(self.build(file, ids, vectors, payloads, template)?)
         };
         crash_point(4)?;
 
@@ -1038,11 +1047,22 @@ impl Collection {
         ids: Vec<u64>,
         vectors: Vec<f32>,
         payloads: PayloadStore,
+        template: Option<IvfPq>,
     ) -> Result<Seg> {
         let (d, n) = (self.cfg.dim, ids.len());
         let pool = build_pool()?;
         if self.ivf_allowed() && n >= self.cfg.ivf_rows as usize {
-            let mut index = IvfPq::new(d, self.cfg.metric, ivf_config(d, n, self.cfg.hnsw.seed))?;
+            let fresh = ivf_config(d, n, self.cfg.hnsw.seed);
+            // Retraining (k-means + PQ) dominates a rebuild; under steady
+            // deletes every big segment is rewritten every few minutes, and
+            // the builds were the soak's p99 spikes. Reuse the quantizers
+            // unless the segment outgrew them (nlist < half of a fresh one's).
+            // ponytail: no retrain on distribution drift; retrain every Nth
+            // rewrite, or on a recall probe, if real data drifts.
+            let mut index = match template {
+                Some(t) if t.config().nlist * 2 >= fresh.nlist => t,
+                _ => IvfPq::new(d, self.cfg.metric, fresh)?,
+            };
             match pool.install(|| index.add(&vectors)) {
                 Ok(_) => {
                     // The f32 vectors go in the file (element type 0), not in RAM.
@@ -2232,9 +2252,12 @@ mod tests {
             for i in (0..n).filter(|i| i % 10 == 0) {
                 assert!(c.delete(i).unwrap());
             }
-            for round in 0..2 {
+            // Round 2 runs after 30% are dead: a rewrite that reuses the
+            // (reopened) segment's quantizers.
+            let dead = |i: u64, round| i.is_multiple_of(10) || (round == 2 && i % 10 <= 2);
+            for round in 0..3 {
                 for i in 0..n {
-                    let want = (i % 10 != 0).then(|| before[i as usize].clone());
+                    let want = (!dead(i, round)).then(|| before[i as usize].clone());
                     assert_eq!(c.get(i), want, "{metric:?} id {i}");
                 }
                 let odd: Filter = serde_json::from_value(json!({"eq": {"odd": true}})).unwrap();
@@ -2247,11 +2270,11 @@ mod tests {
                     };
                     let hits = c.search(&rand_vec(i, DIM), 10, &o).unwrap();
                     assert_eq!(hits.len(), 10);
-                    assert!(hits.iter().all(|m| m.id % 10 != 0), "dead row returned");
-                    found += usize::from(i % 10 != 0 && hits.iter().any(|m| m.id == i));
-                    asked += usize::from(i % 10 != 0);
+                    assert!(hits.iter().all(|m| !dead(m.id, round)), "dead row returned");
+                    found += usize::from(!dead(i, round) && hits.iter().any(|m| m.id == i));
+                    asked += usize::from(!dead(i, round));
                     let hits = c.search(&rand_vec(i, DIM), 10, &opts(Some(&odd))).unwrap();
-                    assert!(hits.iter().all(|m| m.id % 2 == 1 && m.id % 10 != 0));
+                    assert!(hits.iter().all(|m| m.id % 2 == 1 && !dead(m.id, round)));
                 }
                 // Under inner product a vector need not be its own nearest.
                 let ip = metric == Metric::InnerProduct;
@@ -2263,6 +2286,18 @@ mod tests {
                     drop(c);
                     c = open_with(&d, cfg.clone());
                     assert_eq!(c.segments()[0].index, kind);
+                }
+                if round == 1 {
+                    for i in (0..n).filter(|i| matches!(i % 10, 1 | 2)) {
+                        assert!(c.delete(i).unwrap());
+                    }
+                    while c.maintain().unwrap() {}
+                    // 1050 live rows >= ivf_rows (1024): rewritten as IVF-PQ.
+                    assert_eq!(
+                        shape(&c),
+                        [(kind, 1050, 0), ("mutable", 0, 0)],
+                        "{metric:?}"
+                    );
                 }
             }
         }

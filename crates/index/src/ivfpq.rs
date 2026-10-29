@@ -70,6 +70,7 @@ pub struct IvfPq {
     len: usize,
 }
 
+#[derive(Clone)]
 struct Quantizers {
     coarse: Centroids,
     pq: Pq,
@@ -107,6 +108,23 @@ impl IvfPq {
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// An empty index with this one's config and trained quantizers:
+    /// `add` then only encodes. For rebuilding a segment without
+    /// retraining (compaction).
+    pub fn empty_clone(&self) -> IvfPq {
+        IvfPq {
+            lists: if self.quant.is_some() {
+                (0..self.cfg.nlist).map(|_| List::default()).collect()
+            } else {
+                Vec::new()
+            },
+            quant: self.quant.clone(),
+            sq_codes: Vec::new(),
+            len: 0,
+            ..*self
+        }
     }
 
     /// The index blob: config, quantizers, every list and the SQ codes. It
@@ -556,6 +574,36 @@ mod tests {
                 .count();
         }
         hits as f64 / (k * queries.len() / DIM) as f64
+    }
+
+    /// `empty_clone` keeps the quantizers: re-adding a subset encodes it
+    /// exactly as the original did (same lists, codes and re-rank codes).
+    #[test]
+    fn empty_clone_reuses_quantizers() {
+        let data = test_data::vectors(3000, DIM, 1);
+        let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
+        ivf.add(&data).unwrap();
+        let mut copy = ivf.empty_clone();
+        assert_eq!((copy.len, copy.sq_codes.len()), (0, 0));
+        // Rows 1000.. again, in order: like a compaction dropping 0..1000.
+        copy.add(&data[1000 * DIM..]).unwrap();
+        assert_eq!(copy.sq_codes, ivf.sq_codes[1000 * DIM..]);
+        for (a, b) in ivf.lists.iter().zip(&copy.lists) {
+            let kept: Vec<u32> = a
+                .ids
+                .iter()
+                .filter(|&&i| i >= 1000)
+                .map(|i| i - 1000)
+                .collect();
+            assert_eq!(kept, b.ids);
+        }
+        assert!(
+            IvfPq::new(DIM, Metric::L2, cfg())
+                .unwrap()
+                .empty_clone()
+                .quant
+                .is_none()
+        );
     }
 
     #[test]
