@@ -24,7 +24,10 @@ Format:
   filtered sweep, then the 4-hour Phase 6 soak.
 - **Why:** Phase 6 lives in `engine`, 7.5 in `index/hnsw.rs`, the soak
   harness in `server/src/bin/loadtest.rs`: disjoint, so they ran side by
-  side; timings only after the merge.
+  side; timings only after the merge. Soak result: recall held (−0.2%),
+  p99 did not (+41%); Phase 6 acceptance not met yet (RESULTS.md).
+  (Commit 2b96ab6 also carries these doc drafts, and its message's
+  "hyper closes idle connections" guess was wrong: tested, it doesn't.)
 
 ## 2026-10-29 — Phase 6 review fixes
 - **What:** upserts and queries reject components beyond ±1e15 and zero
@@ -85,6 +88,10 @@ Format:
 - **Why:** Phase 6 acceptance (recall and p99 within 10% over 4 hours).
   Medians, not single windows: a 3-minute smoke run showed one window's
   p99 swinging ±40% with whichever background build overlapped it.
+  Later in the day: a fresh connection per probe; errors name the
+  request and whether it reused an idle connection; each window logs the
+  sealed segment layout (the 4-hour run's p99 rise couldn't be
+  attributed without it).
 
 ## 2026-10-28 — Parallel round 3: server and CRUD, index/storage groundwork
 - **What:** scaffold commit (server dependencies in Cargo.lock), then two
