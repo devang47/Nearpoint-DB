@@ -15,6 +15,15 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-29 — 4-hour re-soak with quantizer reuse: Phase 6 still not met
+- **What:** reran the Phase 6 soak at 3300a7d; results and per-window CSV
+  in RESULTS.md (`docs/results/soak-4h-reuse.csv`).
+- **Why it matters:** recall (−0.5%), memory and correctness hold (0
+  errors, 0 violations, 0 reconnects), but p99 drift is +12.3% on the
+  pre-registered 30-window check (+14.6% first vs last hour). Hourly mean
+  p99 is flat; the median moved when the 300 s maintenance cycle settled
+  into a phase covering 3 of 5 windows. Next fix: less background work.
+
 ## 2026-10-29 — Tried: background builds at utility QoS (reverted)
 - **What:** `storage::sys::set_background_qos` on the build pool and the
   maintenance thread (4cf4a72), measured in a 1 h soak, then reverted.

@@ -158,7 +158,12 @@ p99 tracks background builds (a full IVF-PQ retrain every 300 s under
 uniform deletes: 1.98 vs 1.27 ms p99), and the drift check aliases with
 that cycle. Reusing trained quantizers halved the spike windows (1 h);
 HNSW merges still spike; running builds at utility QoS traded peaks for
-duration (reverted). Next: 4-hour re-soak with quantizer reuse.
+duration (reverted). 4-hour re-soak with quantizer reuse: recall −0.5%,
+0 errors/violations, RSS flat, hourly mean p99 flat, but p99 drift
++12.3% (30-window check; +14.6% first vs last hour): still not met. The
+maintenance cycle (both IVF-PQ segments rewritten every 300 s) keeps ~2
+of 5 minutes elevated. Next: cut rewrite volume (profile a rewrite;
+higher dead threshold or encode-only absorption of small segments).
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).

@@ -388,6 +388,37 @@ segment layout per window. Diagnostic run: 2 h at commit 0b0a75e
   0 ms after the previous reply (now retried once, counted as a
   reconnect; 0 in the fix run).
 
+### 2026-10-29 — 4-hour re-soak with quantizer reuse, commit 3300a7d
+
+Same settings as the first 4-hour run (`--drift-windows 30`, the
+pre-registered check), plus per-window segment logging. Per-window CSV:
+`docs/results/soak-4h-reuse.csv`.
+
+| Hour | p99 median | p99 mean | p99 max | windows > 1.8 ms | p50 | searches/s | recall@10 | RSS median (max) |
+|------|-----------:|---------:|--------:|-----------------:|----:|-----------:|----------:|-----------------:|
+| 1 | 1.36 ms | 1.64 ms | 2.67 ms | 16 / 60 | 0.65 ms | 5,767 | 0.7692 | 463 (922) MiB |
+| 2 | 1.31 ms | 1.56 ms | 2.47 ms | 16 / 61 | 0.62 ms | 5,996 | 0.7669 | 480 (795) MiB |
+| 3 | 1.58 ms | 1.54 ms | 2.26 ms | 12 / 61 | 0.64 ms | 5,640 | 0.7646 | 496 (833) MiB |
+| 4 | 1.56 ms | 1.58 ms | 2.15 ms | 24 / 61 | 0.62 ms | 5,817 | 0.7644 | 483 (766) MiB |
+
+| Drift, first vs last N windows (loadtest's upper median) | recall@10 | p99 |
+|-----------------------------------------------------------|----------:|----:|
+| **N = 30 (pre-registered)** | 0.7691 → 0.7656 (−0.5%) | 1.36 → 1.53 ms (**+12.3%, FAIL**) |
+| N = 60 (first vs last hour) | 0.7694 → 0.7656 (−0.5%) | 1.36 → 1.56 ms (+14.6%, FAIL) |
+
+- 13.2 M inserts and as many deletes; **0 errors, 0 violations, 0
+  reconnects**. RSS flat (~480 MiB), recall drift −0.5%.
+- **p99 misses by both measures.** Medians of consecutive 30-window
+  blocks: 1.36, 1.37, 1.33, 1.27, 1.29, then 1.60, 1.58, 1.49 ms.
+- What changed at ~2.5 h is the alignment, not the work: from then on the
+  layout settles into a strict 300 s cycle (two 100k seals, then both
+  IVF-PQ segments rewritten), and the elevated stretch covers 3 of every
+  5 windows (1.76, 2.09, 1.60, then 1.14, 1.26 ms) instead of ~2. Hourly
+  mean p99 is flat (1.64, 1.56, 1.54, 1.58 ms) and max falls, so this is
+  not degradation; but window medians, which the acceptance uses, move
+  with that phase. Not redefining the check: background maintenance
+  still costs ~2 of every 5 minutes, and the next fix is doing less of it.
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.
