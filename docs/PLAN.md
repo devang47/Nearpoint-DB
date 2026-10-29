@@ -150,7 +150,7 @@ steady-state size (~24%); see RESULTS.md for why both are given.
 **Acceptance:** 4-hour soak test with mixed insert/delete/search; recall
 and p99 latency stay within 10% of the start.
 **Status (2026-10-29): not met (p99).** 4-hour soak, 1M live dim-32
-points, 26.7M inserts and deletes: recall drift −0.2%, 0 violations, RSS
+points, 13.3M inserts + 13.3M deletes: recall drift −0.2%, 0 violations, RSS
 flat (dead rows are compacted away), but p99 rose 1.29 → 1.82 ms (+41%)
 over the first ~2 h, then plateaued; 1 client-side transport error.
 Next: rerun with per-window segment logging to attribute the rise

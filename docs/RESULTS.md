@@ -324,7 +324,8 @@ CSV: `docs/results/soak-4h-1m-dim32.csv`.
 | 2–3 | 0.65 ms | 1.65 ms | 5,600 | 0.7760 | 405 (836) MiB |
 | 3–4 | 0.66 ms | 1.70 ms | 5,500 | 0.7780 | 420 (753) MiB |
 
-- Totals: 26.7 M points inserted and deleted, 1.3 M replaced, 80.6 M
+- Totals: 13.3 M points inserted and 13.3 M deleted (~925/s each),
+  1.3 M replaced, 80.6 M
   searches; **0 violations** (no acknowledged-deleted id returned, live
   count matched the model at all 240 probes); **1 error**: a client-side
   broken pipe at 7,982 s (unattributed; the loadtest now labels errors
@@ -340,7 +341,7 @@ CSV: `docs/results/soak-4h-1m-dim32.csv`.
   pays nprobe 32 + rerank 100) and builds on 4 of 10 cores overlapping
   the windows.
 - **Memory: fixed.** RSS flat to falling (561 → ~410 MiB median) over
-  26.7 M deletes; the Phase 4 run grew ~20 MiB/min with dead rows. Peaks
+  13.3 M deletes; the Phase 4 run grew ~20 MiB/min with dead rows. Peaks
   (≤ 979 MiB) are merges in flight.
 
 ## Quantization quality (tasks 5.1–5.3)
