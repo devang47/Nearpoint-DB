@@ -127,6 +127,54 @@ impl IvfPq {
         }
     }
 
+    /// A copy holding only `rows` (ascending ids), renumbered 0.. in that
+    /// order, with their existing codes: dropping dead rows without
+    /// re-encoding anything (compaction). `None` for 4-bit codes (blocks
+    /// would need repacking), an untrained index, or ids out of range or
+    /// not ascending; use `empty_clone` + `add` then.
+    pub fn retain(&self, rows: &[u32]) -> Option<IvfPq> {
+        if self.cfg.nbits != 8 || self.quant.is_none() {
+            return None;
+        }
+        let mut new_id = vec![u32::MAX; self.len];
+        let mut last = None;
+        for (j, &r) in (0u32..).zip(rows) {
+            if last.is_some_and(|l| r <= l) {
+                return None;
+            }
+            *new_id.get_mut(r as usize)? = j;
+            last = Some(r);
+        }
+        let m = self.cfg.m;
+        let lists = self
+            .lists
+            .iter()
+            .map(|l| {
+                let mut out = List::default();
+                for (&id, code) in l.ids.iter().zip(l.codes.chunks_exact(m)) {
+                    let j = new_id[id as usize];
+                    if j != u32::MAX {
+                        out.ids.push(j);
+                        out.codes.extend_from_slice(code);
+                    }
+                }
+                out
+            })
+            .collect();
+        let d = self.dim;
+        let mut sq_codes = Vec::with_capacity(rows.len() * d);
+        for &r in rows {
+            sq_codes.extend_from_slice(&self.sq_codes[r as usize * d..][..d]);
+        }
+        Some(IvfPq {
+            lists,
+            quant: self.quant.clone(),
+            sq_codes,
+            len: rows.len(),
+            ..*self
+        })
+    }
+
     /// The index blob: config, quantizers, every list and the SQ codes. It
     /// is the whole index: no f32 vectors are needed to load or search it,
     /// so its segment can be written without them. Layout in
@@ -604,6 +652,39 @@ mod tests {
                 .quant
                 .is_none()
         );
+    }
+
+    /// `retain` gives exactly what re-adding the kept rows would.
+    #[test]
+    fn retain_matches_re_adding() {
+        let data = test_data::vectors(3000, DIM, 1);
+        let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
+        ivf.add(&data).unwrap();
+        let rows: Vec<u32> = (0..3000).filter(|r| r % 3 != 0).collect();
+        let kept = ivf.retain(&rows).unwrap();
+        let mut want = ivf.empty_clone();
+        let vecs: Vec<f32> = rows
+            .iter()
+            .flat_map(|&r| data[r as usize * DIM..][..DIM].to_vec())
+            .collect();
+        want.add(&vecs).unwrap();
+        assert_eq!((kept.len, &kept.sq_codes), (want.len, &want.sq_codes));
+        for (a, b) in kept.lists.iter().zip(&want.lists) {
+            assert_eq!((&a.ids, &a.codes), (&b.ids, &b.codes));
+        }
+        assert!(ivf.retain(&[2, 1]).is_none());
+        assert!(ivf.retain(&[3000]).is_none());
+        let four = IvfPq::new(
+            DIM,
+            Metric::L2,
+            Config {
+                nbits: 4,
+                m: 16,
+                ..cfg()
+            },
+        )
+        .unwrap();
+        assert!(four.retain(&[]).is_none());
     }
 
     #[test]

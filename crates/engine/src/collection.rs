@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
+use std::time::Instant;
 
 use index::{Hnsw, Index, IvfPq, Metric, SearchParams, hnsw, ivfpq};
 use rayon::prelude::*;
@@ -797,6 +798,7 @@ impl Collection {
     /// segment's files, then publish it.
     fn finish_seal(&self, m: &mut Maint) -> Result<()> {
         let Some(p) = m.pending else { return Ok(()) };
+        let t = Instant::now();
         let snap = self.snapshot();
         let pos = snap
             .pos(p.key)
@@ -827,6 +829,7 @@ impl Collection {
         m.pending = None;
         drop(w);
         self.wal.remove_before(p.covered + 1)?;
+        tracing::info!(ms = t.elapsed().as_millis(), "seal");
         Ok(())
     }
 
@@ -862,6 +865,48 @@ impl Collection {
             .collect();
         let live = |i: usize| u64::from(snap.segs[i].rows) - snap.segs[i].dead.len();
         let dead_share = |i: usize| snap.segs[i].dead.len() as f64 / f64::from(snap.segs[i].rows);
+        let is_ivf = |i: usize| matches!(read(&snap.segs[i].seg).index, SegIndex::IvfPq(..));
+        // 0. Absorb: fold small sealed HNSW segments into the IVF-PQ segment
+        // with the most dead rows that has room. Its live codes are kept and
+        // only the new rows are encoded, so this costs ~a seal, and it drops
+        // that segment's dead rows on the way. Without it, small segments
+        // merged into an HNSW tier (7-8 s per 330k graph) and then into a
+        // freshly trained IVF-PQ (14-17 s): the soak's p99 windows.
+        let cap = self.merge_cap();
+        if self.ivf_allowed() {
+            let small: Vec<usize> = sealed
+                .iter()
+                .copied()
+                .filter(|&i| !is_ivf(i) && live(i) < u64::from(self.cfg.ivf_rows))
+                .collect();
+            let target = sealed
+                .iter()
+                .copied()
+                .filter(|&i| is_ivf(i) && live(i) < cap)
+                .max_by(|&a, &b| dead_share(a).total_cmp(&dead_share(b)));
+            if let Some(t) = target
+                && !small.is_empty()
+            {
+                let mut kinds = self.cfg.schema.clone();
+                merge_kinds(&mut kinds, &read(&snap.segs[t].seg).payloads);
+                let (mut pick, mut sum) = (vec![t], live(t));
+                for i in small {
+                    if sum + live(i) <= cap
+                        && merge_kinds(&mut kinds, &read(&snap.segs[i].seg).payloads)
+                    {
+                        sum += live(i);
+                        pick.push(i);
+                    }
+                }
+                // Only once it changes >= 1/MERGE_FACTOR of the result (new
+                // plus dropped rows): bounds the rewrite's write amplification
+                // (the f32 section is rewritten whole) for big, wide segments.
+                let changed = sum - live(t) + snap.segs[t].dead.len();
+                if pick.len() > 1 && changed * MERGE_FACTOR >= sum {
+                    return Some(pick);
+                }
+            }
+        }
         // 1. Drop dead rows from the segment that has the most, by share.
         if let Some(&i) = sealed
             .iter()
@@ -882,7 +927,7 @@ impl Collection {
         // 3. Merge MERGE_FACTOR segments of the lowest size tier that has
         // that many, smallest first, up to the cap and only with payload
         // columns of matching types.
-        let mut cap = self.merge_cap();
+        let mut cap = cap;
         if !self.ivf_allowed() {
             cap = cap.min(ivf_rows - 1);
         }
@@ -941,18 +986,35 @@ impl Collection {
         // A poisoned WAL fails the publish anyway: don't build (and leave
         // an orphan file pair behind) on every retry.
         self.wal.sync()?;
+        let t = Instant::now();
         let d = self.cfg.dim;
         let (mut ids, mut vectors, mut src) = (Vec::new(), Vec::new(), Vec::new());
+        // The biggest IVF-PQ input goes first: its live rows keep their
+        // codes (`IvfPq::retain`), so only the other inputs' rows are
+        // encoded, with its quantizers (no retraining).
+        let mut inputs = inputs.to_vec();
+        let big = |i: &usize| {
+            let seg = read(&snap.segs[*i].seg);
+            matches!(seg.index, SegIndex::IvfPq(..)).then_some(seg.ids.len())
+        };
+        if let Some(at) = (0..inputs.len()).max_by_key(|&j| big(&inputs[j]))
+            && big(&inputs[at]).is_some()
+        {
+            inputs.swap(0, at);
+        }
+        let inputs = &inputs[..];
         let segs: Vec<_> = inputs.iter().map(|&i| read(&snap.segs[i].seg)).collect();
-        // The biggest IVF-PQ input's quantizers, to skip retraining.
-        let template = segs
-            .iter()
-            .filter_map(|s| match &s.index {
-                SegIndex::IvfPq(ivf, _) => Some((s.ids.len(), ivf)),
-                SegIndex::Hnsw(_) => None,
-            })
-            .max_by_key(|&(n, _)| n)
-            .map(|(_, ivf)| ivf.empty_clone());
+        let template = match &segs[0].index {
+            SegIndex::IvfPq(ivf, _) => {
+                let v = &snap.segs[inputs[0]];
+                let rows: Vec<u32> = (0..v.rows).filter(|&r| !v.dead.contains(r)).collect();
+                Some(match ivf.retain(&rows) {
+                    Some(kept) => (kept, rows.len()),
+                    None => (ivf.empty_clone(), 0),
+                })
+            }
+            SegIndex::Hnsw(_) => None,
+        };
         let mut kinds = self.cfg.schema.clone();
         for seg in &segs {
             merge_kinds(&mut kinds, &seg.payloads);
@@ -973,6 +1035,7 @@ impl Collection {
             }
         }
         drop(segs);
+        let (rows, copy) = (ids.len(), t.elapsed());
         let file = m.next_file;
         m.next_file += 1;
         let built = if ids.is_empty() {
@@ -981,6 +1044,7 @@ impl Collection {
             Some(self.build(file, ids, vectors, payloads, template)?)
         };
         crash_point(4)?;
+        let built_at = t.elapsed();
 
         let mut w = self.writer()?;
         let cur = self.snapshot();
@@ -1026,6 +1090,14 @@ impl Collection {
             *write(&self.snap) = Arc::new(next);
         }
         drop(w);
+        tracing::info!(
+            inputs = inputs.len(),
+            rows,
+            copy_ms = copy.as_millis(),
+            build_ms = (built_at - copy).as_millis(),
+            publish_ms = (t.elapsed() - built_at).as_millis(),
+            "rewrite"
+        );
         // Readers may still hold the old segments: HNSW ones are in RAM and
         // a mapped IVF-PQ file stays readable after it is unlinked.
         for &i in inputs {
@@ -1047,7 +1119,7 @@ impl Collection {
         ids: Vec<u64>,
         vectors: Vec<f32>,
         payloads: PayloadStore,
-        template: Option<IvfPq>,
+        template: Option<(IvfPq, usize)>,
     ) -> Result<Seg> {
         let (d, n) = (self.cfg.dim, ids.len());
         let pool = build_pool()?;
@@ -1055,22 +1127,34 @@ impl Collection {
             let fresh = ivf_config(d, n, self.cfg.hnsw.seed);
             // Retraining (k-means + PQ) dominates a rebuild; under steady
             // deletes every big segment is rewritten every few minutes, and
-            // the builds were the soak's p99 spikes. Reuse the quantizers
-            // unless the segment outgrew them (nlist < half of a fresh one's).
+            // the builds were the soak's p99 spikes. Reuse the quantizers,
+            // and the first `done` rows' codes, unless the segment outgrew
+            // them (nlist < half of a fresh one's).
             // ponytail: no retrain on distribution drift; retrain every Nth
             // rewrite, or on a recall probe, if real data drifts.
-            let mut index = match template {
-                Some(t) if t.config().nlist * 2 >= fresh.nlist => t,
-                _ => IvfPq::new(d, self.cfg.metric, fresh)?,
+            let (mut index, done) = match template {
+                Some((t, done)) if t.config().nlist * 2 >= fresh.nlist => (t, done),
+                _ => (IvfPq::new(d, self.cfg.metric, fresh)?, 0),
             };
-            match pool.install(|| index.add(&vectors)) {
+            let t = Instant::now();
+            match pool.install(|| index.add(&vectors[done * d..])) {
                 Ok(_) => {
+                    let encoded = t.elapsed();
                     // The f32 vectors go in the file (element type 0), not in RAM.
                     let blob = index.to_bytes();
                     self.write_files(file, &vectors, &ids, &payloads, BlobKind::IvfPq, &blob)?;
                     drop((vectors, blob));
+                    let written = t.elapsed();
                     let path = file_path(&self.dir, file, "seg");
                     let mapped = Segment::open(&path).map_err(|e| Error::Segment(path, e))?;
+                    tracing::info!(
+                        rows = n,
+                        encoded = n - done,
+                        encode_ms = encoded.as_millis(),
+                        write_ms = (written - encoded).as_millis(),
+                        open_ms = (t.elapsed() - written).as_millis(),
+                        "ivf_pq build"
+                    );
                     return Ok(Seg {
                         index: SegIndex::IvfPq(index, mapped),
                         ids,
@@ -1081,10 +1165,12 @@ impl Collection {
                 Err(e) => tracing::warn!("IVF-PQ build failed ({e}); building HNSW instead"),
             }
         }
+        let t = Instant::now();
         let mut index = Hnsw::new(d, self.cfg.metric, self.cfg.hnsw);
         index.reserve(n);
         pool.install(|| index.add(&vectors))?;
         drop(vectors);
+        let encoded = t.elapsed();
         let blob = index.to_bytes();
         self.write_files(
             file,
@@ -1094,6 +1180,12 @@ impl Collection {
             BlobKind::Hnsw,
             &blob,
         )?;
+        tracing::info!(
+            rows = n,
+            graph_ms = encoded.as_millis(),
+            write_ms = (t.elapsed() - encoded).as_millis(),
+            "hnsw build"
+        );
         Ok(Seg {
             index: SegIndex::Hnsw(index),
             ids,
@@ -2299,6 +2391,59 @@ mod tests {
                         "{metric:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A small sealed HNSW segment is folded into the IVF-PQ segment
+    /// (codes kept, only new rows encoded) instead of merging into an HNSW
+    /// tier; dead rows go on the way; reads stay exact across a reopen.
+    #[test]
+    fn small_segments_are_absorbed_into_ivf_pq() {
+        let d = TempDir::new("absorb");
+        let cfg = Config {
+            seal_rows: 512,
+            ..cfg()
+        };
+        let mut c = open_with(&d, cfg.clone());
+        let vecs =
+            |ids: &[u64]| -> Vec<f32> { ids.iter().flat_map(|&i| rand_vec(i, DIM)).collect() };
+        let first: Vec<u64> = (0..1500).collect();
+        c.upsert_batch(&first, &vecs(&first), &[]).unwrap();
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c), [("ivf_pq", 1500, 0), ("mutable", 0, 0)]);
+        // Too little change (40 + 0 < 1540 / 4): left alone.
+        let few: Vec<u64> = (2000..2040).collect();
+        c.upsert_batch(&few, &vecs(&few), &[]).unwrap();
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c).len(), 3);
+        let more: Vec<u64> = (3000..3400).collect();
+        c.upsert_batch(&more, &vecs(&more), &[]).unwrap();
+        for i in (0..1500).step_by(15) {
+            assert!(c.delete(i).unwrap());
+        }
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c), [("ivf_pq", 1840, 0), ("mutable", 0, 0)]);
+        for round in 0..2 {
+            for &i in first.iter().chain(&few).chain(&more) {
+                let want = (i >= 1500 || i % 15 != 0).then(|| rand_vec(i, DIM));
+                assert_eq!(c.get(i).map(|g| g.0), want, "id {i}");
+            }
+            let o = SearchOptions {
+                nprobe: Some(64),
+                rerank: Some(200),
+                ..opts(None)
+            };
+            for i in [1, 2001, 3001, 3399] {
+                let hits = c.search(&rand_vec(i, DIM), 5, &o).unwrap();
+                assert_eq!(hits[0].id, i);
+            }
+            if round == 0 {
+                drop(c);
+                c = open_with(&d, cfg.clone());
             }
         }
     }
