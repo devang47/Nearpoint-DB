@@ -15,6 +15,18 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-30 — Compaction absorbs small segments into IVF-PQ, keeping codes
+- **What:** `IvfPq::retain` (a copy with only the given rows' existing
+  codes, 8-bit); rewrites keep the biggest IVF-PQ input's codes and encode
+  only the rest; new plan step 0 folds 3 small sealed HNSW segments into
+  the IVF-PQ segment with the most dead rows; INFO logs with per-phase
+  timings for seals, rewrites and builds. ADR 0012 addendum, RESULTS.md.
+- **Why:** the logs showed the soak's p99 windows came from HNSW tier
+  merges (7–10 s) and fresh IVF-PQ trainings (14–19 s), not from dropping
+  dead rows. Now ~1.2 s per 5 minutes. Trade-off: recall −1.6% absolute
+  (one big IVF-PQ segment with per-segment nprobe), recorded with a
+  predicted (not measured) 4-hour result.
+
 ## 2026-10-29 — 4-hour re-soak with quantizer reuse: Phase 6 still not met
 - **What:** reran the Phase 6 soak at 3300a7d; results and per-window CSV
   in RESULTS.md (`docs/results/soak-4h-reuse.csv`).

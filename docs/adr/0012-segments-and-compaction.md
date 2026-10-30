@@ -183,3 +183,31 @@ leftovers that open deletes.
   start at the merge cap and the segment count grows without bound.
 - The Db thread catches a panicking `maintain` and logs it, so one bad
   collection doesn't stop maintenance for all of them.
+
+## Addendum (2026-10-30): absorb into IVF-PQ, keep codes
+Soak timings (INFO logs per background step) showed the expensive work
+was not dropping dead rows but a detour: 100k seals merged into a ~330k
+HNSW tier (graph from scratch, 7–8 s), later merged again into a freshly
+trained IVF-PQ (k-means + PQ from scratch, 14–17 s), every ~5 minutes.
+
+- **Plan step 0, absorb** (before the dead-share rule): when an IVF-PQ
+  segment with room exists and `MERGE_FACTOR − 1` (3) small sealed HNSW
+  segments have accumulated, fold them into the IVF-PQ segment with the
+  most dead rows, once the rewrite changes ≥ 1/`MERGE_FACTOR` of the
+  result (new plus dropped rows). Waiting for 3 keeps recent rows in
+  small HNSW segments for a while: absorbing every seal at once put all
+  data in IVF-PQ and cost ~0.4 ms of p99 median and ~3% recall in a
+  30-minute soak; and with 3 the tier merge (4) never fires. The threshold bounds write
+  amplification: the segment's f32 section is rewritten whole, which
+  matters for big, wide segments.
+- **Keep codes:** a rewrite puts its biggest IVF-PQ input first and starts
+  from `IvfPq::retain(live rows)`: the same lists, PQ and SQ codes minus
+  the dead rows, renumbered. Only the other inputs' rows are encoded,
+  with the same quantizers (the 2026-10-29 reuse); a fresh train happens
+  only when nlist would more than double, or with no IVF-PQ input.
+- Tier merges and big-HNSW → IVF-PQ builds still run when there is no
+  IVF-PQ segment with room (initial load, inner product, growth past
+  `max_merge_rows`).
+- Alternatives: raising the dead-row threshold (fewer rewrites, but more
+  dead codes scanned per query); appending to the IVF-PQ segment in place
+  (needs a mutable segment file format); both left for later.

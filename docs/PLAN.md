@@ -162,8 +162,13 @@ duration (reverted). 4-hour re-soak with quantizer reuse: recall −0.5%,
 0 errors/violations, RSS flat, hourly mean p99 flat, but p99 drift
 +12.3% (30-window check; +14.6% first vs last hour): still not met. The
 maintenance cycle (both IVF-PQ segments rewritten every 300 s) keeps ~2
-of 5 minutes elevated. Next: cut rewrite volume (profile a rewrite;
-higher dead threshold or encode-only absorption of small segments).
+of 5 minutes elevated.
+2026-10-30: timed every background step; the expensive part was HNSW
+tier merges (7–10 s) and fresh IVF-PQ trainings (14–19 s). Absorbing
+3 small segments at a time into IVF-PQ while keeping its codes cuts
+background work ~15× (30-minute soak: max p99 2.47 → 1.79 ms, mean
+unchanged, recall −1.6% absolute). Predicted to pass the 4-hour check;
+not run (by decision), so still unticked.
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).

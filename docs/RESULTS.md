@@ -419,6 +419,41 @@ pre-registered check), plus per-window segment logging. Per-window CSV:
   with that phase. Not redefining the check: background maintenance
   still costs ~2 of every 5 minutes, and the next fix is doing less of it.
 
+### 2026-10-30 — absorb into IVF-PQ, keep codes (30-minute soaks)
+
+Timings of every background step (new INFO logs) at 3300a7d: seals
+70–540 ms; dead-row rewrites of IVF-PQ with reused quantizers 1.2–1.6 s;
+but 3–4 × 100k seals merged into a ~330k HNSW (graph from scratch,
+7–10 s) that later became a freshly trained IVF-PQ (14–19 s). Those two
+were the p99 windows. Fix (ADR 0012 addendum 2026-10-30): `IvfPq::retain`
+keeps a segment's live codes; small HNSW segments are absorbed into the
+IVF-PQ segment (only new rows encoded). Same soak settings, 30 minutes
+(`--drift-windows 15`); CSVs `docs/results/soak-absorb{1,3}-30m.csv`.
+
+| Variant | rewrite cost in steady state | p99 median / mean / max | recall@10 median | drift (15 windows) |
+|---------|-----------------------------:|------------------------:|-----------------:|-------------------:|
+| reuse quantizers (3300a7d), 4 h run, hours 2–4 | 7–19 s builds every ~5 min | 1.46 / 1.56 / 2.47 ms | 0.7654 | (+12.3% at 30) |
+| absorb every seal | ~0.5 s per seal (encode ~95k) | 1.72 / 1.77 / 2.52 ms | 0.7475 | p99 +0.6%, PASS |
+| **absorb 3 seals at a time** (steady, t ≥ 9 min) | **~1.2 s per ~5 min** (encode ~260k) | **1.55 / 1.56 / 1.79 ms** | 0.7493 | p99 −10.4%, recall −0.7%, PASS |
+
+- Background CPU per 5-minute cycle drops from ~25 s to ~1.5 s, and the
+  worst steady-state window from 2.47 to 1.79 ms. Mean p99 is unchanged
+  (1.56 ms); the median rises (1.46 → 1.55 ms) because the spikes are
+  gone but the floor is a little higher.
+- **Recall costs ~1.6% absolute** (0.765 → 0.749): steady state is one
+  ~1M-row IVF-PQ segment (nlist 775 kept from its first training) plus
+  0–3 HNSW segments, and `nprobe 32` per segment covers a smaller share
+  of one big segment than of two half-size ones. Recall now cycles with
+  the absorb (0.72 right after, 0.79 with three HNSW segments). Fix
+  candidate: scale nprobe per segment with its nlist.
+- **Prediction for the 4-hour check, not measured:** the cycle is ~5
+  windows long with no multi-second builds, so 30-window medians of p99
+  should sit at ~1.55 ± 0.05 ms at both ends (start a little higher from
+  the warm-up trainings), and recall at ~0.75 ± 0.01: p99 drift within
+  ±5% and recall within ±2%, a pass, at maybe 80% confidence. The run
+  was skipped by decision (Devang, 2026-10-30); Phase 6 stays unticked
+  until a 4-hour run measures it.
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

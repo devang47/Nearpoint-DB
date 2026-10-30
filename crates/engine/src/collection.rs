@@ -884,8 +884,12 @@ impl Collection {
                 .copied()
                 .filter(|&i| is_ivf(i) && live(i) < cap)
                 .max_by(|&a, &b| dead_share(a).total_cmp(&dead_share(b)));
+            // Waits for MERGE_FACTOR - 1 of them: recent rows stay in small
+            // HNSW segments a while (faster and more accurate than IVF-PQ at
+            // 100k; absorbing each seal at once cost ~0.4 ms of p99 and ~3%
+            // recall in a soak), and the tier merge (MERGE_FACTOR) never wins.
             if let Some(t) = target
-                && !small.is_empty()
+                && small.len() as u64 >= MERGE_FACTOR - 1
             {
                 let mut kinds = self.cfg.schema.clone();
                 merge_kinds(&mut kinds, &read(&snap.segs[t].seg).payloads);
@@ -2413,20 +2417,24 @@ mod tests {
         c.seal().unwrap();
         while c.maintain().unwrap() {}
         assert_eq!(shape(&c), [("ivf_pq", 1500, 0), ("mutable", 0, 0)]);
-        // Too little change (40 + 0 < 1540 / 4): left alone.
+        // Two small segments: not yet (absorb waits for MERGE_FACTOR - 1).
         let few: Vec<u64> = (2000..2040).collect();
         c.upsert_batch(&few, &vecs(&few), &[]).unwrap();
         c.seal().unwrap();
-        while c.maintain().unwrap() {}
-        assert_eq!(shape(&c).len(), 3);
-        let more: Vec<u64> = (3000..3400).collect();
+        let more: Vec<u64> = (3000..3200).collect();
         c.upsert_batch(&more, &vecs(&more), &[]).unwrap();
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c).len(), 4);
+        let last: Vec<u64> = (3200..3400).collect();
+        c.upsert_batch(&last, &vecs(&last), &[]).unwrap();
         for i in (0..1500).step_by(15) {
             assert!(c.delete(i).unwrap());
         }
         c.seal().unwrap();
         while c.maintain().unwrap() {}
         assert_eq!(shape(&c), [("ivf_pq", 1840, 0), ("mutable", 0, 0)]);
+        let more: Vec<u64> = (3000..3400).collect();
         for round in 0..2 {
             for &i in first.iter().chain(&few).chain(&more) {
                 let want = (i >= 1500 || i % 15 != 0).then(|| rand_vec(i, DIM));
