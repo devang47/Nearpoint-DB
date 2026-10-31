@@ -737,7 +737,7 @@ impl Collection {
     /// Does one unit of background work and returns whether it did any:
     /// seals the mutable segment once it has `seal_rows` rows, else runs
     /// one build or compaction step (policy in ADR 0012). `Db` calls it
-    /// from its background thread; tests call it directly.
+    /// from the collection's background thread; tests call it directly.
     pub fn maintain(&self) -> Result<bool> {
         let mut m = lock(&self.maint);
         if m.closed {
@@ -761,6 +761,13 @@ impl Collection {
     pub fn close(&self) {
         lock(&self.writer).closed = true;
         lock(&self.maint).closed = true;
+    }
+
+    /// Test hook: holds the `maint` mutex, so a `maintain` call blocks as
+    /// if a long build were in flight, until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold_maint(&self) -> impl Sized + '_ {
+        lock(&self.maint)
     }
 
     fn seal_locked(&self, m: &mut Maint) -> Result<()> {

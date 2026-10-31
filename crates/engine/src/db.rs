@@ -14,9 +14,11 @@
 //! point), then deletes it. A crash at any step leaves either the whole
 //! collection or a dot-directory the next open removes.
 //!
-//! One background thread runs `Collection::maintain` (seal, build,
-//! compaction; ADR 0012) over every collection, one step at a time, and
-//! sleeps when none had work. It stops when the Db is dropped.
+//! Each collection has its own background thread running
+//! `Collection::maintain` (seal, build, compaction; ADR 0012) one step at
+//! a time, sleeping when it had no work, so one collection's long build
+//! never delays another's seal (heavy work runs on the shared build pool).
+//! A collection's thread stops when it is dropped or the Db is.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, TryLockError};
@@ -35,74 +37,107 @@ use crate::collection::{Collection, Config, Error, Result};
 const CONFIG: &str = "CONFIG";
 const CONFIG_MAGIC: [u8; 8] = *b"NPCOLCFG";
 const CONFIG_VERSION: u32 = 1;
-/// How long the background thread sleeps when no collection had work.
+/// How long a background thread sleeps after a step with no work.
 const IDLE: Duration = Duration::from_millis(500);
 
-type Colls = RwLock<BTreeMap<String, Arc<Collection>>>;
+/// Set (and notified) to stop a background thread.
+type Stop = (Mutex<bool>, Condvar);
 
 pub struct Db {
     dir: PathBuf,
     sync: SyncPolicy,
-    colls: Arc<Colls>,
+    colls: RwLock<BTreeMap<String, Entry>>,
     /// Serializes create and drop, so the slow file work stays out of
     /// `colls`, which every request reads.
     admin: Mutex<()>,
-    /// Set to stop the background thread.
-    stop: Arc<(Mutex<bool>, Condvar)>,
-    worker: Option<JoinHandle<()>>,
-    /// Holds the exclusive lock on `<data>/LOCK` while the Db lives.
+    /// Holds the exclusive lock on `<data>/LOCK` while the Db lives
+    /// (declared after `colls`, so it is released after every join).
     _lock: File,
 }
 
 impl Drop for Db {
-    /// Stops the background thread after its step in flight.
+    /// Stops every background thread at once; each is then joined after
+    /// its step in flight as `colls` drops.
     fn drop(&mut self) {
-        *self.stop.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        self.stop.1.notify_all();
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
+        let colls = self.colls.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for e in colls.values() {
+            e.signal();
         }
     }
 }
 
-/// The background thread: one `maintain` step per collection per pass;
-/// errors are logged and retried after the idle wait.
-// ponytail: one thread, so one collection's long build delays the others'
-// seals; a thread per collection (or a queue) if that shows up.
-fn maintain_all(colls: &Colls, stop: &(Mutex<bool>, Condvar)) {
-    loop {
-        let list: Vec<_> = {
-            let colls = colls.read().unwrap_or_else(PoisonError::into_inner);
-            colls
-                .iter()
-                .map(|(n, c)| (n.clone(), Arc::clone(c)))
-                .collect()
+/// A collection and its background thread. The thread holds only its
+/// collection, never `colls` or `admin`, so joining it under either
+/// can't deadlock.
+// ponytail: one OS thread per collection, idle in a condvar wait between
+// steps; fine to hundreds of collections. A few workers pulling from a
+// queue if collections reach the thousands.
+struct Entry {
+    coll: Arc<Collection>,
+    stop: Arc<Stop>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Entry {
+    fn spawn(name: &str, coll: Collection) -> io::Result<Entry> {
+        let coll = Arc::new(coll);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread = {
+            let (n, c, s) = (name.to_owned(), Arc::clone(&coll), Arc::clone(&stop));
+            std::thread::Builder::new()
+                .name(format!("np-maintain-{name}"))
+                .spawn(move || maintain_loop(&n, &c, &s))?
         };
-        let mut busy = false;
-        for (name, c) in list {
-            if *stop.0.lock().unwrap_or_else(PoisonError::into_inner) {
-                return;
-            }
-            // A panic must not end maintenance for every collection.
-            match panic::catch_unwind(AssertUnwindSafe(|| c.maintain())) {
-                Ok(Ok(did)) => busy |= did,
-                Ok(Err(Error::Closed)) => {}
-                Ok(Err(e)) => tracing::error!(collection = %name, "background step failed: {e}"),
-                Err(_) => tracing::error!(collection = %name, "background step panicked"),
-            }
+        Ok(Entry {
+            coll,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn signal(&self) {
+        *self.stop.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.stop.1.notify_all();
+    }
+}
+
+impl Drop for Entry {
+    /// Stops and joins the thread after its step in flight.
+    fn drop(&mut self) {
+        self.signal();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
-        let stopped = stop.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if *stopped {
-            return;
-        }
-        if !busy {
-            let (stopped, _) = stop
+    }
+}
+
+/// A collection's background thread: `maintain` steps until stopped;
+/// errors and panics are logged and retried after the idle wait.
+fn maintain_loop(name: &str, c: &Collection, stop: &Stop) {
+    loop {
+        // A panic must not end this collection's maintenance.
+        let busy = match panic::catch_unwind(AssertUnwindSafe(|| c.maintain())) {
+            Ok(Ok(did)) => did,
+            Ok(Err(Error::Closed)) => false,
+            Ok(Err(e)) => {
+                tracing::error!(collection = %name, "background step failed: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::error!(collection = %name, "background step panicked");
+                false
+            }
+        };
+        let mut stopped = stop.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !busy && !*stopped {
+            stopped = stop
                 .1
                 .wait_timeout(stopped, IDLE)
-                .unwrap_or_else(PoisonError::into_inner);
-            if *stopped {
-                return;
-            }
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        if *stopped {
+            return;
         }
     }
 }
@@ -135,25 +170,16 @@ impl Db {
             } else if check_name(&name).is_ok() {
                 let c = open_collection(&entry.path(), sync)
                     .map_err(|e| Error::Open(name.clone(), Box::new(e)))?;
-                colls.insert(name, Arc::new(c));
+                let e = Entry::spawn(&name, c)?;
+                colls.insert(name, e);
             }
         }
         sync_dir(&dir)?;
-        let colls = Arc::new(RwLock::new(colls));
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
-        let worker = {
-            let (colls, stop) = (Arc::clone(&colls), Arc::clone(&stop));
-            std::thread::Builder::new()
-                .name("nearpoint-maintain".into())
-                .spawn(move || maintain_all(&colls, &stop))?
-        };
         Ok(Db {
             dir,
             sync,
-            colls,
+            colls: RwLock::new(colls),
             admin: Mutex::new(()),
-            stop,
-            worker: Some(worker),
             _lock: lock,
         })
     }
@@ -178,15 +204,16 @@ impl Db {
         fs::rename(&staging, &path)?;
         sync_dir(&self.dir)?;
         let (c, _) = Collection::open(&path, cfg)?;
-        let c = Arc::new(c);
+        let e = Entry::spawn(name, c)?;
+        let c = Arc::clone(&e.coll);
         let mut colls = self.colls.write().unwrap_or_else(PoisonError::into_inner);
-        colls.insert(name.to_owned(), Arc::clone(&c));
+        colls.insert(name.to_owned(), e);
         Ok(c)
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Collection>> {
         let colls = self.colls.read().unwrap_or_else(PoisonError::into_inner);
-        colls.get(name).cloned()
+        colls.get(name).map(|e| Arc::clone(&e.coll))
     }
 
     /// Every collection, by name.
@@ -194,20 +221,23 @@ impl Db {
         let colls = self.colls.read().unwrap_or_else(PoisonError::into_inner);
         colls
             .iter()
-            .map(|(n, c)| (n.clone(), Arc::clone(c)))
+            .map(|(n, e)| (n.clone(), Arc::clone(&e.coll)))
             .collect()
     }
 
     /// Drops collection `name` and deletes its files. Writes and the
-    /// background step still in flight on it finish first; later writes
-    /// fail with `Closed`.
+    /// background step still in flight on it finish first (its thread is
+    /// joined); later writes fail with `Closed`.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let _admin = self.admin.lock().unwrap_or_else(PoisonError::into_inner);
-        let c = {
+        let e = {
             let mut colls = self.colls.write().unwrap_or_else(PoisonError::into_inner);
             colls.remove(name)
         }
         .ok_or_else(|| Error::NotFound(name.to_owned()))?;
+        // Joined outside the `colls` lock, so requests never wait on it.
+        let c = Arc::clone(&e.coll);
+        drop(e);
         c.close();
         let tomb = self.dir.join(format!(".drop-{name}"));
         remove_if_exists(&tomb)?;
@@ -416,5 +446,68 @@ mod tests {
         assert!(!d.0.join("collections/bg").exists());
         assert!(matches!(c.maintain(), Ok(false)));
         drop(db); // joins the thread
+    }
+
+    fn wait_for(what: &str, f: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "never {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Each collection has its own thread: one stuck mid-step (as in a
+    /// long build) doesn't keep another from sealing.
+    #[test]
+    fn blocked_collection_does_not_delay_another() {
+        let d = TempDir::new("indep");
+        let db = Db::open(&d.0, SyncPolicy::Batch).unwrap();
+        let spec = json!({"dim": 2, "metric": "l2", "seal_rows": 10});
+        let a = db.create("a", cfg(spec.clone())).unwrap();
+        let b = db.create("b", cfg(spec)).unwrap();
+        let hold = a.hold_maint();
+        for i in 0..25u64 {
+            a.upsert(i, &[i as f32, 1.0], &Value::Null).unwrap();
+            b.upsert(i, &[i as f32, 1.0], &Value::Null).unwrap();
+        }
+        wait_for("sealed b", || b.segments().len() >= 2);
+        assert_eq!(a.segments().len(), 1);
+        drop(hold);
+        wait_for("sealed a", || a.segments().len() >= 2);
+    }
+
+    /// Dropping a collection, and dropping the Db, wait for a step in
+    /// flight: the files stay and LOCK stays held until it ends.
+    #[test]
+    fn drops_wait_for_a_step_in_flight() {
+        let d = TempDir::new("join");
+        let db = Db::open(&d.0, SyncPolicy::Batch).unwrap();
+        let spec = json!({"dim": 2, "metric": "l2"});
+        let a = db.create("a", cfg(spec.clone())).unwrap();
+        let b = db.create("b", cfg(spec)).unwrap();
+        let (hold_a, hold_b) = (a.hold_maint(), b.hold_maint());
+        // Past the idle wait, both threads are blocked inside `maintain`.
+        std::thread::sleep(IDLE * 3);
+        std::thread::scope(|s| {
+            let t = s.spawn(|| db.drop_collection("a"));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!t.is_finished());
+            assert!(d.0.join("collections/a").exists());
+            assert!(db.get("a").is_none() && db.get("b").is_some());
+            drop(hold_a);
+            t.join().unwrap().unwrap();
+        });
+        assert!(!d.0.join("collections/a").exists());
+
+        let t = std::thread::spawn(move || drop(db));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!t.is_finished());
+        assert!(matches!(
+            Db::open(&d.0, SyncPolicy::Batch),
+            Err(Error::Locked(_))
+        ));
+        drop(hold_b);
+        t.join().unwrap();
+        Db::open(&d.0, SyncPolicy::Batch).unwrap();
     }
 }
