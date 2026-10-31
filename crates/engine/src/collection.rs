@@ -34,11 +34,13 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use index::billion::{BillionParams, Lists, Quantizers};
 use index::{Hnsw, Index, IvfPq, Metric, SearchParams, hnsw, ivfpq};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use storage::billion::Billion;
 use storage::framed;
 use storage::segment::{self, BlobKind, Segment, SegmentData};
 use storage::wal::{Lsn, Record, SyncPolicy, Wal, WalError};
@@ -250,6 +252,8 @@ pub enum Error {
     Locked(PathBuf),
     #[error("collection `{0}`: {1}")]
     Open(String, Box<Error>),
+    #[error("billion: {0}")]
+    Billion(#[from] storage::billion::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -296,7 +300,7 @@ pub struct Match {
 /// One segment as `Collection::segments` reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentInfo {
-    /// `"mutable"`, `"hnsw"` or `"ivf_pq"`.
+    /// `"mutable"`, `"hnsw"`, `"ivf_pq"` or `"billion"`.
     pub index: &'static str,
     pub rows: u32,
     pub dead: u64,
@@ -331,6 +335,41 @@ pub struct Memory {
 enum SegIndex {
     Hnsw(Hnsw),
     IvfPq(IvfPq, Arc<Segment>, OnceLock<bool>),
+    /// Read-only, ids `0..n` (ADR 0014).
+    Billion(Box<BillionSeg>),
+}
+
+/// A billion-mode build attached as a segment (task 9.5, ADR 0014). Its row
+/// r is id r: ids are implicit and never in `live` (1B entries would be
+/// ~20 GB); `Collection::base_row` finds them. Never compacted.
+struct BillionSeg {
+    quant: Quantizers,
+    files: Arc<Billion>,
+    refine: index::billion::Refine,
+}
+
+impl BillionSeg {
+    fn lists(&self) -> Lists<'_> {
+        Lists {
+            offsets: self.files.offsets(),
+            codes: self.files.codes(),
+            ids: self.files.ids(),
+            will_need: None,
+        }
+    }
+}
+
+/// The mapped refinement codes as the index's prefetching byte source.
+struct RefineBytes(Arc<Billion>);
+
+impl ivfpq::Shared for RefineBytes {
+    fn bytes(&self) -> &[u8] {
+        self.0.refine()
+    }
+
+    fn will_need(&self, r: std::ops::Range<usize>) {
+        self.0.will_need_refine(r);
+    }
 }
 
 /// One segment's data. A sealed one never changes; the mutable one only
@@ -343,18 +382,37 @@ struct Seg {
 }
 
 impl Seg {
-    fn index(&self) -> &dyn Index {
+    /// The searchable index (`None` for a billion segment, searched by
+    /// its own path).
+    fn index(&self) -> Option<&dyn Index> {
         match &self.index {
-            SegIndex::Hnsw(h) => h,
-            SegIndex::IvfPq(i, ..) => i,
+            SegIndex::Hnsw(h) => Some(h),
+            SegIndex::IvfPq(i, ..) => Some(i),
+            SegIndex::Billion(_) => None,
         }
     }
 
-    /// Whether its f32 vectors are known good, so a rewrite may copy them.
+    fn rows(&self) -> usize {
+        match &self.index {
+            SegIndex::Billion(b) => b.files.len() as usize,
+            _ => self.ids.len(),
+        }
+    }
+
+    fn id(&self, row: u32) -> u64 {
+        match &self.index {
+            SegIndex::Billion(_) => u64::from(row),
+            _ => self.ids[row as usize],
+        }
+    }
+
+    /// Whether its f32 vectors are known good, so a rewrite may copy them
+    /// (never for a billion segment: it is never rewritten).
     fn vectors_ok(&self) -> bool {
         match &self.index {
             SegIndex::Hnsw(_) => true,
             SegIndex::IvfPq(_, _, ok) => ok.get() == Some(&true),
+            SegIndex::Billion(_) => false,
         }
     }
 
@@ -362,6 +420,13 @@ impl Seg {
     /// code for an IVF-PQ segment written without f32 vectors.
     fn vector(&self, dim: usize, row: u32) -> Option<Cow<'_, [f32]>> {
         let all = match &self.index {
+            SegIndex::Billion(b) => {
+                let (f, l) = (&b.files, b.lists());
+                return b
+                    .quant
+                    .reconstruct(&l, f.refine(), f.list_of(), row)
+                    .map(Cow::Owned);
+            }
             SegIndex::Hnsw(h) => h.vectors(),
             SegIndex::IvfPq(i, file, _) if file.vectors().is_empty() => {
                 return i.decode(row).map(Cow::Owned);
@@ -480,14 +545,23 @@ impl Collection {
                     return Err(Error::Corrupt(format!("id {id} is live in two rows")));
                 }
             }
+            if matches!(seg.index, SegIndex::Billion(_)) && key != 0 {
+                return Err(Error::Corrupt("a billion segment that isn't first".into()));
+            }
             segs.push(View {
                 key,
                 file,
-                rows: seg.ids.len() as u32,
+                rows: seg.rows() as u32,
                 seg: Arc::new(RwLock::new(seg)),
                 dead: Arc::new(dead),
             });
         }
+        // A billion segment's live rows must not be live elsewhere too.
+        let base = Snapshot { segs };
+        if let Some(&id) = live.keys().find(|&&id| base_row(&base, id).is_some()) {
+            return Err(Error::Corrupt(format!("id {id} is live in two rows")));
+        }
+        let mut segs = base.segs;
         let key = segs.len() as u32;
         segs.push(new_mutable(&cfg, key));
 
@@ -635,10 +709,13 @@ impl Collection {
         let _w = self.writer()?;
         let doomed: Vec<u64> = {
             let live = read(&self.live);
+            let snap = self.snapshot();
             let mut seen = HashSet::new();
             ids.iter()
                 .copied()
-                .filter(|id| live.contains_key(id) && seen.insert(*id))
+                .filter(|id| {
+                    (live.contains_key(id) || base_row(&snap, *id).is_some()) && seen.insert(*id)
+                })
                 .collect()
         };
         if doomed.is_empty() {
@@ -654,8 +731,8 @@ impl Collection {
     /// `id`. A payload with no fields reads back as null.
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Value)> {
         let live = read(&self.live);
-        let &(key, row) = live.get(&id)?;
         let snap = self.snapshot();
+        let (key, row) = live.get(&id).copied().or_else(|| base_row(&snap, id))?;
         let seg = read(&snap.segs[snap.pos(key)?].seg);
         Some((
             seg.vector(self.cfg.dim, row)?.into_owned(),
@@ -665,7 +742,14 @@ impl Collection {
 
     /// Live ids.
     pub fn len(&self) -> usize {
-        read(&self.live).len()
+        let live = read(&self.live);
+        let snap = self.snapshot();
+        let base = snap
+            .segs
+            .first()
+            .filter(|v| is_billion(v))
+            .map_or(0, |v| u64::from(v.rows) - v.dead.len());
+        live.len() + base as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -687,6 +771,7 @@ impl Collection {
                     match read(&v.seg).index {
                         SegIndex::Hnsw(_) => "hnsw",
                         SegIndex::IvfPq(..) => "ivf_pq",
+                        SegIndex::Billion(_) => "billion",
                     }
                 },
                 rows: v.rows,
@@ -721,6 +806,15 @@ impl Collection {
                         + 8 * file.ids().len()
                         + file.index_blob().len()) as u64;
                 }
+                SegIndex::Billion(b) => {
+                    let f = &b.files;
+                    mem.index += b.quant.heap_bytes() as u64;
+                    mem.mapped += (8 * f.offsets().len()
+                        + f.codes().len()
+                        + 4 * f.ids().len()
+                        + 2 * f.list_of().len()
+                        + f.refine().len()) as u64;
+                }
             }
         }
         mem
@@ -738,6 +832,9 @@ impl Collection {
                 return Ok(Vec::new());
             }
             let seg = read(&view.seg);
+            if let SegIndex::Billion(b) = &seg.index {
+                return self.search_billion(b, &seg, view, s, query, k, opts);
+            }
             let allowed = match opts.filter {
                 Some(f) => Some(evaluate(f, &seg.payloads, n)? - &*view.dead),
                 None if !view.dead.is_empty() || seg.ids.len() > n as usize => {
@@ -758,15 +855,15 @@ impl Collection {
                     SegIndex::IvfPq(i, ..) => {
                         segment_nprobe(nprobe, i.config().nlist, self.cfg.ivf_rows)
                     }
-                    SegIndex::Hnsw(_) => nprobe,
+                    SegIndex::Hnsw(_) | SegIndex::Billion(_) => nprobe,
                 },
                 rerank: opts.rerank.unwrap_or(DEFAULT_RERANK),
                 filter: allowed.as_ref(),
             };
             // The re-check guards against an index that ignores the filter:
             // it may then return fewer than k, but never a dead row.
-            Ok(seg
-                .index()
+            let index = seg.index().ok_or(Error::Invalid("segment has no index"))?;
+            Ok(index
                 .search(query, k, &params)?
                 .into_iter()
                 .filter(|h| allowed.as_ref().is_none_or(|a| a.contains(h.id)))
@@ -797,7 +894,7 @@ impl Collection {
             .map(|(dist, s, row)| {
                 let seg = read(&snap.segs[s].seg);
                 Match {
-                    id: seg.ids[row as usize],
+                    id: seg.id(row),
                     dist,
                     payload: opts.with_payload.then(|| payload(&seg, row)),
                     vector: opts
@@ -807,6 +904,92 @@ impl Collection {
                 }
             })
             .collect())
+    }
+
+    /// Searches a billion segment (k nearest, its own nprobe / rerank from
+    /// `opts`), leaving out tombstoned rows and rows outside the filter
+    /// (billion rows have no payloads, so most filters match none).
+    #[allow(clippy::too_many_arguments)]
+    fn search_billion(
+        &self,
+        b: &BillionSeg,
+        seg: &Seg,
+        view: &View,
+        s: usize,
+        query: &[f32],
+        k: usize,
+        opts: &SearchOptions,
+    ) -> Result<Vec<(f32, usize, u32)>> {
+        // ponytail: a filter is evaluated over all rows, so `not` builds a
+        // bitmap of ~1B bits per query; give billion rows payloads (or
+        // test the filter per candidate) if such filters are needed.
+        let allowed = match opts.filter {
+            Some(f) => Some(evaluate(f, &seg.payloads, view.rows)?),
+            None => None,
+        };
+        if allowed.as_ref().is_some_and(RoaringBitmap::is_empty) {
+            return Ok(Vec::new());
+        }
+        let dead = &*view.dead;
+        let skip = |id: u32| dead.contains(id) || allowed.as_ref().is_some_and(|a| !a.contains(id));
+        let hint = |c, i| b.files.will_need_list(c, i);
+        let lists = Lists {
+            will_need: Some(&hint),
+            ..b.lists()
+        };
+        let p = BillionParams {
+            nprobe: opts.nprobe.unwrap_or(DEFAULT_NPROBE),
+            rerank: opts.rerank.unwrap_or(DEFAULT_RERANK),
+            skip: Some(&skip),
+        };
+        Ok(b.quant
+            .search(&lists, &b.refine, query, k, &p)?
+            .into_iter()
+            .map(|h| (h.dist, s, h.id))
+            .collect())
+    }
+
+    /// Attaches a finished billion-mode build directory (ADR 0014) as a
+    /// read-only segment holding ids `0..n`: checks it, moves it into the
+    /// collection (`<file>.billion`; same file system), publishes it. Only
+    /// into an empty L2 collection of the same dim. Later upserts and
+    /// deletes of those ids tombstone its rows like any others.
+    pub fn attach_billion(&self, src: &Path) -> Result<()> {
+        let mut m = lock(&self.maint);
+        if m.closed {
+            return Err(Error::Closed);
+        }
+        let mut w = self.writer()?;
+        let snap = self.snapshot();
+        if snap.segs.len() != 1 || snap.segs[0].rows != 0 || !read(&self.live).is_empty() {
+            return Err(Error::Invalid("attach needs an empty collection"));
+        }
+        if self.cfg.metric != Metric::L2 {
+            return Err(Error::Invalid("billion mode is L2 only"));
+        }
+        let file = m.next_file;
+        let dst = file_path(&self.dir, file, "billion");
+        open_billion(src, &self.cfg)?; // all checks before moving it
+        fs::rename(src, &dst)?;
+        m.next_file += 1;
+        File::open(&self.dir)?.sync_all()?;
+        let seg = load_segment(&self.dir, &self.cfg, file, &RoaringBitmap::new())?;
+        let mut next = (*snap).clone();
+        next.segs.insert(
+            0,
+            View {
+                key: self.new_key(),
+                file,
+                rows: seg.rows() as u32,
+                seg: Arc::new(RwLock::new(seg)),
+                dead: Arc::default(),
+            },
+        );
+        let covered = w.covered;
+        self.publish(&mut w, covered, &next, 6)?;
+        *write(&self.snap) = Arc::new(next);
+        tracing::info!(dir = %dst.display(), "attached billion segment");
+        Ok(())
     }
 
     /// Seals everything written so far: freezes the mutable segment, writes
@@ -1164,10 +1347,14 @@ impl Collection {
                 .iter()
                 .filter_map(|v| match &read(&v.seg).index {
                     SegIndex::IvfPq(ivf, ..) => Some((v.rows, ivf.empty_clone())),
-                    SegIndex::Hnsw(_) => None,
+                    SegIndex::Hnsw(_) | SegIndex::Billion(_) => None,
                 })
                 .max_by_key(|(rows, _)| *rows)
                 .map(|(_, ivf)| (ivf, 0)),
+            // Never planned as an input (`vectors_ok` is false).
+            SegIndex::Billion(_) => {
+                return Err(Error::Invalid("billion segments aren't rewritten"));
+            }
         };
         // Without exact_vectors the kept rows' f32 would only be decoded
         // codes that nothing reads (they aren't re-encoded or written): up
@@ -1470,7 +1657,7 @@ impl Collection {
         let key = next.segs[m].key;
         let mut live = write(&self.live);
         for (row, &id) in (start..).zip(ids) {
-            if let Some((k, r)) = live.insert(id, (key, row)) {
+            if let Some((k, r)) = live.insert(id, (key, row)).or_else(|| base_row(&next, id)) {
                 kill(&mut next, k, r);
             }
         }
@@ -1483,7 +1670,7 @@ impl Collection {
         let mut next = (*self.snapshot()).clone();
         let mut live = write(&self.live);
         for id in ids {
-            if let Some((k, r)) = live.remove(id) {
+            if let Some((k, r)) = live.remove(id).or_else(|| base_row(&next, *id)) {
                 kill(&mut next, k, r);
             }
         }
@@ -1515,6 +1702,44 @@ impl Collection {
         framed::write(&path, PAYLOADS_MAGIC, PAYLOADS_VERSION, &body)
             .map_err(|e| Error::File(path, e))
     }
+}
+
+fn is_billion(v: &View) -> bool {
+    matches!(read(&v.seg).index, SegIndex::Billion(_))
+}
+
+/// Where `id` is live in the billion segment (always first, if any): row
+/// `id`, unless tombstoned. Ids in `live` are checked first by callers.
+fn base_row(snap: &Snapshot, id: u64) -> Option<(u32, u32)> {
+    let v = snap.segs.first()?;
+    let row = u32::try_from(id).ok()?;
+    (row < v.rows && is_billion(v) && !v.dead.contains(row)).then_some((v.key, row))
+}
+
+/// Opens a billion build directory and checks it against `cfg`.
+fn open_billion(dir: &Path, cfg: &Config) -> Result<BillionSeg> {
+    let path = dir.join("quant");
+    let q = framed::read(
+        &path,
+        storage::billion::QUANT_MAGIC,
+        storage::billion::QUANT_VERSION,
+    )
+    .map_err(|e| Error::File(path, e))?;
+    let quant = Quantizers::from_bytes(&q)?;
+    let files = Arc::new(Billion::open(dir)?);
+    if quant.dim() != cfg.dim || quant.nlist() != files.nlist() || quant.m() != files.m() {
+        return Err(Error::Invalid(
+            "billion build doesn't match the collection's dim",
+        ));
+    }
+    if files.len() > u64::from(u32::MAX) {
+        return Err(Error::Invalid("billion build has more than 2^32 - 1 rows"));
+    }
+    Ok(BillionSeg {
+        quant,
+        refine: Arc::new(RefineBytes(Arc::clone(&files))),
+        files,
+    })
 }
 
 /// Tombstones row `r` of the segment with key `k` in `next`.
@@ -1630,6 +1855,18 @@ fn new_mutable(cfg: &Config, key: u32) -> View {
 }
 
 fn load_segment(dir: &Path, cfg: &Config, file: u64, dead: &RoaringBitmap) -> Result<Seg> {
+    let bdir = file_path(dir, file, "billion");
+    if bdir.is_dir() {
+        let b = open_billion(&bdir, cfg)?;
+        if dead.max().is_some_and(|r| u64::from(r) >= b.files.len()) {
+            return Err(corrupt(&bdir, "manifest tombstones a row past the end"));
+        }
+        return Ok(Seg {
+            index: SegIndex::Billion(Box::new(b)),
+            ids: Vec::new(),
+            payloads: PayloadStore::with_schema(&cfg.schema),
+        });
+    }
     let path = file_path(dir, file, "seg");
     let s = Segment::open(&path).map_err(|e| Error::Segment(path.clone(), e))?;
     if s.dim() != cfg.dim || s.metric() != cfg.metric.code() {
@@ -1662,7 +1899,7 @@ fn load_segment(dir: &Path, cfg: &Config, file: u64, dead: &RoaringBitmap) -> Re
         ids,
         payloads: PayloadStore::new(),
     };
-    if seg.index().len() != seg.ids.len() {
+    if seg.index().map(Index::len) != Some(seg.ids.len()) {
         return Err(corrupt(&path, "index and ids differ in length"));
     }
     if dead.max().is_some_and(|r| r as usize >= seg.ids.len()) {
@@ -2680,7 +2917,7 @@ mod tests {
         let c = open_with(&d, cfg());
         let nlist = |c: &Collection, at: usize| match &read(&c.snapshot().segs[at].seg).index {
             SegIndex::IvfPq(i, ..) => i.config().nlist,
-            SegIndex::Hnsw(_) => 0,
+            SegIndex::Hnsw(_) | SegIndex::Billion(_) => 0,
         };
         for (lo, hi) in [(0u64, 1500u64), (1500, 2600)] {
             let ids: Vec<u64> = (lo..hi).collect();
@@ -2702,6 +2939,104 @@ mod tests {
         for i in [3, 1777, 2599] {
             assert_eq!(c.search(&rand_vec(i, DIM), 5, &o).unwrap()[0].id, i);
         }
+    }
+
+    /// Writes a finished billion build of `rand_vec(0..n)` into `dir`.
+    fn billion_build(dir: &Path, n: u64) {
+        fs::create_dir_all(dir).unwrap();
+        let vecs: Vec<f32> = (0..n).flat_map(|i| rand_vec(i, DIM)).collect();
+        let cfg = index::billion::TrainConfig {
+            nlist: 16,
+            k1: 4,
+            m: 4,
+            seed: 1,
+        };
+        let q = Quantizers::train(&vecs, DIM, cfg).unwrap();
+        let (magic, v) = (
+            storage::billion::QUANT_MAGIC,
+            storage::billion::QUANT_VERSION,
+        );
+        framed::write(&dir.join("quant"), magic, v, &q.to_bytes()).unwrap();
+        let (mut w, _) = storage::billion::StreamWriter::open(dir, 4).unwrap();
+        let (mut l, mut c, mut r) = (Vec::new(), Vec::new(), Vec::new());
+        q.encode(&vecs, &mut l, &mut c, &mut r).unwrap();
+        w.append(&l, &c, &r).unwrap();
+        w.finish().unwrap();
+        storage::billion::sort(dir, 16, 1 << 20).unwrap();
+        fs::remove_file(dir.join("stream")).unwrap();
+    }
+
+    /// 9.5: a billion build attached as a read-only segment: search, get,
+    /// filters, deletes and replacements tombstone its rows, it is never
+    /// compacted, and everything survives a reopen.
+    #[test]
+    fn billion_segment() {
+        let (b, d) = (TempDir::new("billion-build"), TempDir::new("billion"));
+        billion_build(&b.0, 3000);
+        let cfg = Config {
+            seal_rows: 512,
+            ..cfg()
+        };
+        let o = SearchOptions {
+            nprobe: Some(16),
+            rerank: Some(100),
+            with_vector: true,
+            ..opts(None)
+        };
+        let near = |c: &Collection, v: &[f32]| c.search(v, 3, &o).unwrap();
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.05);
+        let replaced = rand_vec(9999, DIM);
+        let check = |c: &Collection| {
+            assert_eq!(c.len(), 3000 - 1000 + 1); // 1000 deleted, id 5000 added
+            for i in [2u64, 702, 2999] {
+                let hits = near(c, &rand_vec(i, DIM));
+                assert_eq!(hits[0].id, i);
+                assert!(close(hits[0].vector.as_deref().unwrap(), &rand_vec(i, DIM)));
+                assert!(close(&c.get(i).unwrap().0, &rand_vec(i, DIM)));
+            }
+            assert!(c.get(10).is_none() && c.get(3000).is_none());
+            assert!(near(c, &rand_vec(10, DIM)).iter().all(|m| m.id != 10));
+            // Id 20 was replaced: its new vector, and the old row is gone.
+            assert_eq!(c.get(20).unwrap().0, replaced);
+            assert!(near(c, &rand_vec(20, DIM)).iter().all(|m| m.id != 20));
+            assert_eq!(near(c, &replaced)[0].id, 20);
+            // Billion rows have no payloads: a filter only finds new rows.
+            let f: Filter = serde_json::from_value(json!({"eq": {"tag": "x"}})).unwrap();
+            let hits = c.search(&rand_vec(5000, DIM), 3, &opts(Some(&f))).unwrap();
+            assert_eq!(hits.iter().map(|m| m.id).collect::<Vec<_>>(), [5000]);
+        };
+
+        let other = TempDir::new("billion-busy");
+        let busy = open_with(&other, cfg.clone());
+        busy.upsert(1, &rand_vec(1, DIM), &json!(null)).unwrap();
+        assert!(matches!(busy.attach_billion(&b.0), Err(Error::Invalid(_))));
+        drop(busy);
+        let c = open_with(&d, cfg.clone());
+        c.attach_billion(&b.0).unwrap();
+        assert!(!b.0.exists(), "the build directory was moved in");
+        assert_eq!(shape(&c), [("billion", 3000, 0), ("mutable", 0, 0)]);
+        assert_eq!(c.len(), 3000);
+        // Id 10 and 999 odd ids (11..=2007); 20 stays for the replace.
+        let ids: Vec<u64> = std::iter::once(10)
+            .chain((11..3000).step_by(2))
+            .take(1000)
+            .collect();
+        assert!(ids.contains(&10) && !ids.contains(&20));
+        assert_eq!(c.delete_batch(&ids).unwrap(), 1000);
+        assert!(!c.delete(10).unwrap());
+        c.upsert(20, &replaced, &json!(null)).unwrap();
+        c.upsert(5000, &rand_vec(5000, DIM), &json!({"tag": "x"}))
+            .unwrap();
+        check(&c);
+        // A third of it dead, yet compaction leaves it alone.
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c)[0], ("billion", 3000, 1001));
+        check(&c);
+        drop(c);
+        let c = open_with(&d, cfg);
+        assert_eq!(shape(&c)[0], ("billion", 3000, 1001));
+        check(&c);
     }
 
     /// With quantizers to borrow, a tier merge of small segments below

@@ -15,8 +15,8 @@ CRC32 is `crc32fast` (IEEE).
 | `refine` | end of `billion build` | kept |
 | `lists` | `billion sort` | kept |
 
-Peak at 1B × m = 16: `stream` 18 GB + `refine` 16 GB + `lists` 20 GB
-= 54 GB during the sort; 36 GB after.
+Peak at 1B × m = 16: `stream` 18 GB + `refine` 16 GB + `lists` 22 GB
+= 56 GB during the sort; 38 GB after.
 
 ## `quant` (framed, magic `NPBQUANT`, version 1)
 
@@ -75,11 +75,14 @@ codes u32, CRC32 of footer bytes 0..28 u32.
 | codes | 8 · (nlist + 1) | n · m, list by list |
 | zero padding | | to a multiple of 4 |
 | ids | | 4 · n: u32 id of each row, list by list (ascending within a list) |
+| lists by id | | 2 · n: u16 list of each id, in id order (for `get`) |
 | footer | file_len − 48 | 48 |
 
-Footer: magic `NPBLISTS` (8), version u32, nlist u32, m u32, reserved u32
-(0), n u64, CRC32 of offsets, of codes, of ids (u32 each), CRC32 of footer
-bytes 0..44 u32.
+Footer: magic `NPBLISTS` (8), version u32, nlist u32, m u32, CRC32 of
+lists-by-id u32, n u64, CRC32 of offsets, of codes, of ids (u32 each),
+CRC32 of footer bytes 0..44 u32. Lists by id is written by the sort's
+counting pass; ids ascend within a list, so an id's row is a binary search
+in its list.
 
 ## Validation
 
@@ -87,7 +90,7 @@ bytes 0..44 u32.
 version before anything else, footer CRC), that m and n agree, that each
 file's length is exactly what the footer implies, and the offsets
 section's CRC and that it ascends from 0 to n (offsets are read on every
-probe). The codes, ids and refine sections (tens of GB) are checked by
+probe). The codes, ids, lists-by-id and refine sections (tens of GB) are checked by
 `Billion::verify` (`billion sort --verify`), not on open. Tests: round
 trip through a resumed stream and a multi-pass sort; every byte of both
 files flipped is caught by open or verify; truncation fails open; a

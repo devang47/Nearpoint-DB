@@ -75,7 +75,7 @@ except the counter:
 | `nearpoint_memory_bytes` | `collection`, `component` | estimated RAM: `id_map` (id → row), `ids` (sealed row → id), `index` (HNSW graphs and vectors, IVF-PQ lists and quantizers), `payloads` (sealed payload columns), `mutable` (in-memory segment and its WAL copy, from its row count) |
 | `nearpoint_mapped_bytes` | `collection` | sealed segment file bytes mapped (page cache, not phys_footprint) |
 | `nearpoint_points` | `collection` | live points |
-| `nearpoint_segments` | `collection`, `index` | segments per index type (`mutable`, `hnsw`, `ivf_pq`) |
+| `nearpoint_segments` | `collection`, `index` | segments per index type (`mutable`, `hnsw`, `ivf_pq`, `billion`) |
 | `nearpoint_phys_footprint_bytes` | | process phys_footprint now (what `--memory-limit-mib` and the 10 GB budget use) |
 | `nearpoint_phys_footprint_peak_bytes` | | its high-water mark |
 | `nearpoint_rss_peak_bytes` | | peak resident set (includes mapped segment pages the OS can drop) |
@@ -242,6 +242,27 @@ their own at `seal_rows`; this forces one (tests, before a backup).
 Writes go on while the files are written; searches never wait. It waits
 for a background build or compaction step in flight.
 `200 {"sealed": true}`.
+
+### `POST /collections/{name}/attach_billion`
+
+```json
+{"dir": "/Users/me/data/Nearpoint/billion/b1b"}
+```
+
+Attaches a finished billion-mode build (`billion train` / `build` /
+`sort`, ADR 0014) as a read-only segment holding ids `0..n`. The
+directory is checked (footers, dim, sizes), then **moved** into the
+collection (same file system), so it is gone from `dir` afterwards. Only
+into an empty `l2` collection of the build's dim; `400` otherwise.
+
+After that the billion rows behave like any others for search (with the
+request's `nprobe` and `rerank` as given: start with 64 and 100), `get`
+(the vector reconstructed from its codes) and deletes; an upsert of an id
+below `n` replaces that row. They have no payloads, so a payload filter
+matches none of them. The segment is never compacted. `200` with the
+collection description (`"index": "billion"` in `segments`). A crash
+between the move and the publish leaves `<file>.billion` in the
+collection directory, unreferenced: move it back out to retry.
 
 ## Examples
 

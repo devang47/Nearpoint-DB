@@ -221,6 +221,15 @@ impl Quantizers {
         check_dim(self.dim, query.len())?;
         let (d, m) = (self.dim, self.m());
         let probes = self.nearest(query, params.nprobe.max(1), params.nprobe * 2 + 32)?;
+        // Mapped lists: request every probed list first, so the reads
+        // overlap instead of faulting in one list at a time.
+        if let Some(hint) = lists.will_need {
+            for cell in &probes {
+                let l = cell.id as usize;
+                let (a, b) = (lists.offsets[l] as usize, lists.offsets[l + 1] as usize);
+                hint(a * m..b * m, a..b);
+            }
+        }
         let short = k.max(params.rerank);
         // One worker per probed list; each keeps its own top `short`.
         let per: Vec<Vec<Cand>> = probes
@@ -243,14 +252,11 @@ impl Quantizers {
                         {
                             continue;
                         }
-                        best.push(Cand(
-                            Hit {
-                                id: lists.ids[row],
-                                dist,
-                            },
-                            cell.id,
-                            row,
-                        ));
+                        let id = lists.ids[row];
+                        if params.skip.is_some_and(|s| s(id)) {
+                            continue;
+                        }
+                        best.push(Cand(Hit { id, dist }, cell.id, row));
                         if best.len() > short {
                             best.pop();
                         }
@@ -296,6 +302,46 @@ impl Quantizers {
         out.sort_unstable();
         out.truncate(k);
         Ok(out)
+    }
+
+    /// Id `id`'s vector as stored, `c + pq + refine` (`None` past the end):
+    /// its list from `list_of`, its row by binary search (ids ascend
+    /// within a list).
+    pub fn reconstruct(
+        &self,
+        lists: &Lists<'_>,
+        refine: &[u8],
+        list_of: &[u16],
+        id: u32,
+    ) -> Option<Vec<f32>> {
+        let m = self.m();
+        let l = usize::from(*list_of.get(id as usize)?);
+        let (a, b) = (
+            *lists.offsets.get(l)? as usize,
+            *lists.offsets.get(l + 1)? as usize,
+        );
+        let row = a + lists.ids.get(a..b)?.binary_search(&id).ok()?;
+        let pc = lists.codes.get(row * m..(row + 1) * m)?;
+        let rc = refine.get(id as usize * m..(id as usize + 1) * m)?;
+        let mut x = self.coarse.get(l).to_vec();
+        for ((v, p), r) in x
+            .iter_mut()
+            .zip(self.pq.decode(pc))
+            .zip(self.refine.decode(rc))
+        {
+            *v += p + r;
+        }
+        Some(x)
+    }
+
+    /// Bytes held in RAM: centroids, codebooks and the centroid graph.
+    pub fn heap_bytes(&self) -> usize {
+        let books: usize = [&self.pq, &self.refine]
+            .iter()
+            .flat_map(|p| p.codebooks())
+            .map(|b| 4 * b.as_slice().len())
+            .sum();
+        4 * self.coarse.as_slice().len() + books + self.graph.heap_bytes()
     }
 
     /// Config, centroids, both codebooks and the HNSW graph (so a resumed
@@ -364,11 +410,16 @@ impl Quantizers {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BillionParams {
+#[derive(Clone, Copy)]
+pub struct BillionParams<'a> {
     pub nprobe: usize,
     pub rerank: usize,
+    /// Ids to leave out (tombstoned, or outside a filter); tested only for
+    /// rows whose ADC distance would enter the candidate list.
+    pub skip: Option<&'a Skip<'a>>,
 }
+
+pub type Skip<'a> = dyn Fn(u32) -> bool + Sync + 'a;
 
 /// The sorted list layout, borrowed from a mapped file.
 pub struct Lists<'a> {
@@ -378,7 +429,13 @@ pub struct Lists<'a> {
     pub codes: &'a [u8],
     /// The id of each row, list by list.
     pub ids: &'a [u32],
+    /// Prefetch hint for a list's code bytes and id rows, called for every
+    /// probed list before the scan (`None`: in RAM).
+    pub will_need: Option<&'a WillNeed<'a>>,
 }
+
+/// A prefetch hint: code byte range, id row range.
+pub type WillNeed<'a> = dyn Fn(std::ops::Range<usize>, std::ops::Range<usize>) + Sync + 'a;
 
 /// A scan candidate: hit (ADC distance), its list, its row in the layout.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -440,17 +497,27 @@ mod tests {
         assert_eq!((q.nlist(), q.m(), q.dim()), (64, 8, D));
         let (l, c, r) = encode(&q, &data);
         let (off, codes, ids) = sort(q.nlist(), q.m(), &l, &c);
+        let seen = std::sync::Mutex::new(0usize);
+        let hint = |c: std::ops::Range<usize>, i: std::ops::Range<usize>| {
+            assert_eq!(c.len(), i.len() * 8);
+            *seen.lock().unwrap() += 1;
+        };
         let lists = Lists {
             offsets: &off,
             codes: &codes,
             ids: &ids,
+            will_need: Some(&hint),
         };
         let refine: Refine = Arc::new(r.clone());
         let mut flat = Flat::new(D, Metric::L2);
         flat.add(&data).unwrap();
         let queries = test_data::vectors(50, D, 2);
         let recall = |nprobe, rerank| {
-            let p = BillionParams { nprobe, rerank };
+            let p = BillionParams {
+                nprobe,
+                rerank,
+                skip: None,
+            };
             let mut hits = 0;
             for v in queries.as_chunks::<D>().0 {
                 let truth = flat.search(v, 10, &SearchParams::default()).unwrap();
@@ -469,6 +536,24 @@ mod tests {
             "{pq_only} -> {refined}"
         );
         assert!(few < refined, "nprobe 2: {few}, 64: {refined}");
+        assert_eq!(*seen.lock().unwrap(), 50 * (64 + 64 + 2)); // every probe hinted
+
+        // Skipped ids never come back; reconstruct is what re-ranking scores.
+        let odd = |id: u32| id % 2 == 1;
+        let p = BillionParams {
+            nprobe: 64,
+            rerank: 200,
+            skip: Some(&odd),
+        };
+        let v = &queries[..D];
+        let got = q.search(&lists, &refine, v, 10, &p).unwrap();
+        assert!(got.len() == 10 && got.iter().all(|h| h.id % 2 == 0));
+        let list_of = &l;
+        for h in &got {
+            let x = q.reconstruct(&lists, &r, list_of, h.id).unwrap();
+            assert!((kernels::l2_sq(v, &x) - h.dist).abs() <= 1e-4 * h.dist.max(1.0));
+        }
+        assert!(q.reconstruct(&lists, &r, list_of, 20_000).is_none());
 
         let back = Quantizers::from_bytes(&q.to_bytes()).unwrap();
         assert_eq!(back.to_bytes(), q.to_bytes());

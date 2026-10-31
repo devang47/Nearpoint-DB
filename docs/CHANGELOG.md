@@ -15,6 +15,19 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — 9.5: billion build as an engine segment
+- **What:** `SegIndex::Billion` (quantizers + mapped files);
+  `Collection::attach_billion` and `POST /collections/{name}/attach_billion`;
+  implicit ids `0..n` resolved by `base_row` in get / delete / upsert /
+  len / open; search with tombstones and filter as a skip predicate and
+  prefetch hints for probed lists; `get` reconstructs from codes. `lists`
+  gains an id → list section (for `get`); `bigload --filtered 0`.
+- **Why:** the billion index is part of the database, not a side tool:
+  one API, and deletes / replacements work on its rows without ~28 GB of
+  per-row RAM. BIGANN 10M attached through the API: recall@10 0.727
+  (nprobe 64, rerank 100) as standalone, p50 0.63 ms, phys_footprint 139
+  MiB, 0 violations after 100k deletes.
+
 ## 2026-11-01 — Phase 9: billion-mode train / stream build / sort (9.1–9.3)
 - **What:** `index::billion` (two-level k-means coarse quantizer with an
   HNSW over the centroids, PQ + refinement PQ, parallel encode, search

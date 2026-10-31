@@ -300,6 +300,9 @@ fn settle(http: &mut Http, coll: &str, secs: u64) -> anyhow::Result<()> {
 fn filtered_truth(a: &Args, queries: &[u8], dim: usize) -> anyhow::Result<Vec<Vec<u64>>> {
     let t = Instant::now();
     let nq = queries.len() / dim;
+    if nq == 0 {
+        return Ok(Vec::new());
+    }
     let mut r = open(&a.base)?;
     header(&mut r, &a.base)?;
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -392,6 +395,17 @@ fn run(
             violations += usize::from(deleted(id));
             hits += usize::from(want.contains(&id));
         }
+    }
+    if lat.is_empty() {
+        // `--filtered 0` (e.g. a billion segment: no payloads to filter on).
+        let nan = f64::NAN;
+        return Ok(Run {
+            p50: nan,
+            p99: nan,
+            mean: nan,
+            recall: nan,
+            violations,
+        });
     }
     lat.sort_by(f64::total_cmp);
     let pct = |p: f64| lat[((lat.len() - 1) as f64 * p).round() as usize];

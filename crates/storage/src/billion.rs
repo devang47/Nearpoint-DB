@@ -278,24 +278,41 @@ pub fn sort(dir: &Path, nlist: usize, budget: usize) -> Result<usize> {
         }
         Ok(())
     };
-    let mut offsets = vec![0u64; nlist + 1];
-    pass(&mut |_, l, _| {
-        offsets[usize::from(l) + 1] += 1;
-        Ok(())
-    })?;
-    for i in 0..nlist {
-        offsets[i + 1] += offsets[i];
-    }
-
     let off_bytes = 8 * (nlist + 1);
     let codes_at = off_bytes as u64;
     let codes_len = n * m as u64;
     let ids_at = (codes_at + codes_len).next_multiple_of(4);
     let ids_len = n * 4;
-    let end = ids_at + ids_len;
+    let by_id_at = ids_at + ids_len;
+    let end = by_id_at + n * 2;
     let tmp = dir.join("lists.tmp");
     let out = File::create(&tmp)?;
     out.set_len(end)?;
+
+    // The counting pass also writes each id's list (in id order).
+    let mut offsets = vec![0u64; nlist + 1];
+    let mut by_id_crc = crc32fast::Hasher::new();
+    let mut by_id = Vec::with_capacity(1 << 20);
+    let mut by_id_written = 0u64;
+    let mut flush = |buf: &mut Vec<u8>, at: &mut u64| -> Result<()> {
+        out.write_all_at(buf, by_id_at + *at)?;
+        by_id_crc.update(buf);
+        *at += buf.len() as u64;
+        buf.clear();
+        Ok(())
+    };
+    pass(&mut |_, l, _| {
+        offsets[usize::from(l) + 1] += 1;
+        by_id.extend_from_slice(&l.to_le_bytes());
+        if by_id.len() >= 1 << 20 {
+            flush(&mut by_id, &mut by_id_written)?;
+        }
+        Ok(())
+    })?;
+    flush(&mut by_id, &mut by_id_written)?;
+    for i in 0..nlist {
+        offsets[i + 1] += offsets[i];
+    }
     // Ranges of lists that fit the budget, in order (a list bigger than the
     // budget gets a range of its own).
     let per_row = (m + 4) as u64;
@@ -340,7 +357,7 @@ pub fn sort(dir: &Path, nlist: usize, budget: usize) -> Result<usize> {
     foot.extend_from_slice(&LISTS_VERSION.to_le_bytes());
     foot.extend_from_slice(&(nlist as u32).to_le_bytes());
     foot.extend_from_slice(&p.m.to_le_bytes());
-    foot.extend_from_slice(&0u32.to_le_bytes());
+    foot.extend_from_slice(&by_id_crc.finalize().to_le_bytes());
     foot.extend_from_slice(&n.to_le_bytes());
     for c in [
         crc32fast::hash(off),
@@ -369,7 +386,8 @@ pub struct Billion {
     offsets: Range<usize>,
     codes: Range<usize>,
     ids: Range<usize>,
-    crcs: [u32; 4], // offsets, codes, ids, refine
+    by_id: Range<usize>,
+    crcs: [u32; 5], // offsets, codes, ids, refine, by_id
 }
 
 fn map(path: &Path) -> Result<Mmap> {
@@ -419,7 +437,13 @@ impl Billion {
             le_u32(lf, 16) as usize,
             le_u64(lf, 24),
         );
-        let mut crcs = [le_u32(lf, 32), le_u32(lf, 36), le_u32(lf, 40), 0];
+        let mut crcs = [
+            le_u32(lf, 32),
+            le_u32(lf, 36),
+            le_u32(lf, 40),
+            0,
+            le_u32(lf, 20),
+        ];
         let rf = footer(&rp, &refine, REFINE_FOOTER, REFINE_MAGIC, REFINE_VERSION)?;
         let refine_crc = le_u32(rf, 24);
         if le_u32(rf, 12) as usize != m || le_u64(rf, 16) != n {
@@ -433,7 +457,8 @@ impl Billion {
         let codes_end = codes_at + size(n * m as u64)?;
         let ids_at = codes_end.next_multiple_of(4);
         let ids_end = ids_at + size(n * 4)?;
-        if lists.len() != ids_end + LISTS_FOOTER {
+        let by_id_end = ids_end + size(n * 2)?;
+        if lists.len() != by_id_end + LISTS_FOOTER {
             return Err(Error::Corrupt(lp, "length differs from its footer"));
         }
         if refine.len() != size(n * m as u64)? + REFINE_FOOTER {
@@ -450,6 +475,7 @@ impl Billion {
             offsets: 0..codes_at,
             codes: codes_at..codes_end,
             ids: ids_at..ids_end,
+            by_id: ids_end..by_id_end,
             crcs,
         };
         // Offsets are read on every probe: check them now (small).
@@ -495,9 +521,29 @@ impl Billion {
         bytemuck::cast_slice(&self.lists[self.ids.clone()])
     }
 
+    /// Each id's list.
+    pub fn list_of(&self) -> &[u16] {
+        bytemuck::cast_slice(&self.lists[self.by_id.clone()])
+    }
+
     /// Refinement codes by id.
     pub fn refine(&self) -> &[u8] {
         &self.refine[..self.refine.len() - REFINE_FOOTER]
+    }
+
+    /// Prefetch hint for a list's code bytes and id rows (ranges within
+    /// `codes()` and `ids()`).
+    pub fn will_need_list(&self, codes: Range<usize>, ids: Range<usize>) {
+        for (base, r) in [
+            (self.codes.start, codes),
+            (self.ids.start, ids.start * 4..ids.end * 4),
+        ] {
+            if r.start < r.end {
+                let _ = self
+                    .lists
+                    .advise_range(memmap2::Advice::WillNeed, base + r.start, r.len());
+            }
+        }
     }
 
     /// Prefetch hint for refinement bytes `r` (see `Segment::will_need_blob`).
@@ -519,6 +565,7 @@ impl Billion {
                 bytemuck::cast_slice::<u32, u8>(self.ids()),
                 self.crcs[2],
             ),
+            ("lists by id", &self.lists[self.by_id.clone()], self.crcs[4]),
         ] {
             if crc32fast::hash(bytes) != crc {
                 return Err(Error::Checksum(lp, name));
@@ -595,6 +642,7 @@ mod tests {
         assert_eq!((b.nlist(), b.m(), b.len()), (nlist as usize, m, n));
         let (l, c, r) = rows(0..n, nlist, m);
         assert_eq!(b.refine(), &r[..]);
+        assert_eq!(b.list_of(), &l[..]);
         let off = b.offsets();
         for list in 0..nlist as usize {
             let ids = &b.ids()[off[list] as usize..off[list + 1] as usize];

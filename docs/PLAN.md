@@ -229,7 +229,9 @@ decoded int8 with `exact_vectors: false`.
       data. Resumable from the last committed byte offset.
 - [ ] 9.3 Multi-pass on-disk counting sort into the final IVF list layout.
 - [ ] 9.4 Optional refinement codes for second-stage re-ranking.
-- [ ] 9.5 Load as a read-only compressed segment in the engine.
+- [x] 9.5 Load as a read-only compressed segment in the engine.
+      `attach_billion`: ids `0..n` implicit, deletes and replacements
+      tombstone it, never compacted (ADR 0014 addendum).
 **Acceptance:** 1B vectors, p99 < 100 ms, peak disk ≤ 60 GB,
 recall published honestly against the official 1B ground truth.
 

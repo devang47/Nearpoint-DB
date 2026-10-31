@@ -44,6 +44,7 @@ pub fn router(db: Arc<Db>) -> Router {
             put(create).get(info).delete(drop_collection),
         )
         .route("/collections/{name}/seal", post(seal))
+        .route("/collections/{name}/attach_billion", post(attach_billion))
         .route("/collections/{name}/search", post(search))
         .route("/collections/{name}/points", post(upsert))
         .route("/collections/{name}/points/bulk", post(bulk))
@@ -308,6 +309,25 @@ async fn seal(State(db): State<Arc<Db>>, Path(name): Path<String>) -> ApiResult<
     blocking(move || {
         c.seal()?;
         Ok(Json(json!({"sealed": true})))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Attach {
+    dir: std::path::PathBuf,
+}
+
+async fn attach_billion(
+    State(db): State<Arc<Db>>,
+    Path(name): Path<String>,
+    Json(req): Json<Attach>,
+) -> ApiResult<Json<Value>> {
+    let c = collection(&db, &name)?;
+    blocking(move || {
+        c.attach_billion(&req.dir)?;
+        Ok(Json(describe(&name, &c)))
     })
     .await
 }

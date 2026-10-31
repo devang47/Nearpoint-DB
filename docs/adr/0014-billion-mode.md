@@ -32,7 +32,8 @@ that is 30+ GB of RAM and more disk than the box has.
 - **Multi-pass counting sort** (`storage::billion::sort`): count per list,
   then each pass gathers a range of lists that fits a RAM budget (3 GiB:
   ~7 passes at 1B) from a full read of `stream` and writes it in place in
-  `lists`. Peak disk 18 + 16 + 20 = 54 GB; `stream` is deleted after.
+  `lists` (plus each id's list, u16 in id order, for `get`). Peak disk
+  18 + 16 + 22 = 56 GB; `stream` is deleted after.
 - **Search reads the files mapped**: lists for the probed cells, refine
   codes by id with `madvise(WILLNEED)` for all candidates first (as in
   ADR 0013).
@@ -55,5 +56,21 @@ that is 30+ GB of RAM and more disk than the box has.
   candidates makes no difference); 1B is harder. Published as measured.
 - The quantizers are trained on the first 10M rows only and never
   retrained.
-- Read-only: no deletes, upserts or payloads on the billion rows (9.5
-  decides how the engine exposes it).
+- The build itself is read-only; the engine (9.5) makes it a segment.
+
+## Addendum (2026-11-01): engine segment (9.5)
+`Collection::attach_billion` (`POST /collections/{name}/attach_billion`)
+checks a finished build directory, moves it into an empty L2 collection
+as `<file>.billion` and publishes it as the first segment, holding ids
+`0..n`. Its ids are implicit: never in the id map (1B entries ≈ 20 GB),
+found by `base_row` (row = id unless tombstoned) wherever the map is
+consulted: get, delete, upsert (which tombstones the billion row like any
+replaced row), `len`, and open (no id may be live in both). Searches pass
+the segment's tombstones and the filter as a skip predicate into the scan;
+`get` reconstructs `c + pq + refine`. It has no payloads, so filters match
+none of its rows; `vectors_ok` is false, so compaction never picks it.
+- Alternatives: a separate read-only collection type (simpler, but no
+  deletes, replacements or new rows next to the billion ones); ids in the
+  id map (RAM); u64 row → id arrays like other segments (8 GB).
+- Measured at 10M (RESULTS.md): recall identical to the standalone tool,
+  server phys_footprint 139 MiB.

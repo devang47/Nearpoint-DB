@@ -225,10 +225,12 @@ fn eval(
         gt_ids.len() >= nq && gt_ids.dim() >= k,
         "ground truth too small"
     );
+    let hint = |c: std::ops::Range<usize>, i: std::ops::Range<usize>| b.will_need_list(c, i);
     let lists = Lists {
         offsets: b.offsets(),
         codes: b.codes(),
         ids: b.ids(),
+        will_need: Some(&hint),
     };
     let refine: index::billion::Refine = Arc::new(RefineBytes(Arc::clone(&b)));
     println!(
@@ -242,6 +244,7 @@ fn eval(
             let p = BillionParams {
                 nprobe: np,
                 rerank: rr,
+                skip: None,
             };
             let (mut lat, mut hits) = (Vec::with_capacity(nq), 0usize);
             for i in 0..nq {
