@@ -9,6 +9,7 @@ use std::ops::Range;
 
 use roaring::RoaringBitmap;
 
+pub mod billion;
 mod blob;
 pub mod flat;
 pub mod hnsw;

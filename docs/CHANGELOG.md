@@ -15,6 +15,21 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — Phase 9: billion-mode train / stream build / sort (9.1–9.3)
+- **What:** `index::billion` (two-level k-means coarse quantizer with an
+  HNSW over the centroids, PQ + refinement PQ, parallel encode, search
+  over mapped lists with a refine re-rank); `storage::billion` (append-only
+  `stream` / `refine` with CRC'd `progress` for resume, multi-pass
+  counting sort into `lists`, footer-checked mapped reader); `billion`
+  binary (train, status, build from stdin, sort, eval);
+  `tools/billion-{stream,build}.sh` (chunked parallel range download piped
+  in row order, resume loop). ADR 0014, docs/formats/billion.md.
+- **Why:** 1B rows don't fit the engine's per-row RAM or its rewrite
+  disk budget; this streams the 128 GB once, never stores it, and peaks
+  at 54 GB on disk. BIGANN 10M through the whole pipeline: 74k rows/s
+  encode, recall@10 0.727 at nprobe 64 / rerank 100 (p99 0.78 ms), 0.763
+  at nprobe 256 (the 32-byte codes' ceiling).
+
 ## 2026-11-01 — 8.2: cold-cache benchmarks at 100M (Phase 8 complete)
 - **What:** ran `.context/cold100m.sh` (purge before start and before
   each pass, dataset reads with `F_NOCACHE`) on the 100M data directory;

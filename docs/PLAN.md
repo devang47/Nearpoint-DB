@@ -221,7 +221,9 @@ client, warm-ish cache), peak phys_footprint 8,965 MiB during the load,
 decoded int8 with `exact_vectors: false`.
 
 ## Phase 9: Billion mode
-- [ ] 9.1 Train coarse quantizer + PQ on a 10M sample.
+- [x] 9.1 Train coarse quantizer + PQ on a 10M sample. Two-level k-means
+      (256 × 256 = 65,536 lists) + HNSW over the centroids, PQ16 +
+      16-byte refinement PQ; 214 s on BIGANN's first 10M (ADR 0014).
 - [ ] 9.2 Streaming builder: `curl` range download piped into the builder's
       stdin → encode → append (list_id, code, id) to temp file → discard raw
       data. Resumable from the last committed byte offset.
