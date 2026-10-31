@@ -394,6 +394,19 @@ impl Segment {
     pub fn index_blob(&self) -> &[u8] {
         &self.map[self.layout.blob.clone()]
     }
+
+    /// Hints that bytes `r` of the index blob will be read soon
+    /// (`madvise(MADV_WILLNEED)`): the kernel starts reading them, so many
+    /// scattered reads overlap instead of faulting in one at a time. A hint
+    /// only: out-of-range or failed advice is ignored.
+    pub fn will_need_blob(&self, r: Range<usize>) {
+        let blob = &self.layout.blob;
+        if r.start <= r.end && r.end <= blob.len() {
+            let _ = self
+                .map
+                .advise_range(memmap2::Advice::WillNeed, blob.start + r.start, r.len());
+        }
+    }
 }
 
 #[cfg(test)]

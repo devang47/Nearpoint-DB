@@ -15,6 +15,37 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-31 — 8.3 / Phase 8: BIGANN 100M through the API (met); re-rank prefetch
+- **What:** `IvfPq` asks its shared buffer to prefetch every re-rank
+  candidate's SQ row before scoring (`Shared::will_need`; the engine maps
+  it to `Segment::will_need_blob`, `madvise(MADV_WILLNEED)` via memmap2);
+  `nearpoint_rss_peak_bytes` in `/metrics`. Results in RESULTS.md (logs
+  `docs/results/bigann{10m,100m}-*.log`), PLAN 8.1/8.3 ticked, ADR 0013
+  addendum.
+- **Why:** at 100M the first measurement missed p99 (123 ms; 194 ms after
+  deletes): ~3,900 SQ rows per query faulted in one at a time from a map
+  bigger than the page cache. With the prefetch: recall@10 0.977, p50 50
+  ms, p99 92.9 ms, peak phys_footprint 8,965 MiB: acceptance met, p99
+  with a thin margin and cold cache (8.2) still unmeasured.
+
+## 2026-10-31 — 8.1: memory budget for 100M, /metrics, memory limit
+- **What:** IVF-PQ SQ codes stay in the mapped segment file
+  (`IvfPq::from_shared`) instead of being copied to RAM; collection option
+  `exact_vectors` (default true; false = IVF-PQ segments without f32,
+  `get` decodes the int8 code); one rewrite at a time across collections;
+  `/metrics` (hand-written Prometheus text: RAM by component, mapped bytes,
+  phys_footprint now/peak); `--memory-limit-mib` (upserts 503 above it).
+  Builds: a sealed segment with no IVF-PQ input borrows an existing IVF-PQ
+  segment's quantizers; with quantizers to reuse, IVF-PQ from the first
+  tier merge (4 seals) up; `exact_vectors: false` rewrites skip decoding
+  the rows whose codes they keep. `bigload` (API loader + recall/latency
+  measure for big-ann files), `fetch-dataset.sh bigann100m`. ADR 0013.
+- **Why:** at 100M × 128 the Phase 6 layout needed ~18 GB RAM (12.8 GB of
+  it SQ codes) and 51 GB of f32 on disk. BIGANN 10M dry runs through the
+  API: fresh IVF-PQ trainings (90–110 s) and HNSW tier merges (75 s) made
+  seals wait and the in-RAM segment grow to 1.6M rows; borrowing
+  quantizers cut those builds to 8–33 s.
+
 ## 2026-10-31 — Payloads v2: columnar binary section
 - **What:** segment payload sidecars are written as v2: per column (name
   order) kind, present-rows bitmap, then typed values (i64/f64, a true-rows

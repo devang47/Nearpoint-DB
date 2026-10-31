@@ -74,6 +74,26 @@ Disk: ~170 bytes/row (SQ 128, PQ 16, ids 8 + 4, payloads ~10) ≈ 17 GB.
   scan reads every probed list in full (page faults per query on a cold
   cache). Next step if a bigger collection needs it.
 
+## Addendum (2026-10-31): measured at 100M, prefetch for re-ranking
+BIGANN 100M through the API (RESULTS.md): peak phys_footprint 8,965 MiB
+(load), 6.6 GB serving; components at the end: id map 2.2 GB, row → id
+1.2 GB (0.8 after reopen: exact capacity), IVF lists 2.3 GB, payloads 1.4
+GB (0.9 after reopen). The estimate above held; the id map's doubling at
+~59M rows was the largest single step.
+- Build rules found in 10M dry runs: a sealed segment with no IVF-PQ
+  input borrows the biggest IVF-PQ segment's quantizers (fresh trainings
+  took 90–110 s while seals waited), and with quantizers to reuse a
+  rewrite builds IVF-PQ from `MERGE_FACTOR · seal_rows` rows (HNSW tier
+  merges took 75 s); `exact_vectors: false` rewrites skip decoding kept
+  rows.
+- Search cost is the re-rank: 100 SQ rows per segment × 39 segments, read
+  at random from a 14.8 GB map that mostly isn't cached (rerank off: 6.9
+  ms p50; on: 65 ms). The index now calls `Shared::will_need` for every
+  candidate before scoring them; the engine's blob forwards it to
+  `madvise(MADV_WILLNEED)` (memmap2, no new unsafe), so a segment's reads
+  overlap: p50 48–50 ms, p99 93 ms. A global re-rank budget across
+  segments would cut the reads themselves; not done.
+
 ## Consequences and limits
 - Cold-cache searches fault in `rerank` SQ rows per segment (8.2 measures
   that). Opening a segment still reads its whole blob for the CRC

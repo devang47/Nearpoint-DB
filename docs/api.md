@@ -78,6 +78,7 @@ except the counter:
 | `nearpoint_segments` | `collection`, `index` | segments per index type (`mutable`, `hnsw`, `ivf_pq`) |
 | `nearpoint_phys_footprint_bytes` | | process phys_footprint now (what `--memory-limit-mib` and the 10 GB budget use) |
 | `nearpoint_phys_footprint_peak_bytes` | | its high-water mark |
+| `nearpoint_rss_peak_bytes` | | peak resident set (includes mapped segment pages the OS can drop) |
 | `nearpoint_memory_limit_bytes` | | `--memory-limit-mib` in bytes, 0 if none |
 | `nearpoint_writes_refused_total` | | upserts refused by the memory limit (counter) |
 

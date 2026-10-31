@@ -529,6 +529,78 @@ segments, 1M live dim-32 rows).
   before-number for the restart was measured, so no speedup is claimed
   here; the change matters for multi-GB segments (Phase 8).
 
+## Phase 8: BIGANN 100M through the API (2026-10-31)
+
+`bigload` (crates/server/src/bin/bigload.rs) streams the first N rows of
+the BIGANN u8 base (`tools/fetch-dataset.sh bigann100m`: a range-fetched
+prefix of the 1B file) as 10k-row bulk upserts from 4 connections, with
+payload `{"tag": "t<id % 10>"}`, into a server with `--memory-limit-mib
+9000`; collection `{"dim": 128, "metric": "l2", "schema": {"tag":
+"keyword"}, "exact_vectors": false}`, everything else default (seal 100k,
+IVF-PQ from 1M, merges ≤ 4M, nprobe 32 and rerank 100 per segment). Then,
+one query at a time from one client: 10,000 public queries at k = 10
+against the official ground truth (top 100, deleted ids skipped), 100
+filtered queries (`{"eq": {"tag": "t3"}}`, 10%) against an exact
+filtered top 10 computed by `bigload` in one pass over the base file; then
+delete every id ≡ 0 (mod 100) and measure again (a deleted id returned
+counts as a violation). Logs in `docs/results/bigann{10m,100m}-*.log`.
+
+### 10M dry runs (what the build rules cost)
+
+| Build | load | peak phys_footprint | steady | recall@10 | p50 / p99 |
+|-------|-----:|--------------------:|-------:|----------:|----------:|
+| a38a965~ (SQ codes mapped, exact_vectors off) | 675 s | 5,012 MiB | 817 MiB | 0.9697 | 1.00 / 4.89 ms |
+| + borrowed quantizers, IVF-PQ from 4 seals with quantizers | 576 s | 4,910 MiB | 1,470 MiB | 0.9702 | 0.98 / 7.65 ms |
+
+In the first run every sealed 1.1–1.6M-row segment trained IVF-PQ from
+scratch (90–110 s) and 4 × 140k HNSW tier merges took 75 s; seals wait
+behind a build, so the in-RAM segment grew to 1.6M rows. Borrowing an
+existing segment's quantizers made those builds 8–33 s. (The second run's
+higher steady number includes a leftover 160k HNSW segment in RAM.)
+
+### 100M (a38a965 load; measured at the prefetch commit)
+
+Load: **100M rows in 3,852 s (26.0k rows/s)**, 0 writes refused, peak
+**phys_footprint 8,965 MiB** (the id map's last doubling at ~59M rows is
+the biggest step: 5.7 → 7.0 GB). RSS was not recorded in this run (it
+would include up to the 14.8 GB of mapped segment pages; `/metrics` now
+reports its peak, `nearpoint_rss_peak_bytes`). Final
+layout: 38 IVF-PQ segments of 2.2–3.5M rows (a 4-way merge would pass the
+4M cap), 1 HNSW (320k), the mutable one. Data directory 16 GB (SQ codes
+13 GB, ids 0.8 GB, PQ lists 2 GB, payloads), plus the 12.8 GB source.
+
+| Run (10,000 queries unless noted) | recall@10 | p50 | p99 | phys_footprint |
+|-----------------------------------|----------:|----:|----:|---------------:|
+| a38a965, after load (before deletes) | 0.9770 | 71.0 ms | 123.1 ms | 7,097 MiB |
+| a38a965, after 1M deletes | 0.9771 | 71.9 ms | 193.7 ms | 7,104 MiB |
+| restart, 1,000 queries, `rerank 0` | 0.4492 | 6.9 ms | 25.7 ms | 6,605 MiB |
+| restart, 1,000 queries, `nprobe 16` | 0.9493 | 69.0 ms | 143.2 ms | 6,606 MiB |
+| **+ WILLNEED prefetch of re-rank rows, fresh restart, after deletes** | **0.9771** | **50.0 ms** | **92.9 ms** | **6,623 MiB** (peak 7,009) |
+| same, filtered 10% (100 queries) | 0.9700 | 50.2 ms | 60.0 ms | |
+
+- **Phase 8 acceptance met:** 100M vectors through the API with payloads,
+  a filter, deletes, WAL and background compaction on; p99 92.9 ms
+  (< 100), recall@10 0.977 (≥ 0.9), peak phys_footprint 8,965 MiB
+  (9.40 GB ≤ 10 GB) during the load, 6.6–7.0 GB serving. 0 violations
+  after 1M deletes.
+- **Where the time goes:** with re-ranking off, a query takes 6.9 ms; the
+  rest is reading SQ codes for 100 candidates in each of 39 segments
+  (~3,900 random 128-byte reads) from a 14.8 GB map that doesn't fit in
+  the page cache next to 6.6 GB of process memory. Asking the kernel for
+  all of a segment's candidate pages first (`madvise(WILLNEED)`) lets the
+  reads overlap: p50 65 → 48 ms and p99 101–118 → 65–67 ms on 1,000
+  queries, recall unchanged. `nprobe` barely matters (lists are in RAM).
+- **Margin is thin:** p99 92.9 ms against 100, single client, page cache
+  warmed only by the restart's CRC pass and by the queries themselves.
+  Cold cache (8.2, needs `sudo purge`) and concurrent clients are not
+  measured. Next lever: a global re-rank budget across segments (each
+  segment returns ADC candidates, only the best `rerank` overall are
+  re-scored) instead of 100 per segment.
+- `get` returns decoded int8 vectors for these rows (`exact_vectors:
+  false`), not the exact source values; search is unaffected.
+- Restart: 60 s to first reply (every segment's blob, 15 GB, is read for
+  its CRC at open; ADR 0013).
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

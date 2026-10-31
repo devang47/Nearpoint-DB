@@ -238,6 +238,11 @@ async fn metrics(State(db): State<Arc<Db>>) -> ApiResult<Response> {
                 peak.phys_footprint,
             ),
             (
+                "nearpoint_rss_peak_bytes",
+                "Process peak RSS (includes mapped file pages).",
+                peak.rss,
+            ),
+            (
                 "nearpoint_memory_limit_bytes",
                 "--memory-limit-mib in bytes (0: none).",
                 MEMORY_LIMIT.load(Ordering::Relaxed),
@@ -611,6 +616,7 @@ mod tests {
             "nearpoint_memory_limit_bytes 0",
             "nearpoint_writes_refused_total 1",
             "# TYPE nearpoint_phys_footprint_bytes gauge",
+            "nearpoint_rss_peak_bytes ",
         ] {
             assert!(
                 text.lines().any(|l| l.starts_with(line)),

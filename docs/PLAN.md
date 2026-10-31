@@ -197,15 +197,26 @@ throughput).
 then brute-force (ADR 0010 addendum).
 
 ## Phase 8: Scale to 100M
-- [ ] 8.1 Memory budget per component; enforce limits and expose metrics
+- [x] 8.1 Memory budget per component; enforce limits and expose metrics
       via a hand-written plaintext Prometheus `/metrics` endpoint (no new dep).
+      ADR 0013: SQ codes read from the mapped file, `exact_vectors: false`
+      (no f32 section), one rewrite at a time, `--memory-limit-mib`.
 - [ ] 8.2 Cold-cache benchmarks using `F_NOCACHE` (via `libc`) and
       `sudo purge` between runs.
-- [ ] 8.3 Load 100M vectors (BIGANN or SPACEV subset) through the API.
+- [x] 8.3 Load 100M vectors (BIGANN or SPACEV subset) through the API.
       BIGANN 100M u8 is ~12.8 GB: fetch only that prefix of the 1B file
       with an HTTP range request (ask before downloading).
+      `bigload`; 100M rows in 3,852 s.
 **Acceptance:** 100M vectors, all features on, p99 < 100 ms,
 recall@10 ≥ 0.9, phys_footprint ≤ 10 GB (RSS reported alongside).
+**Status (2026-10-31): met, p99 narrowly; 8.2 open.** BIGANN 100M through
+the API (payloads, a 10% filter, 1M deletes, WAL, compaction):
+recall@10 0.977 (filtered 0.970), p50 50.0 ms, **p99 92.9 ms** (one
+client, warm-ish cache), peak phys_footprint 8,965 MiB during the load,
+6.6 GB serving; 0 violations. RSS not recorded in that run (now in
+`/metrics`). The re-rank reads dominate (rerank off: 6.9 ms); a
+`madvise(WILLNEED)` prefetch took p99 from 101–123 to 93 ms. `get` is
+decoded int8 with `exact_vectors: false`. Cold cache (8.2) unmeasured.
 
 ## Phase 9: Billion mode
 - [ ] 9.1 Train coarse quantizer + PQ on a 10M sample.

@@ -1604,9 +1604,13 @@ fn restore(t: &IvfPq, from: usize, vectors: Vec<f32>) -> Result<Vec<f32>> {
 /// from in place.
 struct Blob(Arc<Segment>);
 
-impl AsRef<[u8]> for Blob {
-    fn as_ref(&self) -> &[u8] {
+impl ivfpq::Shared for Blob {
+    fn bytes(&self) -> &[u8] {
         self.0.index_blob()
+    }
+
+    fn will_need(&self, r: std::ops::Range<usize>) {
+        self.0.will_need_blob(r);
     }
 }
 
