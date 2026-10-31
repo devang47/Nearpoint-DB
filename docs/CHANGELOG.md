@@ -15,6 +15,38 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-31 — Payloads v2: columnar binary section
+- **What:** segment payload sidecars are written as v2: per column (name
+  order) kind, present-rows bitmap, then typed values (i64/f64, a true-rows
+  bitmap, or keyword dictionary + offsets + codes); keyword postings are
+  rebuilt on open. v1 (JSON text per row) stays readable. `payload.rs`
+  `encode`/`decode`, fixture `testdata/payloads-v2`,
+  `docs/formats/payloads.md`.
+- **Why:** every seal, rewrite and open serialized or re-parsed each
+  row's JSON; at 100M rows that is minutes. Ad-hoc 1M-row run: encode
+  520 → 4 ms, decode 505 → 33 ms, 42 → 23 MB. Side effect: an inferred
+  column whose rows were all dropped now survives a reopen.
+
+## 2026-10-31 — Segment open: lazy CRC check of the f32 vectors section
+- **What:** `Segment::open` checks header, footer, ids and index blob
+  CRCs but no longer the vectors section; `Segment::verify_vectors` does.
+  HNSW segments verify at load (they copy the vectors anyway); IVF-PQ
+  segments (vectors stay mmap'd) are checked by `maintain`, one per step,
+  before planning, and an unverified or corrupt one is never a rewrite
+  input. ADR 0012 addendum, `docs/formats/segment.md`.
+- **Why:** known issue 5: a multi-GB segment was read whole at open. A
+  rewrite copies f32 rows into a fresh file with valid CRCs, so it must
+  never read unchecked ones.
+
+## 2026-10-31 — Db: one maintenance thread per collection
+- **What:** each collection gets its own background thread running
+  `maintain` (spawned on open/create; joined on drop, and on Db drop
+  before the LOCK is released). `db.rs`, ADR 0012 Threading.
+- **Why:** one shared thread let a long build in one collection delay
+  every other collection's seals. CPU stays capped by the shared build
+  pool; RAM is not (two big merges in different collections can now
+  overlap), noted in the ADR for Phase 8.1's memory budget.
+
 ## 2026-10-31 — Phase 6 met: 4-hour soak at 71bbdd4
 - **What:** reran the Phase 6 soak (same settings, pre-registered
   30-window check) at the absorb + nprobe-per-nlist commit; results in

@@ -509,6 +509,26 @@ Per-window CSV: `docs/results/soak-4h-final.csv`.
   trainings). 98 background rewrites, one of them an HNSW build (initial
   load).
 
+### 2026-10-31 — housekeeping round regression check (30-minute soak, 310a003)
+
+Lazy vectors CRC, payloads v2 (columnar), one maintenance thread per
+collection, merged. Same settings and steady-state window as the nprobe
+run above; CSV `docs/results/soak-round8-30m.csv`. Then the server was
+restarted on the soak's data directory (one ~1M IVF-PQ + 2 HNSW
+segments, 1M live dim-32 rows).
+
+| Build | p99 median / mean / max | recall@10 median | search/s mean | drift (15 windows) |
+|-------|------------------------:|-----------------:|--------------:|-------------------:|
+| 71bbdd4 (nprobe per nlist) | 1.52 / 1.53 / 2.04 ms | 0.7919 | 5,576 | p99 −14.8%, PASS |
+| **310a003 (round 8 merged)** | **1.41 / 1.42 / 1.55 ms** | **0.7942** | 5,669 | p99 +2.0%, recall −0.1%, PASS |
+
+- No regression; 0 errors, 0 violations, 0 reconnects. The lower p99 is
+  within run-to-run noise for single 30-minute runs (not attributed).
+- Restart to first HTTP reply: 152 ms. The IVF-PQ segment's vectors CRC
+  (128 MB) ran afterwards in the background step: 139 ms. No
+  before-number for the restart was measured, so no speedup is claimed
+  here; the change matters for multi-GB segments (Phase 8).
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.
