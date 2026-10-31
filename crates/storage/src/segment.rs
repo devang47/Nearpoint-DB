@@ -106,6 +106,9 @@ struct Layout {
     metric: u32,
     blob_kind: BlobKind,
     vectors: Range<usize>,
+    /// The vector section's CRC from the footer: checked by
+    /// `Segment::verify_vectors`, not by `parse`.
+    vectors_crc: u32,
     ids: Range<usize>,
     blob: Range<usize>,
 }
@@ -146,9 +149,10 @@ fn le_u64(b: &[u8], at: usize) -> u64 {
 
 const SECTION_NAMES: [&str; 3] = ["vector section", "id section", "index blob"];
 
-/// Validates a whole segment image and returns its layout. Checks magic,
+/// Validates a segment image and returns its layout. Checks magic,
 /// version, footer and header CRCs, that the section table matches the
-/// header exactly, that padding is zero, and every section CRC.
+/// header exactly, that padding is zero, and the id and blob CRCs. The
+/// vector section is not read (its CRC: `verify_vectors`).
 fn parse(b: &[u8]) -> Result<Layout> {
     if b.len() >= MAGIC.len() && b[..MAGIC.len()] != MAGIC {
         return Err(Error::BadMagic);
@@ -217,7 +221,7 @@ fn parse(b: &[u8]) -> Result<Layout> {
     {
         return Err(Error::Corrupt("nonzero padding"));
     }
-    for (i, r) in [&vectors, &ids, &blob].into_iter().enumerate() {
+    for (i, r) in [(1, &ids), (2, &blob)] {
         if crc32fast::hash(&b[r.clone()]) != le_u32(footer, 8 + 24 * i + 16) {
             return Err(Error::Checksum(SECTION_NAMES[i]));
         }
@@ -228,9 +232,18 @@ fn parse(b: &[u8]) -> Result<Layout> {
         metric,
         blob_kind,
         vectors,
+        vectors_crc: le_u32(footer, 8 + 16),
         ids,
         blob,
     })
+}
+
+/// The vector section's CRC check, which `parse` leaves out.
+fn verify_vectors(b: &[u8], layout: &Layout) -> Result<()> {
+    if crc32fast::hash(&b[layout.vectors.clone()]) != layout.vectors_crc {
+        return Err(Error::Checksum(SECTION_NAMES[0]));
+    }
+    Ok(())
 }
 
 /// `<path>.tmp`: where a segment is built before it's renamed into place.
@@ -311,15 +324,18 @@ fn write_file(tmp: &Path, seg: &SegmentData<'_>, secs: &[Range<u64>; 3], elem: u
     Ok(())
 }
 
-/// An open, fully verified segment, mapped read-only.
+/// An open segment, mapped read-only. Everything but the f32 vector
+/// section is verified on open; `verify_vectors` checks that one.
 pub struct Segment {
     map: Mmap,
     layout: Layout,
 }
 
 impl Segment {
-    /// Maps `path` and verifies all of it (every CRC), so opening reads the
-    /// whole file once. See docs/formats/segment.md for the cost.
+    /// Maps `path` and verifies the header, footer, ids and index blob
+    /// (their CRCs and the layout). The vector section is not read: it can
+    /// be most of a multi-GB file. Call `verify_vectors` before trusting
+    /// it whole (e.g. copying it into another segment).
     pub fn open(path: &Path) -> Result<Segment> {
         let file = File::open(path)?;
         // SAFETY: segments are immutable once published: they are written
@@ -335,6 +351,11 @@ impl Segment {
         bytemuck::try_cast_slice::<u8, u64>(&map[layout.ids.clone()])
             .map_err(|_| Error::Corrupt("id section misaligned"))?;
         Ok(Segment { map, layout })
+    }
+
+    /// Checks the vector section's CRC: reads all of it once.
+    pub fn verify_vectors(&self) -> Result<()> {
+        verify_vectors(&self.map, &self.layout)
     }
 
     pub fn dim(&self) -> usize {
@@ -457,35 +478,60 @@ mod tests {
         for (r, name) in [lay.vectors, lay.ids, lay.blob].iter().zip(SECTION_NAMES) {
             let mut bad = img.clone();
             bad[r.start + 1] ^= 0x10;
-            assert!(matches!(parse(&bad), Err(Error::Checksum(n)) if n == name));
+            assert!(matches!(parse_all(&bad), Err(Error::Checksum(n)) if n == name));
         }
     }
 
+    /// `open` plus `verify_vectors`, on an image.
+    fn parse_all(b: &[u8]) -> Result<Layout> {
+        let lay = parse(b)?;
+        verify_vectors(b, &lay)?;
+        Ok(lay)
+    }
+
     fn assert_every_flip_detected(img: &[u8]) {
-        assert!(parse(img).is_ok());
+        assert!(parse_all(img).is_ok());
         let mut bad = img.to_vec();
         for byte in 0..img.len() {
             for bit in 0..8 {
                 bad[byte] ^= 1 << bit;
-                assert!(parse(&bad).is_err(), "flip at byte {byte} bit {bit}");
+                assert!(parse_all(&bad).is_err(), "flip at byte {byte} bit {bit}");
                 bad[byte] ^= 1 << bit;
             }
         }
     }
 
+    /// A flipped byte in the ids or the blob fails `open`; one in the
+    /// vector section doesn't (`open` never reads it), `verify_vectors`
+    /// reports it.
     #[test]
-    fn flipped_bit_in_a_file_fails_open() {
+    fn open_skips_the_vector_section_crc() {
         let dir = tmp_dir("flip-file");
         let path = dir.join("s.seg");
         let o = Owned::new(10, 3, 37);
         write(&path, &o.data(3)).unwrap();
-        let mut img = fs::read(&path).unwrap();
-        img[HEADER_LEN + 5] ^= 4;
-        fs::write(&path, &img).unwrap();
+        let img = fs::read(&path).unwrap();
+        let lay = parse(&img).unwrap();
+        for (at, name) in [
+            (lay.ids.start + 3, "id section"),
+            (lay.blob.end - 1, "index blob"),
+        ] {
+            let mut bad = img.clone();
+            bad[at] ^= 4;
+            fs::write(&path, &bad).unwrap();
+            assert!(matches!(Segment::open(&path), Err(Error::Checksum(n)) if n == name));
+        }
+        let mut bad = img.clone();
+        bad[HEADER_LEN + 5] ^= 4;
+        fs::write(&path, &bad).unwrap();
+        let s = Segment::open(&path).unwrap();
+        assert_eq!(s.ids(), &o.ids[..]);
         assert!(matches!(
-            Segment::open(&path),
+            s.verify_vectors(),
             Err(Error::Checksum("vector section"))
         ));
+        fs::write(&path, &img).unwrap();
+        Segment::open(&path).unwrap().verify_vectors().unwrap();
     }
 
     #[test]
