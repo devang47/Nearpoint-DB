@@ -19,12 +19,13 @@ One step per call, under a `maint` mutex (so only one seal, build or
 compaction is ever in flight): finish a pending seal, else seal if the
 mutable segment has `seal_rows` rows, else run one planned rewrite.
 Returns whether it did anything. Tests call it directly; `Db` runs one
-background thread that calls it on every collection in turn and waits
-500 ms (condvar, so drop wakes it) after a pass with no work. Errors are
-logged (`tracing::error!`) and retried on the next pass. `Collection::
-close` (drop) waits for the step in flight and stops later ones, so no
-build races the directory's deletion; `Db::drop` stops and joins the
-thread. Explicit `seal()` (the `/seal` endpoint) takes the same mutex.
+background thread per collection (see Threading) that calls it in a
+loop and waits 500 ms (condvar, so a drop wakes it) after a step with no
+work. Errors and panics are logged (`tracing::error!`) and retried after
+the wait. Dropping a collection stops and joins its thread (after the
+step in flight), then `Collection::close` stops later steps, so no build
+races the directory's deletion; `Db::drop` stops every thread, then
+joins each. Explicit `seal()` (the `/seal` endpoint) takes the same mutex.
 
 Lock order: maint, writer, live, snap, a segment.
 
@@ -137,6 +138,22 @@ pool worker blocked on that lock deadlocks the pool (found by the
 concurrent test). Sealed segments are never write-locked. The "never a
 dead row" re-check of every hit against the allowed bitmap stays.
 
+**One maintenance thread per collection (2026-10-31).** It used to be
+one Db thread looping over every collection, so a multi-second IVF-PQ
+build in one collection held back every other collection's seal (its
+mutable segment and WAL kept growing). Now each collection gets its own
+thread, spawned on open/create and kept next to the collection in the
+Db's map. The thread holds only its `Arc<Collection>` and stop flag, never
+the collections map or the admin lock, so `drop_collection` joins it
+(outside the map lock, under admin) without a lock-order risk, and
+`Db::drop` signals all of them before joining any. Builds of several
+collections can now run at once; they share the one build pool, so CPU
+stays bounded by `--build-threads`, though each holds its own build RAM.
+Alternative: a small worker pool pulling collections from a queue. It
+caps threads but needs a queue, re-queueing after each step and a "this
+collection is already being worked on" rule, all to save idle threads
+that cost ~nothing at the expected tens of collections.
+
 ### Crash safety
 Fail points: 1 WAL rotated, 2 seal files written, 3 seal manifest
 published, 4 rewrite files written, 5 rewrite manifest published. Tests
@@ -161,9 +178,10 @@ leftovers that open deletes.
   pool would also work but doubles the thread count for nothing.
 
 ## Consequences and limits
-- `ponytail:` one background thread for all collections: a long build
-  in one delays the others' seals (the mutable segment then grows past
-  `seal_rows` meanwhile; it is in RAM).
+- `ponytail:` one OS thread per collection (mostly idle): fine to
+  hundreds of collections; a worker pool with a queue past that.
+  Concurrent builds in different collections add up in RAM (one merge
+  each, below).
 - A merge holds its rows' f32 vectors, the new index and (while writing)
   its blob: ~2.6 GB at the default 4M-row cap and dim 128. The cap is
   also limited to 2 GiB of f32 input, so wide vectors merge smaller.
