@@ -245,3 +245,29 @@ per-segment count. 30-minute soak: recall 0.749 → 0.792, mean p99
   across rewrites, so this drifts as dead rows go); a global
   probe budget split across segments by size (needs all segments'
   centroid distances before scanning, a bigger change).
+
+## Addendum (2026-10-31): lazy CRC check of the f32 vectors section
+`Segment::open` checked every section CRC, reading the whole file. An
+IVF-PQ segment keeps its f32 vectors mapped and reads them only for
+`get`/`with_vector` and as rewrite input; at 100M vectors (Phase 8) that
+section is tens of GB, so opening would take minutes and page it all in.
+
+- **Decision:** `open` checks everything but the vector section (header,
+  footer, layout, padding, ids and blob CRCs: all read at load anyway).
+  `Segment::verify_vectors` checks that section. HNSW segments call it on
+  load (they copy the vectors into RAM, so it costs one more pass over
+  pages being read anyway). Loaded IVF-PQ segments are checked by
+  `Collection::maintain`, one segment per step, after a due seal and
+  before planning. A segment not yet checked, or whose check failed, is
+  never picked by `plan`: a rewrite copies its f32 rows into a new file
+  with fresh CRCs and would launder the corruption. A failure is logged
+  (`tracing::error!` with the path); the segment keeps serving search
+  from its codes, and `get` returns whatever the page holds (as before:
+  mapped pages were never re-checked after open). No repair path.
+- **Alternatives:** verify on first touch (in `vectors()`): puts a
+  multi-second read on whichever query or `get` comes first, and makes
+  every accessor fallible. A background thread inside `storage`: a second
+  scheduler next to the Db thread, with its own shutdown and error
+  reporting, for work `maintain` already sequences. A per-row or per-block
+  CRC (verify only the rows a rewrite copies): a format change, and a
+  rewrite copies nearly every row anyway.

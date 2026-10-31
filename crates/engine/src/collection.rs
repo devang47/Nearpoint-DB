@@ -288,9 +288,13 @@ pub struct SegmentInfo {
 
 /// A segment's index. IVF-PQ keeps its f32 vectors in the mapped file
 /// (not in RAM): `get` stays exact and Phase 8 can re-rank from them.
+/// `open` doesn't check that section's CRC (it can be GBs); the third
+/// field is the result of `verify_vectors` once `maintain` has run it
+/// (`true` from the start for a file this process wrote). HNSW vectors
+/// are verified on load, which copies them anyway.
 enum SegIndex {
     Hnsw(Hnsw),
-    IvfPq(IvfPq, Segment),
+    IvfPq(IvfPq, Segment, OnceLock<bool>),
 }
 
 /// One segment's data. A sealed one never changes; the mutable one only
@@ -306,7 +310,15 @@ impl Seg {
     fn index(&self) -> &dyn Index {
         match &self.index {
             SegIndex::Hnsw(h) => h,
-            SegIndex::IvfPq(i, _) => i,
+            SegIndex::IvfPq(i, ..) => i,
+        }
+    }
+
+    /// Whether its f32 vectors are known good, so a rewrite may copy them.
+    fn vectors_ok(&self) -> bool {
+        match &self.index {
+            SegIndex::Hnsw(_) => true,
+            SegIndex::IvfPq(_, _, ok) => ok.get() == Some(&true),
         }
     }
 
@@ -314,7 +326,7 @@ impl Seg {
     fn vector(&self, dim: usize, row: u32) -> Option<&[f32]> {
         let all = match &self.index {
             SegIndex::Hnsw(h) => h.vectors(),
-            SegIndex::IvfPq(_, file) => file.vectors(),
+            SegIndex::IvfPq(_, file, _) => file.vectors(),
         };
         all.get(row as usize * dim..(row as usize + 1) * dim)
     }
@@ -668,7 +680,7 @@ impl Collection {
             let params = SearchParams {
                 ef: opts.ef.unwrap_or(d.ef),
                 nprobe: match &seg.index {
-                    SegIndex::IvfPq(i, _) => {
+                    SegIndex::IvfPq(i, ..) => {
                         segment_nprobe(nprobe, i.config().nlist, self.cfg.ivf_rows)
                     }
                     SegIndex::Hnsw(_) => nprobe,
@@ -735,9 +747,10 @@ impl Collection {
     }
 
     /// Does one unit of background work and returns whether it did any:
-    /// seals the mutable segment once it has `seal_rows` rows, else runs
-    /// one build or compaction step (policy in ADR 0012). `Db` calls it
-    /// from the collection's background thread; tests call it directly.
+    /// seals the mutable segment once it has `seal_rows` rows, else checks
+    /// one loaded IVF-PQ segment's f32 vectors CRC, else runs one build or
+    /// compaction step (policy in ADR 0012). `Db` calls it from the
+    /// collection's background thread; tests call it directly.
     pub fn maintain(&self) -> Result<bool> {
         let mut m = lock(&self.maint);
         if m.closed {
@@ -746,6 +759,9 @@ impl Collection {
         let snap = self.snapshot();
         if m.pending.is_some() || snap.mutable().rows >= self.cfg.seal_rows {
             self.seal_locked(&mut m)?;
+            return Ok(true);
+        }
+        if self.verify_one(&snap) {
             return Ok(true);
         }
         let Some(inputs) = self.plan(&snap) else {
@@ -872,11 +888,43 @@ impl Collection {
         Ok(())
     }
 
+    /// Checks the f32 vectors CRC of the first IVF-PQ segment not checked
+    /// yet; returns whether there was one. Reads the whole section, under
+    /// the segment's read lock only (searches go on). A mismatch is logged
+    /// and keeps the segment out of every rewrite: it still serves search
+    /// from its codes, but its rows must not be copied into a new file.
+    fn verify_one(&self, snap: &Snapshot) -> bool {
+        // Not the mutable segment's lock: the writer holds it.
+        for v in snap.segs.iter().filter(|v| v.file != 0) {
+            let seg = read(&v.seg);
+            let SegIndex::IvfPq(_, file, ok) = &seg.index else {
+                continue;
+            };
+            if ok.get().is_some() {
+                continue;
+            }
+            let t = Instant::now();
+            let res = file.verify_vectors();
+            let path = file_path(&self.dir, v.file, "seg");
+            match &res {
+                Ok(()) => tracing::info!(ms = t.elapsed().as_millis(), "verify vectors"),
+                Err(e) => tracing::error!(
+                    path = %path.display(),
+                    "{e}: segment kept for search but never compacted"
+                ),
+            }
+            let _ = ok.set(res.is_ok()); // only maintain sets it, under `maint`
+            return true;
+        }
+        false
+    }
+
     /// The compaction policy (ADR 0012); `None` if nothing is due. Returns
-    /// positions in `snap` of sealed segments to rewrite into one.
+    /// positions in `snap` of sealed segments to rewrite into one. Never
+    /// one whose f32 vectors aren't verified (`Seg::vectors_ok`).
     fn plan(&self, snap: &Snapshot) -> Option<Vec<usize>> {
         let sealed: Vec<usize> = (0..snap.segs.len())
-            .filter(|&i| snap.segs[i].file != 0)
+            .filter(|&i| snap.segs[i].file != 0 && read(&snap.segs[i].seg).vectors_ok())
             .collect();
         let live = |i: usize| u64::from(snap.segs[i].rows) - snap.segs[i].dead.len();
         let dead_share = |i: usize| snap.segs[i].dead.len() as f64 / f64::from(snap.segs[i].rows);
@@ -1024,7 +1072,7 @@ impl Collection {
         let inputs = &inputs[..];
         let segs: Vec<_> = inputs.iter().map(|&i| read(&snap.segs[i].seg)).collect();
         let template = match &segs[0].index {
-            SegIndex::IvfPq(ivf, _) => {
+            SegIndex::IvfPq(ivf, ..) => {
                 let v = &snap.segs[inputs[0]];
                 let rows: Vec<u32> = (0..v.rows).filter(|&r| !v.dead.contains(r)).collect();
                 Some(match ivf.retain(&rows) {
@@ -1175,7 +1223,8 @@ impl Collection {
                         "ivf_pq build"
                     );
                     return Ok(Seg {
-                        index: SegIndex::IvfPq(index, mapped),
+                        // Its CRCs were computed from `vectors` just now.
+                        index: SegIndex::IvfPq(index, mapped, OnceLock::from(true)),
                         ids,
                         payloads,
                     });
@@ -1437,8 +1486,14 @@ fn load_segment(dir: &Path, cfg: &Config, file: u64, dead: &RoaringBitmap) -> Re
         return Err(corrupt(&path, "segment has no f32 vectors"));
     }
     let index = match s.blob_kind() {
-        BlobKind::Hnsw => SegIndex::Hnsw(Hnsw::from_bytes(s.index_blob(), s.vectors().to_vec())?),
-        BlobKind::IvfPq => SegIndex::IvfPq(IvfPq::from_bytes(s.index_blob())?, s),
+        BlobKind::Hnsw => {
+            // Copied into RAM anyway: verify on the way.
+            s.verify_vectors()
+                .map_err(|e| Error::Segment(path.clone(), e))?;
+            SegIndex::Hnsw(Hnsw::from_bytes(s.index_blob(), s.vectors().to_vec())?)
+        }
+        // Stays mapped: `maintain` verifies it later (`verify_one`).
+        BlobKind::IvfPq => SegIndex::IvfPq(IvfPq::from_bytes(s.index_blob())?, s, OnceLock::new()),
         BlobKind::Flat => return Err(corrupt(&path, "flat segments are not used")),
     };
     let seg = Seg {
@@ -2439,6 +2494,48 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// An IVF-PQ segment's f32 vectors aren't read on open. `maintain`
+    /// checks them (one step); a corrupt one keeps serving search from its
+    /// codes but is never rewritten, which would copy the bad rows into a
+    /// fresh file with valid CRCs.
+    #[test]
+    fn corrupt_ivf_pq_vectors_are_found_and_never_rewritten() {
+        let d = TempDir::new("lazy-crc");
+        let cfg = Config {
+            seal_rows: 512,
+            ..cfg()
+        };
+        let c = open_with(&d, cfg.clone());
+        let ids: Vec<u64> = (0..1500).collect();
+        let vecs: Vec<f32> = ids.iter().flat_map(|&i| rand_vec(i, DIM)).collect();
+        c.upsert_batch(&ids, &vecs, &[]).unwrap();
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c), [("ivf_pq", 1500, 0), ("mutable", 0, 0)]);
+        let path = file_path(&d.0, c.snapshot().segs[0].file, "seg");
+        drop(c);
+        let mut img = fs::read(&path).unwrap();
+        img[64 + 7 * DIM * 4] ^= 0x40; // row 7, in the vector section
+        fs::write(&path, &img).unwrap();
+
+        let c = open_with(&d, cfg);
+        for i in (0..1500).step_by(2) {
+            assert!(c.delete(i).unwrap()); // half dead: a rewrite is due
+        }
+        assert!(c.maintain().unwrap(), "the check is a step");
+        assert!(!c.maintain().unwrap(), "nothing it may rewrite");
+        assert_eq!(shape(&c), [("ivf_pq", 1500, 750), ("mutable", 0, 0)]);
+        assert!(path.exists());
+        let o = SearchOptions {
+            nprobe: Some(64),
+            rerank: Some(200),
+            ..opts(None)
+        };
+        for i in [1, 701, 1499] {
+            assert_eq!(c.search(&rand_vec(i, DIM), 5, &o).unwrap()[0].id, i);
         }
     }
 

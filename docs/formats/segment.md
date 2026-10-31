@@ -83,14 +83,23 @@ file is detected (tested exhaustively on a small file).
 newer file gets a clear error), footer magic (`Truncated`), footer CRC, header CRC
 (`Checksum`), element type (`UnsupportedElementType`: 0, or 1 in a v2
 file), dim/blob kind/section
-table/file length/padding (`Corrupt`), then every section CRC (`Checksum`).
+table/file length/padding (`Corrupt`), then the id and blob CRCs
+(`Checksum`).
 
-**Cost.** v1 verifies every section on open, which reads the whole file
-once: for SIFT1M HNSW (~658 MB) that is one sequential pass and pulls the
-file into the page cache (clean, evictable pages, not counted in
-phys_footprint). For multi-GB IVF-PQ segments (Phase 5/6) this becomes a
-startup cost; the planned fix is an `open` that verifies header and footer
-only, plus a lazy/background `verify()`. The format doesn't change for it.
+**The vector section's CRC is not checked by `open`.** That section is
+most of the file (512 MB of SIFT1M's 658 MB) and an IVF-PQ segment
+keeps it mapped, read only by `get`/`with_vector` and as rewrite
+input, so checking it on open would page the whole file in for nothing.
+`Segment::verify_vectors` checks it (one sequential read). When the
+engine calls it (ADR 0012, 2026-10-31 lazy CRC addendum):
+
+| Segment | Vector CRC checked |
+|---------|--------------------|
+| HNSW    | on load (the vectors are copied into RAM anyway) |
+| IVF-PQ, loaded | by a later background step (`Collection::maintain`, one segment per step); until it passes the segment is never a rewrite input, and if it fails it never becomes one |
+| IVF-PQ, just written | never: its CRC was computed from the in-RAM rows this process wrote |
+
+The format didn't change for this: the CRC was already per section.
 
 ## Publishing
 
