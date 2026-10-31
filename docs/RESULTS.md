@@ -601,6 +601,41 @@ layout: 38 IVF-PQ segments of 2.2–3.5M rows (a 4-way merge would pass the
 - Restart: 60 s to first reply (every segment's blob, 15 GB, is read for
   its CRC at open; ADR 0013).
 
+### 2026-11-01 — 8.2 cold cache (4e999d5, `.context/cold100m.sh`)
+
+Same 100M data directory (after the 1M deletes). `sudo -n purge` before
+the server start and, with `bigload --purge`, before each measured pass;
+`bigload` reads the dataset files with `F_NOCACHE`, so its 12.8 GB pass
+for the filtered ground truth doesn't refill the cache. 1,000 unfiltered
+queries (ground truth includes the deleted ids, so recall reads ~0.009
+low; compare rows, not with the table above) and 100 filtered (10%).
+Order: cold, warm, cold, warm.
+
+| Pass | unfiltered p50 / p99 | filtered p50 / p99 | recall@10 (unf. / filt.) |
+|------|---------------------:|-------------------:|-------------------------:|
+| cold 1 | 46.8 / 79.7 ms | 54.4 / 100.3 ms | 0.9683 / 0.9700 |
+| warm 1 | 46.8 / 90.6 ms | 50.6 / 69.3 ms | 0.9683 / 0.9700 |
+| cold 2 | 47.2 / 93.3 ms | 52.6 / 91.1 ms | 0.9683 / 0.9700 |
+| warm 2 | 45.7 / 84.9 ms | 46.3 / 51.8 ms | 0.9683 / 0.9700 |
+
+- Cold restart: **59.8 s** to first reply (warm restarts: 60–62 s). Peak
+  phys_footprint 7,046 MiB, peak RSS 6,325 MiB (6,632,112,128 B: mapped
+  pages are mostly not resident).
+- **Cold and warm are the same within noise.** The re-rank reads ~3,900
+  random SQ rows per query from a 14.8 GB map, and only ~7 GB of the
+  16 GB box is left for the page cache, so "warm" is mostly cold for
+  those reads anyway; that is the cost the WILLNEED prefetch attacks.
+  The PQ lists are in RAM and don't depend on the cache. Not verified:
+  whether `purge` also drops pages the running server has mapped (it
+  took 0.3–0.5 s); the cold restart, with no process mapping anything,
+  is cold either way.
+- Unfiltered p99 stays under 100 ms in all four passes (79.7–93.3 ms).
+  The filtered cold p99 of 100.3 ms is the slowest of 100 queries (p99
+  of 100 samples), not a stable figure.
+- Restart is bound by the CRC pass over every blob (15 GB in 60 s,
+  ~250 MB/s through page faults): the next thing to make lazy, like the
+  vectors section was.
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

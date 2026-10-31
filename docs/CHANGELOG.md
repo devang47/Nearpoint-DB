@@ -15,6 +15,15 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — 8.2: cold-cache benchmarks at 100M (Phase 8 complete)
+- **What:** ran `.context/cold100m.sh` (purge before start and before
+  each pass, dataset reads with `F_NOCACHE`) on the 100M data directory;
+  results in RESULTS.md, 8.2 ticked in PLAN.md.
+- **Why it matters:** cold and warm search are the same within noise
+  (p50 ~47 ms, unfiltered p99 80–93 ms): the re-rank's random SQ reads
+  miss the page cache either way at this size. Cold restart 59.8 s, bound
+  by the blob CRC pass; that is the next thing to make lazy.
+
 ## 2026-10-31 — 8.2 prep: F_NOCACHE dataset reads, bigload --purge
 - **What:** `storage::sys::set_nocache` (fcntl `F_NOCACHE`); `bigload`
   reads every dataset file with it and, with `--purge`, runs
