@@ -58,6 +58,20 @@ fn rusage_info() -> io::Result<libc::rusage_info_v4> {
     }
 }
 
+/// Sets `F_NOCACHE` on `f`: reads through it bypass the unified buffer
+/// cache, so a benchmark streaming a dataset file doesn't evict the pages
+/// it is measuring (task 8.2).
+#[cfg(target_os = "macos")]
+pub fn set_nocache(f: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `f` owns a valid open descriptor for the duration of the
+    // call; F_NOCACHE takes an int argument and changes no memory of ours.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +86,8 @@ mod tests {
         let after = peak_memory().unwrap();
         assert!(after.phys_footprint >= before.phys_footprint.max(256 * MB));
         assert!(after.rss >= 256 * MB);
+        let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        set_nocache(&f).unwrap();
         let now = phys_footprint().unwrap();
         assert!(now >= 256 * MB && now <= after.phys_footprint);
     }

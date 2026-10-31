@@ -15,6 +15,10 @@
 //! 4. Delete every id `≡ 0 (mod --delete-every)` and measure again: no
 //!    deleted id may come back (counted as violations).
 //!
+//! `--purge` (8.2) empties the page cache before each measured pass; the
+//! dataset files are read with `F_NOCACHE` either way, so they never push
+//! the server's segment pages out.
+//!
 //! ```text
 //! cargo run --release -p server --bin bigload -- --n 10000000 \
 //!     --base ~/data/Nearpoint/bigann10m/base.10M.u8bin \
@@ -85,6 +89,25 @@ struct Args {
     /// Delete ids `≡ 0 (mod this)` before the second measurement; 0 = skip.
     #[arg(long, default_value_t = 100)]
     delete_every: u64,
+    /// Cold cache (8.2): `sudo -n /usr/sbin/purge` right before each
+    /// measured pass, so each starts with no file pages cached.
+    #[arg(long)]
+    purge: bool,
+}
+
+fn purge() -> anyhow::Result<()> {
+    let t = Instant::now();
+    let out = std::process::Command::new("sudo")
+        .args(["-n", "/usr/sbin/purge"])
+        .output()
+        .context("running sudo -n purge")?;
+    ensure!(
+        out.status.success(),
+        "sudo -n purge failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    println!("purged page cache in {:.1} s", t.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// A `.u8bin`/`.ibin` header: count and dim.
@@ -101,8 +124,11 @@ fn header(r: &mut impl Read, path: &Path) -> anyhow::Result<(u64, usize)> {
     ))
 }
 
+/// Opened with `F_NOCACHE`: streaming the 12.8 GB base must not evict the
+/// server's segment pages from the page cache.
 fn open(path: &Path) -> anyhow::Result<BufReader<File>> {
     let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    storage::sys::set_nocache(&f)?;
     Ok(BufReader::with_capacity(1 << 22, f))
 }
 
@@ -405,6 +431,9 @@ fn main() -> anyhow::Result<()> {
                   label: &str,
                   deleted: &dyn Fn(u64) -> bool|
      -> anyhow::Result<()> {
+        if a.purge {
+            purge()?;
+        }
         let un = run(
             &a,
             http,
@@ -421,6 +450,9 @@ fn main() -> anyhow::Result<()> {
             },
             deleted,
         )?;
+        if a.purge {
+            purge()?;
+        }
         let fi = run(
             &a,
             http,

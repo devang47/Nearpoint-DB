@@ -15,6 +15,14 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-31 — 8.2 prep: F_NOCACHE dataset reads, bigload --purge
+- **What:** `storage::sys::set_nocache` (fcntl `F_NOCACHE`); `bigload`
+  reads every dataset file with it and, with `--purge`, runs
+  `sudo -n /usr/sbin/purge` before each measured pass.
+- **Why:** 8.2 measures cold-cache search; `bigload` streams the 12.8 GB
+  base for the filtered ground truth, which would otherwise refill the
+  page cache with dataset pages and evict the segments under test.
+
 ## 2026-10-31 — 8.3 / Phase 8: BIGANN 100M through the API (met); re-rank prefetch
 - **What:** `IvfPq` asks its shared buffer to prefetch every re-rank
   candidate's SQ row before scoring (`Shared::will_need`; the engine maps
