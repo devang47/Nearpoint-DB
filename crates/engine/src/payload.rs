@@ -12,11 +12,13 @@
 //! serialize into the segment file later.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io;
 
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::collection::{take, u32_at};
 use crate::{Error, Result};
 
 /// A column's type, fixed by the schema or the first value the field gets.
@@ -339,6 +341,168 @@ impl PayloadStore {
     }
 }
 
+/// On-disk kind codes are the `Kind` discriminants (docs/formats/payloads.md).
+const KINDS: [Kind; 5] = [
+    Kind::Int,
+    Kind::Float,
+    Kind::Bool,
+    Kind::Keyword,
+    Kind::KeywordList,
+];
+
+impl PayloadStore {
+    /// The columnar payload body (v2, docs/formats/payloads.md) for a
+    /// segment of `rows` rows.
+    pub(crate) fn encode(&self, rows: u32) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&rows.to_le_bytes());
+        out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
+        for (name, c) in &self.columns {
+            put_bytes(&mut out, name.as_bytes());
+            out.push(c.kind() as u8);
+            put_bitmap(&mut out, &c.present)?;
+            match &c.data {
+                Data::Int(v) => put_words(&mut out, v.iter().map(|x| x.to_le_bytes())),
+                Data::Float(v) => put_words(&mut out, v.iter().map(|x| x.to_le_bytes())),
+                Data::Bool(trues) => put_bitmap(&mut out, trues)?,
+                Data::Keyword(k) => {
+                    out.extend_from_slice(&(k.terms.len() as u32).to_le_bytes());
+                    for t in &k.terms {
+                        put_bytes(&mut out, t.as_bytes());
+                    }
+                    put_words(&mut out, k.offsets.iter().map(|x| x.to_le_bytes()));
+                    put_words(&mut out, k.codes.iter().map(|x| x.to_le_bytes()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads [`encode`](Self::encode)'s output back; `None` if it is
+    /// malformed, has another row count, or conflicts with `schema`.
+    pub(crate) fn decode(mut b: &[u8], rows: u32, schema: &Schema) -> Option<PayloadStore> {
+        if u32_at(&mut b)? != rows {
+            return None;
+        }
+        let mut store = PayloadStore::with_schema(schema);
+        let mut prev: Option<String> = None;
+        for _ in 0..u32_at(&mut b)? {
+            let name = String::from_utf8(get_bytes(&mut b)?.to_vec()).ok()?;
+            if prev.as_ref().is_some_and(|p| *p >= name) {
+                return None; // names are strictly ascending
+            }
+            let kind = *KINDS.get(usize::from(*take(&mut b, 1)?.first()?))?;
+            let present = get_bitmap(&mut b)?;
+            if present.max().is_some_and(|m| m >= rows) {
+                return None;
+            }
+            // A row past the values would make `get` index out of bounds.
+            let covers =
+                |n: usize| n <= rows as usize && present.max().is_none_or(|m| (m as usize) < n);
+            let data = match kind {
+                Kind::Int => {
+                    Data::Int(get_words(&mut b, i64::from_le_bytes).filter(|v| covers(v.len()))?)
+                }
+                Kind::Float => {
+                    Data::Float(get_words(&mut b, f64::from_le_bytes).filter(|v| covers(v.len()))?)
+                }
+                Kind::Bool => Data::Bool(get_bitmap(&mut b).filter(|t| t.is_subset(&present))?),
+                Kind::Keyword | Kind::KeywordList => {
+                    let mut k = Keywords {
+                        list: kind == Kind::KeywordList,
+                        ..Keywords::default()
+                    };
+                    for code in 0..u32_at(&mut b)? {
+                        let t = String::from_utf8(get_bytes(&mut b)?.to_vec()).ok()?;
+                        if k.dict.insert(t.clone(), code).is_some() {
+                            return None;
+                        }
+                        k.terms.push(t);
+                        k.postings.push(RoaringBitmap::new());
+                    }
+                    k.offsets = get_words(&mut b, u32::from_le_bytes)?;
+                    k.codes = get_words(&mut b, u32::from_le_bytes)?;
+                    if k.offsets.first() != Some(&0)
+                        || k.offsets.last() != Some(&(k.codes.len() as u32))
+                        || !covers(k.offsets.len() - 1)
+                    {
+                        return None;
+                    }
+                    // Rebuild the postings; a row has codes iff it is present
+                    // (exactly one for a scalar keyword).
+                    let mut seen = RoaringBitmap::new();
+                    for (row, w) in (0u32..).zip(k.offsets.windows(2)) {
+                        let codes = k.codes.get(w[0] as usize..w[1] as usize)?;
+                        if codes.len() > 1 && !k.list {
+                            return None;
+                        }
+                        for &c in codes {
+                            // `insert`, not `push`: push rescans a dense
+                            // container for its max (10x slower here).
+                            k.postings.get_mut(c as usize)?.insert(row);
+                        }
+                        if !codes.is_empty() {
+                            seen.insert(row);
+                        }
+                    }
+                    if seen != present {
+                        return None;
+                    }
+                    Data::Keyword(k)
+                }
+            };
+            if store.kind(&name).is_some_and(|k| k != kind) {
+                return None; // the schema declares another type
+            }
+            store.columns.insert(name.clone(), Column { present, data });
+            prev = Some(name);
+        }
+        store.len = store
+            .columns
+            .values()
+            .filter_map(|c| c.present.max())
+            .max()
+            .map_or(0, |m| m + 1);
+        b.is_empty().then_some(store)
+    }
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+fn get_bytes<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let n = u32_at(b)? as usize;
+    take(b, n)
+}
+
+fn put_bitmap(out: &mut Vec<u8>, bits: &RoaringBitmap) -> io::Result<()> {
+    out.extend_from_slice(&(bits.serialized_size() as u32).to_le_bytes());
+    bits.serialize_into(out)
+}
+
+fn get_bitmap(b: &mut &[u8]) -> Option<RoaringBitmap> {
+    let bytes = get_bytes(b)?;
+    let bits = RoaringBitmap::deserialize_from(bytes).ok()?;
+    (bits.serialized_size() == bytes.len()).then_some(bits)
+}
+
+/// `n` fixed-width little-endian words after a `u32` count.
+fn put_words<const W: usize>(out: &mut Vec<u8>, words: impl ExactSizeIterator<Item = [u8; W]>) {
+    out.extend_from_slice(&(words.len() as u32).to_le_bytes());
+    out.reserve(words.len() * W);
+    for w in words {
+        out.extend_from_slice(&w);
+    }
+}
+
+fn get_words<T, const W: usize>(b: &mut &[u8], from: fn([u8; W]) -> T) -> Option<Vec<T>> {
+    let n = u32_at(b)? as usize;
+    let bytes = take(b, n.checked_mul(W)?)?;
+    Some(bytes.as_chunks::<W>().0.iter().map(|&c| from(c)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +524,50 @@ mod tests {
         assert_eq!(s.get(1), None);
         assert_eq!(s.get(4), None);
         assert_eq!(s.get(99), None);
+    }
+
+    #[test]
+    fn columnar_encoding_round_trips_and_rejects_damage() {
+        let schema = Schema::from([("empty".into(), Kind::Bool), ("price".into(), Kind::Float)]);
+        let mut s = PayloadStore::with_schema(&schema);
+        let rows = [
+            json!({"i": -3, "price": 2, "b": true, "k": "red", "t": ["x", "y", "x"], "n": null}),
+            json!(null),
+            json!({"b": false, "k": "réd", "t": [], "i": i64::MIN}),
+            json!({}),
+            json!({"price": 1e300, "t": ["y"], "i": i64::MAX, "k": "red"}),
+        ];
+        for (r, v) in rows.iter().enumerate() {
+            s.insert(r as u32, v).unwrap();
+        }
+        let body = s.encode(7).unwrap();
+        let back = PayloadStore::decode(&body, 7, &schema).unwrap();
+        for r in 0..8 {
+            assert_eq!(back.get(r), s.get(r), "row {r}");
+        }
+        assert_eq!(
+            back.kinds().collect::<Vec<_>>(),
+            s.kinds().collect::<Vec<_>>()
+        );
+        assert_eq!(back.len(), s.len());
+        let k = |st: &PayloadStore| match &st.column("t").unwrap().data {
+            Data::Keyword(k) => (k.dict.clone(), k.postings.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(k(&back), k(&s));
+        assert!(PayloadStore::decode(&body, 6, &schema).is_none());
+        let other = Schema::from([("i".into(), Kind::Float)]);
+        assert!(PayloadStore::decode(&body, 7, &other).is_none());
+        // Malformed bodies (CRC aside) are rejected or decode, never panic.
+        for n in 0..body.len() {
+            assert!(PayloadStore::decode(&body[..n], 7, &schema).is_none());
+        }
+        for i in 0..body.len() {
+            let mut bad = body.clone();
+            bad[i] ^= 0x41;
+            let _ =
+                PayloadStore::decode(&bad, 7, &schema).map(|b| (0..8).for_each(|r| drop(b.get(r))));
+        }
     }
 
     #[test]

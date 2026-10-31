@@ -50,7 +50,9 @@ const MANIFEST_MAGIC: [u8; 8] = *b"NPMANIFS";
 const MANIFEST_VERSION: u32 = 2;
 const MANIFEST_V1: u32 = 1;
 const PAYLOADS_MAGIC: [u8; 8] = *b"NPPAYLDS";
-const PAYLOADS_VERSION: u32 = 1;
+/// v2: columnar binary (v1: one JSON text per row, read-only).
+const PAYLOADS_VERSION: u32 = 2;
+const PAYLOADS_V1: u32 = 1;
 /// Rows the writer adds to the mutable segment per write-lock hold.
 const APPLY_CHUNK: usize = 1024;
 /// WAL records replayed per batch on open (bounds the extra copy).
@@ -1326,7 +1328,7 @@ impl Collection {
         };
         segment::write(&path, &data).map_err(|e| Error::Segment(path, e))?;
         let path = file_path(&self.dir, file, "payloads");
-        let body = encode_payloads(payloads, ids.len() as u32);
+        let body = payloads.encode(ids.len() as u32)?;
         framed::write(&path, PAYLOADS_MAGIC, PAYLOADS_VERSION, &body)
             .map_err(|e| Error::File(path, e))
     }
@@ -1446,10 +1448,7 @@ fn load_segment(dir: &Path, cfg: &Config, file: u64, dead: &RoaringBitmap) -> Re
         return Err(corrupt(&path, "manifest tombstones a row past the end"));
     }
     let path = file_path(dir, file, "payloads");
-    let body = framed::read(&path, PAYLOADS_MAGIC, PAYLOADS_VERSION)
-        .map_err(|e| Error::File(path.clone(), e))?;
-    let payloads = decode_payloads(&body, seg.ids.len() as u32, &cfg.schema)
-        .ok_or_else(|| corrupt(&path, "bad payloads"))?;
+    let payloads = read_payloads(&path, seg.ids.len() as u32, &cfg.schema)?;
     Ok(Seg { payloads, ..seg })
 }
 
@@ -1566,21 +1565,22 @@ fn decode_manifest(mut b: &[u8], version: u32) -> Option<Manifest> {
     b.is_empty().then_some(Manifest { covered, segs })
 }
 
-// ponytail: payloads round-trip as JSON text per row, re-parsed on open;
-// a columnar section would load faster if segment opens show up in profiles.
-fn encode_payloads(store: &PayloadStore, rows: u32) -> Vec<u8> {
-    let mut out = rows.to_le_bytes().to_vec();
-    for row in 0..rows {
-        let json = store
-            .get(row)
-            .map_or_else(String::new, |m| Value::Object(m).to_string());
-        out.extend_from_slice(&(json.len() as u32).to_le_bytes());
-        out.extend_from_slice(json.as_bytes());
-    }
-    out
+/// Reads a v2 (columnar) or v1 (JSON per row) payload sidecar.
+fn read_payloads(path: &Path, rows: u32, schema: &Schema) -> Result<PayloadStore> {
+    let read =
+        |v| framed::read(path, PAYLOADS_MAGIC, v).map_err(|e| Error::File(path.to_path_buf(), e));
+    let store = match framed::read(path, PAYLOADS_MAGIC, PAYLOADS_VERSION) {
+        Ok(body) => PayloadStore::decode(&body, rows, schema),
+        Err(framed::Error::UnsupportedVersion {
+            found: PAYLOADS_V1, ..
+        }) => decode_payloads_v1(&read(PAYLOADS_V1)?, rows, schema),
+        Err(e) => return Err(Error::File(path.to_path_buf(), e)),
+    };
+    store.ok_or_else(|| corrupt(path, "bad payloads"))
 }
 
-fn decode_payloads(mut b: &[u8], rows: u32, schema: &Schema) -> Option<PayloadStore> {
+/// v1: each row's JSON re-inserted into a fresh store.
+fn decode_payloads_v1(mut b: &[u8], rows: u32, schema: &Schema) -> Option<PayloadStore> {
     if u32_at(&mut b)? != rows {
         return None;
     }
@@ -1596,13 +1596,13 @@ fn decode_payloads(mut b: &[u8], rows: u32, schema: &Schema) -> Option<PayloadSt
     b.is_empty().then_some(store)
 }
 
-fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+pub(crate) fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     let (head, rest) = b.split_at_checked(n)?;
     *b = rest;
     Some(head)
 }
 
-fn u32_at(b: &mut &[u8]) -> Option<u32> {
+pub(crate) fn u32_at(b: &mut &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(take(b, 4)?.try_into().ok()?))
 }
 
@@ -2095,17 +2095,31 @@ mod tests {
         for (r, v) in rows.iter().enumerate() {
             store.insert(r as u32, v).unwrap();
         }
+        // Payloads: v1 (JSON per row) still reads; v2 (columnar) is what's
+        // written now, byte for byte.
         let p = dir.0.join("x.payloads");
-        let body = encode_payloads(&store, 3);
+        let schema = Schema::new();
+        let check = |back: PayloadStore| {
+            for (r, v) in rows.iter().enumerate() {
+                assert_eq!(back.get(r as u32), v.as_object().cloned());
+            }
+        };
+        fs::write(&p, include_bytes!("../testdata/payloads-v1")).unwrap();
+        check(read_payloads(&p, 3, &schema).unwrap());
+        assert!(read_payloads(&p, 4, &schema).is_err());
+        let body = store.encode(3).unwrap();
         framed::write(&p, PAYLOADS_MAGIC, PAYLOADS_VERSION, &body).unwrap();
-        let fixture: &[u8] = include_bytes!("../testdata/payloads-v1");
+        let fixture: &[u8] = include_bytes!("../testdata/payloads-v2");
         assert_eq!(fs::read(&p).unwrap(), fixture);
-        let body = framed::read(&p, PAYLOADS_MAGIC, PAYLOADS_VERSION).unwrap();
-        let back = decode_payloads(&body, 3, &Schema::new()).unwrap();
-        for (r, v) in rows.iter().enumerate() {
-            assert_eq!(back.get(r as u32), v.as_object().cloned());
-        }
-        assert!(decode_payloads(&body, 4, &Schema::new()).is_none());
+        check(read_payloads(&p, 3, &schema).unwrap());
+        assert!(read_payloads(&p, 4, &schema).is_err());
+        // A flipped bit or a cut file is an error, not a panic.
+        let mut bad = fixture.to_vec();
+        bad[30] ^= 1;
+        fs::write(&p, &bad).unwrap();
+        assert!(read_payloads(&p, 3, &schema).is_err());
+        fs::write(&p, &fixture[..fixture.len() - 1]).unwrap();
+        assert!(read_payloads(&p, 3, &schema).is_err());
     }
 
     /// Review fixes: configs that could never merge are rejected, cosine
