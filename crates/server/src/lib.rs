@@ -2,7 +2,9 @@
 //! docs/api.md. Every engine call runs on tokio's blocking pool, so a
 //! WAL fsync or a long search never stalls the async workers.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -23,9 +25,19 @@ pub const MAX_BODY: usize = 256 << 20;
 /// Largest `k`, `ef`, `nprobe` or `rerank` a search accepts.
 pub const MAX_K: usize = 10_000;
 
+/// Upserts are refused (503) while the process's phys_footprint is above
+/// this many bytes; 0 = no limit. Deletes, searches and gets still run.
+static MEMORY_LIMIT: AtomicU64 = AtomicU64::new(0);
+static WRITES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_memory_limit(bytes: u64) {
+    MEMORY_LIMIT.store(bytes, Ordering::Relaxed);
+}
+
 pub fn router(db: Arc<Db>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/collections", get(list))
         .route(
             "/collections/{name}",
@@ -125,6 +137,134 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// 503 if an upsert would grow memory past `--memory-limit-mib`.
+fn check_memory() -> ApiResult<()> {
+    let limit = MEMORY_LIMIT.load(Ordering::Relaxed);
+    if limit == 0 {
+        return Ok(());
+    }
+    let now = storage::sys::phys_footprint()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if now <= limit {
+        return Ok(());
+    }
+    WRITES_REFUSED.fetch_add(1, Ordering::Relaxed);
+    Err(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "memory limit: phys_footprint {} MiB > {} MiB; upserts are refused until it drops \
+             (deletes and compaction free memory)",
+            now >> 20,
+            limit >> 20
+        ),
+    ))
+}
+
+/// Prometheus text format (docs/api.md): memory by collection and
+/// component, points and segments, the process's phys_footprint.
+async fn metrics(State(db): State<Arc<Db>>) -> ApiResult<Response> {
+    let text = blocking(move || {
+        let mut out = String::new();
+        let colls = db.list();
+        let gauge = |out: &mut String, name: &str, help: &str| {
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
+        };
+        gauge(
+            &mut out,
+            "nearpoint_memory_bytes",
+            "Estimated RAM by collection and component.",
+        );
+        let mut mapped = String::new();
+        for (n, c) in &colls {
+            let m = c.memory();
+            for (part, v) in [
+                ("id_map", m.id_map),
+                ("ids", m.ids),
+                ("index", m.index),
+                ("payloads", m.payloads),
+                ("mutable", m.mutable),
+            ] {
+                let _ = writeln!(
+                    out,
+                    "nearpoint_memory_bytes{{collection=\"{n}\",component=\"{part}\"}} {v}"
+                );
+            }
+            let _ = writeln!(
+                mapped,
+                "nearpoint_mapped_bytes{{collection=\"{n}\"}} {}",
+                m.mapped
+            );
+        }
+        gauge(
+            &mut out,
+            "nearpoint_mapped_bytes",
+            "Segment file bytes mapped (page cache, not phys_footprint).",
+        );
+        out.push_str(&mapped);
+        gauge(&mut out, "nearpoint_points", "Live points by collection.");
+        for (n, c) in &colls {
+            let _ = writeln!(out, "nearpoint_points{{collection=\"{n}\"}} {}", c.len());
+        }
+        gauge(
+            &mut out,
+            "nearpoint_segments",
+            "Segments by collection and index.",
+        );
+        for (n, c) in &colls {
+            let mut count = std::collections::BTreeMap::<&str, usize>::new();
+            for s in c.segments() {
+                *count.entry(s.index).or_default() += 1;
+            }
+            for (index, k) in count {
+                let _ = writeln!(
+                    out,
+                    "nearpoint_segments{{collection=\"{n}\",index=\"{index}\"}} {k}"
+                );
+            }
+        }
+        let peak = storage::sys::peak_memory()
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let now = storage::sys::phys_footprint()
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for (name, help, v) in [
+            (
+                "nearpoint_phys_footprint_bytes",
+                "Process phys_footprint now.",
+                now,
+            ),
+            (
+                "nearpoint_phys_footprint_peak_bytes",
+                "Process phys_footprint high-water mark.",
+                peak.phys_footprint,
+            ),
+            (
+                "nearpoint_memory_limit_bytes",
+                "--memory-limit-mib in bytes (0: none).",
+                MEMORY_LIMIT.load(Ordering::Relaxed),
+            ),
+        ] {
+            gauge(&mut out, name, help);
+            let _ = writeln!(out, "{name} {v}");
+        }
+        let name = "nearpoint_writes_refused_total";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Upserts refused by the memory limit.\n# TYPE {name} counter\n{name} {}",
+            WRITES_REFUSED.load(Ordering::Relaxed)
+        );
+        Ok(out)
+    })
+    .await?;
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        text,
+    )
+        .into_response())
+}
+
 async fn list(State(db): State<Arc<Db>>) -> Json<Value> {
     let all: Vec<Value> = db.list().iter().map(|(n, c)| describe(n, c)).collect();
     Json(json!({"collections": all}))
@@ -188,6 +328,7 @@ async fn upsert(
     Json(req): Json<Points>,
 ) -> ApiResult<Json<Value>> {
     let c = collection(&db, &name)?;
+    check_memory()?;
     blocking(move || {
         let dim = c.config().dim;
         let n = req.points.len();
@@ -219,6 +360,7 @@ async fn bulk(
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let c = collection(&db, &name)?;
+    check_memory()?;
     blocking(move || {
         let (ids, vectors, payloads) = decode_bulk(&body, c.config().dim).map_err(bad)?;
         c.upsert_batch(&ids, &vectors, &payloads)?;
@@ -431,5 +573,51 @@ mod tests {
         let mut huge = block(&[], 2, &[], "");
         huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_bulk(&huge, 2).is_err());
+    }
+
+    /// `/metrics` reports every component, and upserts get a 503 (counted)
+    /// while phys_footprint is over the limit. The only test here that
+    /// touches the process-wide limit.
+    #[tokio::test]
+    async fn metrics_and_memory_limit() {
+        let dir = std::env::temp_dir().join(format!("np-metrics-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Arc::new(Db::open(&dir, storage::wal::SyncPolicy::Batch).unwrap());
+        let cfg: Config = serde_json::from_value(json!({"dim": 2, "metric": "l2"})).unwrap();
+        db.create("m", cfg).unwrap();
+        let points = |id| {
+            let p = json!({"points": [{"id": id, "vector": [1.0, 2.0]}]});
+            Json(serde_json::from_value::<Points>(p).unwrap())
+        };
+        let up = |id| upsert(State(Arc::clone(&db)), Path("m".into()), points(id));
+        assert_eq!(up(1).await.unwrap().0["upserted"], 1);
+
+        set_memory_limit(1);
+        let e = up(2).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(e.1.starts_with("memory limit"), "{}", e.1);
+        set_memory_limit(0);
+        assert_eq!(up(2).await.unwrap().0["upserted"], 1);
+
+        let body = metrics(State(Arc::clone(&db))).await.unwrap().into_body();
+        let text = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = std::str::from_utf8(&text).unwrap();
+        for line in [
+            "nearpoint_points{collection=\"m\"} 2",
+            "nearpoint_segments{collection=\"m\",index=\"mutable\"} 1",
+            "nearpoint_memory_bytes{collection=\"m\",component=\"id_map\"} ",
+            "nearpoint_memory_bytes{collection=\"m\",component=\"mutable\"} ",
+            "nearpoint_mapped_bytes{collection=\"m\"} 0",
+            "nearpoint_memory_limit_bytes 0",
+            "nearpoint_writes_refused_total 1",
+            "# TYPE nearpoint_phys_footprint_bytes gauge",
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with(line)),
+                "missing {line}:\n{text}"
+            );
+        }
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

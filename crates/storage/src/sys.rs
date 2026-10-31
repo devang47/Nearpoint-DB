@@ -26,10 +26,26 @@ pub fn peak_memory() -> io::Result<PeakMemory> {
         ru.assume_init()
     };
 
+    Ok(PeakMemory {
+        rss: ru.ru_maxrss as u64, // bytes on macOS (KiB on Linux)
+        phys_footprint: rusage_info()?.ri_lifetime_max_phys_footprint,
+    })
+}
+
+/// This process's phys_footprint now, in bytes (what the 10 GB budget and
+/// `--memory-limit-mib` are measured against).
+#[cfg(target_os = "macos")]
+pub fn phys_footprint() -> io::Result<u64> {
+    Ok(rusage_info()?.ri_phys_footprint)
+}
+
+#[cfg(target_os = "macos")]
+fn rusage_info() -> io::Result<libc::rusage_info_v4> {
     let mut info = MaybeUninit::<libc::rusage_info_v4>::uninit();
-    // SAFETY: as above; RUSAGE_INFO_V4 tells the kernel the buffer is a
-    // `rusage_info_v4`, which is exactly what `info` holds.
-    let info = unsafe {
+    // SAFETY: RUSAGE_INFO_V4 tells the kernel the buffer is a
+    // `rusage_info_v4`, which is exactly what `info` holds; on success it
+    // has written all of it.
+    unsafe {
         if libc::proc_pid_rusage(
             libc::getpid(),
             libc::RUSAGE_INFO_V4,
@@ -38,13 +54,8 @@ pub fn peak_memory() -> io::Result<PeakMemory> {
         {
             return Err(io::Error::last_os_error());
         }
-        info.assume_init()
-    };
-
-    Ok(PeakMemory {
-        rss: ru.ru_maxrss as u64, // bytes on macOS (KiB on Linux)
-        phys_footprint: info.ri_lifetime_max_phys_footprint,
-    })
+        Ok(info.assume_init())
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +72,7 @@ mod tests {
         let after = peak_memory().unwrap();
         assert!(after.phys_footprint >= before.phys_footprint.max(256 * MB));
         assert!(after.rss >= 256 * MB);
+        let now = phys_footprint().unwrap();
+        assert!(now >= 256 * MB && now <= after.phys_footprint);
     }
 }

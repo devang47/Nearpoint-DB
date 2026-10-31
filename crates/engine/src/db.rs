@@ -406,13 +406,21 @@ mod tests {
         assert_eq!((cfg.dim, cfg.hnsw.seed), (4, 7));
         assert_eq!(cfg.schema["tag"], crate::Kind::Keyword);
         assert_eq!(
-            (cfg.seal_rows, cfg.ivf_rows, cfg.max_merge_rows),
-            (100_000, 1_000_000, 4_000_000)
+            (
+                cfg.seal_rows,
+                cfg.ivf_rows,
+                cfg.max_merge_rows,
+                cfg.exact_vectors
+            ),
+            (100_000, 1_000_000, 4_000_000, true)
         );
         // New collections write the segment keys (still CONFIG v1: JSON
         // keys are optional, so this is a compatible addition).
         let v = serde_json::to_value(cfg).unwrap();
-        assert_eq!(v["seal_rows"], 100_000);
+        assert_eq!(
+            (&v["seal_rows"], &v["exact_vectors"]),
+            (&json!(100_000), &json!(true))
+        );
         assert!(
             serde_json::from_value::<Config>(json!({"dim": 4, "metric": "l2", "ivf_rows": 10}))
                 .unwrap()

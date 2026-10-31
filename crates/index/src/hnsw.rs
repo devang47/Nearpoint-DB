@@ -122,6 +122,16 @@ impl Hnsw {
         &self.vectors
     }
 
+    /// Bytes held in RAM: vectors, levels and both layers' lists.
+    pub fn heap_bytes(&self) -> usize {
+        let upper: usize = self.upper.iter().map(|u| 16 + 4 * u.len()).sum();
+        4 * self.vectors.capacity()
+            + self.levels.capacity()
+            + 4 * self.layer0.capacity()
+            + 24 * self.upper.capacity()
+            + upper
+    }
+
     /// The index blob: config, levels, every neighbour list and the entry
     /// point, but not the vectors (they live in the segment's vector
     /// section). Lists are written at full capacity, `[count, ids...]`

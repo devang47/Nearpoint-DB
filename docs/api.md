@@ -16,8 +16,10 @@ cargo run --release -p server -- --data-dir ~/data/Nearpoint/db
 | `--bind` | `NEARPOINT_BIND` | `127.0.0.1:7700` | listen address |
 | `--sync` | `NEARPOINT_SYNC` | `batch` | WAL durability: `always`, `batch` (group commit) or `<n>ms` (fsync every n ms; a power loss can lose that window) |
 | `--build-threads` | `NEARPOINT_BUILD_THREADS` | `0` | threads for background index builds and compaction; 0 = half the cores, so builds don't starve searches |
+| `--memory-limit-mib` | `NEARPOINT_MEMORY_LIMIT_MIB` | `0` | upserts get `503` while the process's phys_footprint is above this many MiB (0 = no limit); searches, gets and deletes still run (ADR 0013) |
 
-A background thread seals, rebuilds and compacts segments (ADR 0012):
+A background thread per collection seals, rebuilds and compacts
+segments (ADR 0012); one rewrite runs at a time across collections:
 searches never wait for it, writes wait only for its short publish step.
 Failures are logged at `error` and retried.
 
@@ -55,12 +57,29 @@ Errors from Nearpoint are JSON: `{"error": "<message>"}`.
 | 415, 422, 400 | body isn't JSON, has the wrong shape or an unknown field (plain text from the framework, not JSON) |
 | 500 | I/O error or corrupt data (the server logs it) |
 | 503 | **write outcome unknown**: the WAL failed with this write in flight (ADR 0007). It may or may not be durable and was not applied. Every later write to that collection gets 503 until the server restarts; after the restart, read the points back to learn the outcome. Never retried as a success. |
+| 503 | `memory limit: ...`: an upsert while phys_footprint is above `--memory-limit-mib`; nothing was written, retry later |
 
 ## Endpoints
 
 ### `GET /health`
 
 `200 {"status": "ok"}`.
+
+### `GET /metrics`
+
+`200`, Prometheus text format (`text/plain; version=0.0.4`), all gauges
+except the counter:
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `nearpoint_memory_bytes` | `collection`, `component` | estimated RAM: `id_map` (id → row), `ids` (sealed row → id), `index` (HNSW graphs and vectors, IVF-PQ lists and quantizers), `payloads` (sealed payload columns), `mutable` (in-memory segment and its WAL copy, from its row count) |
+| `nearpoint_mapped_bytes` | `collection` | sealed segment file bytes mapped (page cache, not phys_footprint) |
+| `nearpoint_points` | `collection` | live points |
+| `nearpoint_segments` | `collection`, `index` | segments per index type (`mutable`, `hnsw`, `ivf_pq`) |
+| `nearpoint_phys_footprint_bytes` | | process phys_footprint now (what `--memory-limit-mib` and the 10 GB budget use) |
+| `nearpoint_phys_footprint_peak_bytes` | | its high-water mark |
+| `nearpoint_memory_limit_bytes` | | `--memory-limit-mib` in bytes, 0 if none |
+| `nearpoint_writes_refused_total` | | upserts refused by the memory limit (counter) |
 
 ### `PUT /collections/{name}`
 
@@ -87,6 +106,7 @@ Creates a collection. `name`: 1–64 characters of `A-Z a-z 0-9 _ -`.
 | `seal_rows` | no | the in-memory segment is sealed to disk once it has this many rows (default 100,000, ≥ 1, ≤ half of `max_merge_rows`, and of `ivf_rows` for `inner_product`, or fresh segments could never merge) |
 | `ivf_rows` | no | sealed segments with at least this many rows are rebuilt as IVF-PQ, for `l2` and `cosine` (default 1,000,000, ≥ 1,024). `inner_product` collections stay HNSW and merge only below this size |
 | `max_merge_rows` | no | compaction never merges segments into one bigger than this (default 4,000,000, ≥ 1); also capped at 2 GiB of f32 vectors (4M rows at dim 128, 512k at dim 1024) |
+| `exact_vectors` | no | `true` (default): IVF-PQ segments keep each row's exact f32 vector on disk (4·dim bytes per row). `false`: they keep only the int8 re-rank code (dim bytes per row), and `get` / `with_vector` return it decoded (within half a quantization step per component; the segment's `(max − min) / 255 / 2`). Search is the same either way. For collections too big for f32 on disk (ADR 0013) |
 
 `201` with the collection description (below). `409` if it exists, `400`
 if invalid.

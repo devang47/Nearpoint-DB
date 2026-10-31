@@ -37,6 +37,7 @@ fn config() -> Config {
         seal_rows: 16,
         ivf_rows: 1024,
         max_merge_rows: 1_000_000,
+        exact_vectors: true,
         sync: SyncPolicy::Batch,
     }
 }

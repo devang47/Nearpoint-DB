@@ -23,6 +23,7 @@
 //! Background work (`maintain`: seal, build, compact) runs one step at a
 //! time under the `maint` mutex and takes the writer lock only to publish.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
@@ -97,6 +98,11 @@ pub struct Config {
     /// Compaction never merges segments into one bigger than this.
     #[serde(default = "default_max_merge_rows")]
     pub max_merge_rows: u32,
+    /// IVF-PQ segments keep the exact f32 vectors in their file (4·dim
+    /// bytes per row on disk). `false`: only their int8 re-rank codes, and
+    /// `get`/`with_vector` return those decoded (ADR 0013).
+    #[serde(default = "default_exact_vectors")]
+    pub exact_vectors: bool,
     /// Not persisted: the server picks it at startup.
     #[serde(skip)]
     pub sync: SyncPolicy,
@@ -146,6 +152,10 @@ fn default_max_merge_rows() -> u32 {
     4_000_000
 }
 
+fn default_exact_vectors() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Metric", rename_all = "snake_case")]
 enum MetricDef {
@@ -186,6 +196,10 @@ pub fn set_build_threads(n: usize) {
 
 static BUILD_THREADS: AtomicUsize = AtomicUsize::new(0);
 static BUILD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+/// One rewrite at a time across collections: each holds an f32 copy of
+/// its rows (up to `MERGE_BYTES`) plus the index it builds, and two at
+/// once could break the RAM budget. Seals don't take it.
+static REWRITE: Mutex<()> = Mutex::new(());
 
 fn build_pool() -> Result<&'static rayon::ThreadPool> {
     if let Some(p) = BUILD_POOL.get() {
@@ -288,6 +302,26 @@ pub struct SegmentInfo {
     pub dead: u64,
 }
 
+/// Approximate RAM by component (`Collection::memory`), in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Memory {
+    /// The id -> (segment, row) map.
+    pub id_map: u64,
+    /// Sealed segments' row -> id arrays.
+    pub ids: u64,
+    /// Sealed segments' index structures: HNSW vectors and graphs, IVF-PQ
+    /// lists and quantizers (not their SQ codes, which stay mapped).
+    pub index: u64,
+    /// Sealed segments' payload columns.
+    pub payloads: u64,
+    /// The mutable segment, estimated from its rows (vectors, graph, ids;
+    /// the WAL holds a copy of the same rows).
+    pub mutable: u64,
+    /// Sealed segment files mapped: page cache the OS can drop, not
+    /// counted in phys_footprint.
+    pub mapped: u64,
+}
+
 /// A segment's index. IVF-PQ keeps its f32 vectors in the mapped file
 /// (not in RAM): `get` stays exact and Phase 8 can re-rank from them.
 /// `open` doesn't check that section's CRC (it can be GBs); the third
@@ -296,7 +330,7 @@ pub struct SegmentInfo {
 /// are verified on load, which copies them anyway.
 enum SegIndex {
     Hnsw(Hnsw),
-    IvfPq(IvfPq, Segment, OnceLock<bool>),
+    IvfPq(IvfPq, Arc<Segment>, OnceLock<bool>),
 }
 
 /// One segment's data. A sealed one never changes; the mutable one only
@@ -324,13 +358,18 @@ impl Seg {
         }
     }
 
-    /// Row `row`'s vector in stored form.
-    fn vector(&self, dim: usize, row: u32) -> Option<&[f32]> {
+    /// Row `row`'s vector in stored form: exact, or decoded from its int8
+    /// code for an IVF-PQ segment written without f32 vectors.
+    fn vector(&self, dim: usize, row: u32) -> Option<Cow<'_, [f32]>> {
         let all = match &self.index {
             SegIndex::Hnsw(h) => h.vectors(),
+            SegIndex::IvfPq(i, file, _) if file.vectors().is_empty() => {
+                return i.decode(row).map(Cow::Owned);
+            }
             SegIndex::IvfPq(_, file, _) => file.vectors(),
         };
         all.get(row as usize * dim..(row as usize + 1) * dim)
+            .map(Cow::Borrowed)
     }
 }
 
@@ -618,7 +657,10 @@ impl Collection {
         let &(key, row) = live.get(&id)?;
         let snap = self.snapshot();
         let seg = read(&snap.segs[snap.pos(key)?].seg);
-        Some((seg.vector(self.cfg.dim, row)?.to_vec(), payload(&seg, row)))
+        Some((
+            seg.vector(self.cfg.dim, row)?.into_owned(),
+            payload(&seg, row),
+        ))
     }
 
     /// Live ids.
@@ -651,6 +693,37 @@ impl Collection {
                 dead: v.dead.len(),
             })
             .collect()
+    }
+
+    /// What this collection holds in RAM, by component (estimates).
+    pub fn memory(&self) -> Memory {
+        let snap = self.snapshot();
+        let last = snap.segs.len() - 1;
+        // hashbrown: (u64, (u32, u32)) = 16 bytes plus 1 control byte per
+        // bucket, buckets = capacity * 8 / 7.
+        let id_map = read(&self.live).capacity() as u64 * 17 * 8 / 7;
+        let (d, m) = (self.cfg.dim as u64, self.cfg.hnsw.m as u64);
+        let mut mem = Memory {
+            id_map,
+            // Its lock is skipped: the writer holds it.
+            mutable: u64::from(snap.segs[last].rows) * (4 * d + 4 * (1 + 2 * m) + 8 + 4 * d),
+            ..Memory::default()
+        };
+        for v in &snap.segs[..last] {
+            let seg = read(&v.seg);
+            mem.ids += 8 * seg.ids.capacity() as u64;
+            mem.payloads += seg.payloads.heap_bytes() as u64;
+            match &seg.index {
+                SegIndex::Hnsw(h) => mem.index += h.heap_bytes() as u64,
+                SegIndex::IvfPq(i, file, _) => {
+                    mem.index += i.heap_bytes() as u64;
+                    mem.mapped += (4 * file.vectors().len()
+                        + 8 * file.ids().len()
+                        + file.index_blob().len()) as u64;
+                }
+            }
+        }
+        mem
     }
 
     /// The `k` nearest live ids matching `opts.filter`, nearest first.
@@ -729,7 +802,7 @@ impl Collection {
                     payload: opts.with_payload.then(|| payload(&seg, row)),
                     vector: opts
                         .with_vector
-                        .then(|| seg.vector(self.cfg.dim, row).map(<[f32]>::to_vec))
+                        .then(|| seg.vector(self.cfg.dim, row).map(Cow::into_owned))
                         .flatten(),
                 }
             })
@@ -1055,6 +1128,7 @@ impl Collection {
         // A poisoned WAL fails the publish anyway: don't build (and leave
         // an orphan file pair behind) on every retry.
         self.wal.sync()?;
+        let _one = lock(&REWRITE);
         let t = Instant::now();
         let d = self.cfg.dim;
         let (mut ids, mut vectors, mut src) = (Vec::new(), Vec::new(), Vec::new());
@@ -1082,7 +1156,25 @@ impl Collection {
                     None => (ivf.empty_clone(), 0),
                 })
             }
-            SegIndex::Hnsw(_) => None,
+            // No IVF-PQ input: borrow the quantizers of the collection's
+            // biggest IVF-PQ segment (same data), so a big seal doesn't
+            // retrain from scratch (90-110 s at 1-1.6M rows, during which
+            // seals wait and the mutable segment grows).
+            SegIndex::Hnsw(_) => snap.segs[..snap.segs.len() - 1]
+                .iter()
+                .filter_map(|v| match &read(&v.seg).index {
+                    SegIndex::IvfPq(ivf, ..) => Some((v.rows, ivf.empty_clone())),
+                    SegIndex::Hnsw(_) => None,
+                })
+                .max_by_key(|(rows, _)| *rows)
+                .map(|(_, ivf)| (ivf, 0)),
+        };
+        // Without exact_vectors the kept rows' f32 would only be decoded
+        // codes that nothing reads (they aren't re-encoded or written): up
+        // to 2 GiB per merge. `build` decodes them back if it must.
+        let from = match &template {
+            Some((_, done)) if !self.cfg.exact_vectors => *done,
+            _ => 0,
         };
         let mut kinds = self.cfg.schema.clone();
         for seg in &segs {
@@ -1092,14 +1184,16 @@ impl Collection {
         for (&i, seg) in inputs.iter().zip(&segs) {
             let v = &snap.segs[i];
             for row in (0..v.rows).filter(|&r| !v.dead.contains(r)) {
-                let vector = seg
-                    .vector(d, row)
-                    .ok_or(Error::Invalid("segment row has no vector"))?;
+                if ids.len() >= from {
+                    let vector = seg
+                        .vector(d, row)
+                        .ok_or(Error::Invalid("segment row has no vector"))?;
+                    vectors.extend_from_slice(&vector);
+                }
                 if let Some(p) = seg.payloads.get(row) {
                     payloads.insert(ids.len() as u32, &Value::Object(p))?;
                 }
                 ids.push(seg.ids[row as usize]);
-                vectors.extend_from_slice(vector);
                 src.push((v.key, row));
             }
         }
@@ -1110,7 +1204,7 @@ impl Collection {
         let built = if ids.is_empty() {
             None
         } else {
-            Some(self.build(file, ids, vectors, payloads, template)?)
+            Some(self.build(file, ids, vectors, payloads, template, from)?)
         };
         crash_point(4)?;
         let built_at = t.elapsed();
@@ -1181,18 +1275,28 @@ impl Collection {
     }
 
     /// Builds a segment's index on the build pool and writes its files.
-    /// IVF-PQ from `ivf_rows` rows up (L2 and cosine), HNSW below.
+    /// IVF-PQ from `ivf_rows` rows up (L2 and cosine), HNSW below; with
+    /// quantizers to reuse (`template`), from the first tier merge
+    /// (`MERGE_FACTOR` seals) up: encoding then beats building a graph
+    /// from scratch (4 x 140k rows: 75 s as HNSW, the seals' wait).
+    /// `vectors` holds rows `from..`: rows `..from` are the template's
+    /// first rows, decoded only if a fresh build needs them.
     fn build(
         &self,
         file: u64,
         ids: Vec<u64>,
-        vectors: Vec<f32>,
+        mut vectors: Vec<f32>,
         payloads: PayloadStore,
-        template: Option<(IvfPq, usize)>,
+        mut template: Option<(IvfPq, usize)>,
+        mut from: usize,
     ) -> Result<Seg> {
         let (d, n) = (self.cfg.dim, ids.len());
         let pool = build_pool()?;
-        if self.ivf_allowed() && n >= self.cfg.ivf_rows as usize {
+        let mut ivf_from = u64::from(self.cfg.ivf_rows);
+        if template.is_some() {
+            ivf_from = ivf_from.min(MERGE_FACTOR * u64::from(self.cfg.seal_rows));
+        }
+        if self.ivf_allowed() && n as u64 >= ivf_from {
             let fresh = ivf_config(d, n, self.cfg.hnsw.seed);
             // Retraining (k-means + PQ) dominates a rebuild; under steady
             // deletes every big segment is rewritten every few minutes, and
@@ -1201,21 +1305,37 @@ impl Collection {
             // them (nlist < half of a fresh one's).
             // ponytail: no retrain on distribution drift; retrain every Nth
             // rewrite, or on a recall probe, if real data drifts.
-            let (mut index, done) = match template {
+            let (mut index, done) = match template.take() {
                 Some((t, done)) if t.config().nlist * 2 >= fresh.nlist => (t, done),
-                _ => (IvfPq::new(d, self.cfg.metric, fresh)?, 0),
+                t => {
+                    if let Some((t, _)) = &t {
+                        vectors = restore(t, from, vectors)?;
+                        from = 0;
+                    }
+                    (IvfPq::new(d, self.cfg.metric, fresh)?, 0)
+                }
             };
             let t = Instant::now();
-            match pool.install(|| index.add(&vectors[done * d..])) {
+            match pool.install(|| index.add(&vectors[(done - from) * d..])) {
                 Ok(_) => {
                     let encoded = t.elapsed();
-                    // The f32 vectors go in the file (element type 0), not in RAM.
+                    // The f32 vectors go in the file (element type 0), not in
+                    // RAM; or nowhere (element type 1) without exact_vectors.
                     let blob = index.to_bytes();
-                    self.write_files(file, &vectors, &ids, &payloads, BlobKind::IvfPq, &blob)?;
-                    drop((vectors, blob));
+                    let keep = if self.cfg.exact_vectors {
+                        &vectors[..]
+                    } else {
+                        &[]
+                    };
+                    self.write_files(file, keep, &ids, &payloads, BlobKind::IvfPq, &blob)?;
+                    drop((vectors, blob, index));
                     let written = t.elapsed();
+                    // Reloaded from the file, so its SQ codes are paged in
+                    // from there rather than held in RAM.
                     let path = file_path(&self.dir, file, "seg");
-                    let mapped = Segment::open(&path).map_err(|e| Error::Segment(path, e))?;
+                    let mapped =
+                        Arc::new(Segment::open(&path).map_err(|e| Error::Segment(path, e))?);
+                    let index = IvfPq::from_shared(Arc::new(Blob(Arc::clone(&mapped))))?;
                     tracing::info!(
                         rows = n,
                         encoded = n - done,
@@ -1232,8 +1352,15 @@ impl Collection {
                     });
                 }
                 // Data IVF-PQ can't train on stays searchable as HNSW.
-                Err(e) => tracing::warn!("IVF-PQ build failed ({e}); building HNSW instead"),
+                Err(e) => {
+                    tracing::warn!("IVF-PQ build failed ({e}); building HNSW instead");
+                    vectors = restore(&index, from, vectors)?;
+                    from = 0;
+                }
             }
+        }
+        if let Some((t, _)) = &template {
+            vectors = restore(t, from, vectors)?;
         }
         let t = Instant::now();
         let mut index = Hnsw::new(d, self.cfg.metric, self.cfg.hnsw);
@@ -1460,6 +1587,29 @@ fn pq_m(dim: usize) -> usize {
         .unwrap_or(1)
 }
 
+/// `vectors` with rows `..from` decoded from `t`'s codes put back in front.
+fn restore(t: &IvfPq, from: usize, vectors: Vec<f32>) -> Result<Vec<f32>> {
+    if from == 0 {
+        return Ok(vectors);
+    }
+    let mut all = Vec::with_capacity(from * t.dim() + vectors.len());
+    for r in 0..from as u32 {
+        all.extend(t.decode(r).ok_or(Error::Invalid("kept row has no code"))?);
+    }
+    all.extend_from_slice(&vectors);
+    Ok(all)
+}
+
+/// A mapped segment's index blob, which an IVF-PQ index reads its SQ codes
+/// from in place.
+struct Blob(Arc<Segment>);
+
+impl AsRef<[u8]> for Blob {
+    fn as_ref(&self) -> &[u8] {
+        self.0.index_blob()
+    }
+}
+
 fn new_mutable(cfg: &Config, key: u32) -> View {
     let seg = Seg {
         index: SegIndex::Hnsw(Hnsw::new(cfg.dim, cfg.metric, cfg.hnsw)),
@@ -1484,7 +1634,8 @@ fn load_segment(dir: &Path, cfg: &Config, file: u64, dead: &RoaringBitmap) -> Re
         ));
     }
     let ids = s.ids().to_vec();
-    if s.vectors().len() != ids.len() * cfg.dim {
+    let no_vectors = s.vectors().is_empty() && s.blob_kind() == BlobKind::IvfPq;
+    if s.vectors().len() != ids.len() * cfg.dim && !no_vectors {
         return Err(corrupt(&path, "segment has no f32 vectors"));
     }
     let index = match s.blob_kind() {
@@ -1495,7 +1646,11 @@ fn load_segment(dir: &Path, cfg: &Config, file: u64, dead: &RoaringBitmap) -> Re
             SegIndex::Hnsw(Hnsw::from_bytes(s.index_blob(), s.vectors().to_vec())?)
         }
         // Stays mapped: `maintain` verifies it later (`verify_one`).
-        BlobKind::IvfPq => SegIndex::IvfPq(IvfPq::from_bytes(s.index_blob())?, s, OnceLock::new()),
+        BlobKind::IvfPq => {
+            let s = Arc::new(s);
+            let index = IvfPq::from_shared(Arc::new(Blob(Arc::clone(&s))))?;
+            SegIndex::IvfPq(index, s, OnceLock::new())
+        }
         BlobKind::Flat => return Err(corrupt(&path, "flat segments are not used")),
     };
     let seg = Seg {
@@ -1741,6 +1896,7 @@ mod tests {
             seal_rows: 100_000, // tests seal explicitly unless they lower it
             ivf_rows: MIN_IVF_ROWS,
             max_merge_rows: 1_000_000,
+            exact_vectors: true,
             sync: SyncPolicy::Batch,
         }
     }
@@ -2508,6 +2664,146 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A big seal with no IVF-PQ input borrows the quantizers of an IVF-PQ
+    /// segment already there instead of training (nlist 39 = √1500, where
+    /// a fresh 1100-row build would get 33).
+    #[test]
+    fn big_seal_borrows_quantizers() {
+        let d = TempDir::new("borrow");
+        let c = open_with(&d, cfg());
+        let nlist = |c: &Collection, at: usize| match &read(&c.snapshot().segs[at].seg).index {
+            SegIndex::IvfPq(i, ..) => i.config().nlist,
+            SegIndex::Hnsw(_) => 0,
+        };
+        for (lo, hi) in [(0u64, 1500u64), (1500, 2600)] {
+            let ids: Vec<u64> = (lo..hi).collect();
+            let vecs: Vec<f32> = ids.iter().flat_map(|&i| rand_vec(i, DIM)).collect();
+            c.upsert_batch(&ids, &vecs, &[]).unwrap();
+            c.seal().unwrap();
+            while c.maintain().unwrap() {}
+        }
+        assert_eq!(
+            shape(&c),
+            [("ivf_pq", 1500, 0), ("ivf_pq", 1100, 0), ("mutable", 0, 0)]
+        );
+        assert_eq!((nlist(&c, 0), nlist(&c, 1)), (39, 39));
+        let o = SearchOptions {
+            nprobe: Some(64),
+            rerank: Some(200),
+            ..opts(None)
+        };
+        for i in [3, 1777, 2599] {
+            assert_eq!(c.search(&rand_vec(i, DIM), 5, &o).unwrap()[0].id, i);
+        }
+    }
+
+    /// With quantizers to borrow, a tier merge of small segments below
+    /// `ivf_rows` (4 x 300 = 1200 < 2000) is built as IVF-PQ, not HNSW.
+    #[test]
+    fn tier_merge_with_quantizers_is_ivf_pq() {
+        let d = TempDir::new("tier-ivf");
+        let c = open_with(
+            &d,
+            Config {
+                seal_rows: 300,
+                ivf_rows: 2000,
+                ..cfg()
+            },
+        );
+        let mut next = 0u64;
+        let mut add = |n: u64| {
+            let ids: Vec<u64> = (next..next + n).collect();
+            next += n;
+            let vecs: Vec<f32> = ids.iter().flat_map(|&i| rand_vec(i, DIM)).collect();
+            c.upsert_batch(&ids, &vecs, &[]).unwrap();
+            c.seal().unwrap();
+            while c.maintain().unwrap() {}
+        };
+        add(5000); // too big for an absorb of 3 x 300 to pay off
+        for _ in 0..4 {
+            add(300);
+        }
+        assert_eq!(
+            shape(&c),
+            [("ivf_pq", 5000, 0), ("ivf_pq", 1200, 0), ("mutable", 0, 0)]
+        );
+    }
+
+    /// `exact_vectors: false`: IVF-PQ segments are written without f32
+    /// vectors; `get` and `with_vector` return the int8 decoding (within
+    /// half a step: rand_vec is in [0, 1), so ~1/510), and the segment
+    /// reopens and rewrites from the decoded rows.
+    #[test]
+    fn ivf_pq_without_exact_vectors() {
+        let d = TempDir::new("no-f32");
+        let cfg = Config {
+            exact_vectors: false,
+            seal_rows: 512,
+            ..cfg()
+        };
+        let c = open_with(&d, cfg.clone());
+        let ids: Vec<u64> = (0..1500).collect();
+        let vecs: Vec<f32> = ids.iter().flat_map(|&i| rand_vec(i, DIM)).collect();
+        c.upsert_batch(&ids, &vecs, &[]).unwrap();
+        c.seal().unwrap();
+        while c.maintain().unwrap() {}
+        assert_eq!(shape(&c), [("ivf_pq", 1500, 0), ("mutable", 0, 0)]);
+        let path = file_path(&d.0, c.snapshot().segs[0].file, "seg");
+        let s = Segment::open(&path).unwrap();
+        assert!(s.vectors().is_empty() && s.len() == 1500);
+        let close = |c: &Collection, i: u64| {
+            let (v, _) = c.get(i).unwrap();
+            let want = rand_vec(i, DIM);
+            assert!(
+                v.iter().zip(&want).all(|(a, b)| (a - b).abs() < 2.5e-3),
+                "id {i}"
+            );
+        };
+        close(&c, 7);
+        drop(c);
+
+        let c = open_with(&d, cfg);
+        close(&c, 1499);
+        // Plus 600 new rows, then a third dead: one IVF-PQ rewrite keeping
+        // the old codes and encoding the new rows.
+        let more: Vec<u64> = (1500..2100).collect();
+        let vecs: Vec<f32> = more.iter().flat_map(|&i| rand_vec(i, DIM)).collect();
+        c.upsert_batch(&more, &vecs, &[]).unwrap();
+        c.seal().unwrap();
+        for i in (0..1500).step_by(4) {
+            assert!(c.delete(i).unwrap());
+        }
+        while c.maintain().unwrap() {}
+        let layout = [("hnsw", 600, 0), ("ivf_pq", 1125, 0), ("mutable", 0, 0)];
+        assert_eq!(shape(&c), layout);
+        close(&c, 701);
+        close(&c, 2099);
+        for i in (1..1500).step_by(4).chain(1500..1900) {
+            assert!(c.delete(i).unwrap());
+        }
+        while c.maintain().unwrap() {}
+        // 750 < ivf_rows: rebuilt as HNSW from the decoded rows.
+        let shape = shape(&c);
+        assert!(
+            shape
+                .iter()
+                .all(|&(kind, _, dead)| kind != "ivf_pq" && dead == 0)
+        );
+        assert_eq!(shape.iter().map(|s| s.1).sum::<u32>(), 950);
+        close(&c, 702);
+        let o = SearchOptions {
+            nprobe: Some(64),
+            rerank: Some(200),
+            with_vector: true,
+            ..opts(None)
+        };
+        for i in [2, 702, 2099] {
+            let m = &c.search(&rand_vec(i, DIM), 5, &o).unwrap()[0];
+            assert_eq!(m.id, i);
+            assert_eq!(m.vector, c.get(i).map(|(v, _)| v));
         }
     }
 

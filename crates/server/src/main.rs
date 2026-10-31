@@ -30,6 +30,10 @@ struct Args {
     /// cores, so builds don't starve searches.
     #[arg(long, env = "NEARPOINT_BUILD_THREADS", default_value_t = 0)]
     build_threads: usize,
+    /// Refuse upserts (503) while phys_footprint is above this many MiB;
+    /// 0 = no limit. Searches, gets and deletes still run.
+    #[arg(long, env = "NEARPOINT_MEMORY_LIMIT_MIB", default_value_t = 0)]
+    memory_limit_mib: u64,
 }
 
 fn parse_sync(s: &str) -> Result<SyncPolicy, String> {
@@ -54,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     engine::collection::set_build_threads(args.build_threads);
+    server::set_memory_limit(args.memory_limit_mib << 20);
     let db = Db::open(&args.data_dir, args.sync)
         .with_context(|| format!("opening {}", args.data_dir.display()))?;
     for (name, c) in db.list() {

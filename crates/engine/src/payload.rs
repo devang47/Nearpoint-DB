@@ -326,6 +326,26 @@ impl PayloadStore {
     }
 
     /// The type of `field`, if any row has it.
+    /// Approximate bytes held in RAM (bitmaps at their serialized size).
+    pub fn heap_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|(name, c)| {
+                let data = match &c.data {
+                    Data::Int(v) => 8 * v.capacity(),
+                    Data::Float(v) => 8 * v.capacity(),
+                    Data::Bool(b) => b.serialized_size(),
+                    Data::Keyword(k) => {
+                        let terms: usize = k.terms.iter().map(|t| 2 * t.len() + 56).sum();
+                        let postings: usize = k.postings.iter().map(|b| b.serialized_size()).sum();
+                        terms + postings + 4 * (k.offsets.capacity() + k.codes.capacity())
+                    }
+                };
+                name.len() + c.present.serialized_size() + data
+            })
+            .sum()
+    }
+
     pub fn kind(&self, field: &str) -> Option<Kind> {
         self.columns.get(field).map(Column::kind)
     }

@@ -71,10 +71,12 @@ The body is the collection's `Config` as compact JSON (serde), e.g.
 | `seal_rows` | integer ≥ 1; optional, default 100000 | seal the mutable segment at this many rows (ADR 0012) |
 | `ivf_rows` | integer ≥ 1024; optional, default 1000000 | segments this big become IVF-PQ (L2/cosine) |
 | `max_merge_rows` | integer ≥ 1; optional, default 4000000 | largest segment a merge may produce |
+| `exact_vectors` | bool; optional, default true | IVF-PQ segments keep f32 vectors (false: element type 1, ADR 0013) |
 
-The last three were added with Phase 6 as optional keys (still `CONFIG`
-v1): older files load with the defaults, new ones are written with all
-keys. Unknown keys are rejected. The WAL sync policy is not stored (a server
+`seal_rows`, `ivf_rows` and `max_merge_rows` were added with Phase 6 and
+`exact_vectors` with Phase 8, as optional keys (still `CONFIG` v1): older
+files load with the defaults, new ones are written with all keys (so a
+build from before a key rejects files that have it). Unknown keys are rejected. The WAL sync policy is not stored (a server
 flag). A JSON body keeps the file readable and lets later versions add
 optional keys; a breaking change bumps the version. Fixture:
 `crates/engine/testdata/config-v1`.

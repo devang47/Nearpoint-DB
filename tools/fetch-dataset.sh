@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch a dataset into ${NEARPOINT_DATA:-~/data/Nearpoint}/<name>/.
-# Usage: tools/fetch-dataset.sh siftsmall|sift1m|bigann10m [--mirror hf]
+# Usage: tools/fetch-dataset.sh siftsmall|sift1m|bigann10m|bigann100m [--mirror hf]
 #   default      canonical texmex FTP (ftp.irisa.fr), ~30 KB/s
 #   --mirror hf  third-party Hugging Face copy of the extracted sift1m files
 #                (huggingface.co/datasets/qbo-odp/sift1m). Sizes are checked
@@ -10,10 +10,12 @@
 #                header still says 1B), the 10k queries and the 10M ground
 #                truth. texmex only has the base as .bvecs.gz, which can't be
 #                range-fetched.
+#   bigann100m   the same for the first 100M (~12.8 GB); the base starts as
+#                an APFS clone of bigann10m's if present (no extra space).
 # Resumable: re-running continues a partial download and skips finished ones.
 set -euo pipefail
 
-name=${1:?usage: $0 siftsmall|sift1m|bigann10m [--mirror hf]}
+name=${1:?usage: $0 siftsmall|sift1m|bigann10m|bigann100m [--mirror hf]}
 mirror=${3:-ftp}
 [[ ${2:-} == "" || ${2:-} == --mirror ]] || { echo "unknown option: $2" >&2; exit 2; }
 # Each file's expected size = vectors * (4-byte dim + dim * elem_size).
@@ -22,8 +24,8 @@ case $name in
              files="base:10000:516 query:100:516 learn:25000:516 groundtruth:100:404" ;;
   sift1m)    archive=sift.tar.gz extracted=sift p=sift                 # ~161 MB, ~577 MB extracted
              files="base:1000000:516 query:10000:516 learn:100000:516 groundtruth:10000:404" ;;
-  bigann10m) [[ $mirror == ftp ]] || { echo "bigann10m has no --mirror" >&2; exit 2; } ;;
-  *) echo "unknown dataset: $name (want siftsmall, sift1m or bigann10m)" >&2; exit 2 ;;
+  bigann10m|bigann100m) [[ $mirror == ftp ]] || { echo "$name has no --mirror" >&2; exit 2; } ;;
+  *) echo "unknown dataset: $name (want siftsmall, sift1m, bigann10m or bigann100m)" >&2; exit 2 ;;
 esac
 [[ $mirror == ftp || ($mirror == hf && $name == sift1m) ]] ||
   { echo "mirror $mirror not available for $name" >&2; exit 2; }
@@ -33,14 +35,20 @@ dest=$root/$name
 mkdir -p "$root"
 df -h "$root" | tail -1
 
-if [[ $name == bigann10m ]]; then
+if [[ $name == bigann* ]]; then
   url=https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks
+  m=${name#bigann}; m=${m%m}  # millions of vectors
   # local name, bytes (u8bin/ibin: 8-byte header + payload), source
   set -- \
-    base.10M.u8bin 1280000008 "$url/bigann/base.1B.u8bin" \
+    base.${m}M.u8bin $((m * 128000000 + 8)) "$url/bigann/base.1B.u8bin" \
     query.public.10K.u8bin 1280008 "$url/bigann/query.public.10K.u8bin" \
-    gt.10M.ibin 8000008 "$url/GT_10M/bigann-10M"
+    gt.${m}M.ibin 8000008 "$url/GT_${m}M/bigann-${m}M"
   mkdir -p "$dest"
+  # A prefix of the same 1B file: start from the 10M one (cp -c: a clone).
+  small=$root/bigann10m/base.10M.u8bin
+  if [[ $m != 10 && ! -f $dest/base.${m}M.u8bin && -f $small ]]; then
+    cp -c "$small" "$dest/base.${m}M.u8bin"
+  fi
   while (($#)); do
     file=$dest/$1 want=$2 src=$3
     shift 3

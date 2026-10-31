@@ -157,10 +157,12 @@ huge allocation.
 ### IVF-PQ blob v1
 
 Self-contained: loading and searching need no f32 vectors, so its segment
-can be written with element type 1. The engine (task 6.2) writes element
-type 0 anyway: `get` and `with_vector` read exact vectors from the mapped
-file (never copied into RAM), and Phase 8 can re-rank in f32 from it.
-Element type 1 is for Phase 9's compressed-only mode.
+can be written with element type 1. The engine writes element type 0 by
+default: `get` and `with_vector` read exact vectors from the mapped file
+(never copied into RAM). A collection with `exact_vectors: false` writes
+element type 1 and decodes the SQ codes instead (ADR 0013), as will
+Phase 9's compressed-only mode. Loaded from a mapped file, the SQ codes
+(the last part of the blob) are read in place, not copied (ADR 0013).
 
 | Offset | Type | Field |
 |--------|------|-------|

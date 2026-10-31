@@ -24,7 +24,8 @@
 
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::ops::Range;
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 
 use quant::{Centroids, KMeans, Pq, PqConfig, Sq};
 use rayon::prelude::*;
@@ -66,8 +67,50 @@ pub struct IvfPq {
     quant: Option<Quantizers>,
     lists: Vec<List>,
     /// SQ int8 codes by id, `dim` bytes each, for re-ranking.
-    sq_codes: Vec<i8>,
+    sq_codes: SqCodes,
     len: usize,
+}
+
+/// A buffer an index can borrow its SQ codes from: in practice the mapped
+/// segment file, whose index blob `as_ref` returns.
+pub type SharedBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// The SQ codes: owned while building, or a range of a shared buffer once
+/// loaded with `from_shared`, so they are paged in from the file instead of
+/// copied into RAM (`dim` bytes per vector: the biggest part of the index).
+enum SqCodes {
+    Owned(Vec<i8>),
+    Shared(SharedBytes, Range<usize>),
+}
+
+impl Default for SqCodes {
+    fn default() -> Self {
+        SqCodes::Owned(Vec::new())
+    }
+}
+
+impl Deref for SqCodes {
+    type Target = [i8];
+
+    fn deref(&self) -> &[i8] {
+        match self {
+            SqCodes::Owned(v) => v,
+            SqCodes::Shared(b, r) => bytemuck::cast_slice(&(**b).as_ref()[r.clone()]),
+        }
+    }
+}
+
+impl SqCodes {
+    /// Owned codes to append to (a shared range is copied first).
+    fn to_mut(&mut self) -> &mut Vec<i8> {
+        if let SqCodes::Shared(..) = self {
+            *self = SqCodes::Owned(self.to_vec());
+        }
+        match self {
+            SqCodes::Owned(v) => v,
+            SqCodes::Shared(..) => unreachable!("made owned above"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -101,7 +144,7 @@ impl IvfPq {
             cfg,
             quant: None,
             lists: Vec::new(),
-            sq_codes: Vec::new(),
+            sq_codes: SqCodes::default(),
             len: 0,
         })
     }
@@ -121,7 +164,7 @@ impl IvfPq {
                 Vec::new()
             },
             quant: self.quant.clone(),
-            sq_codes: Vec::new(),
+            sq_codes: SqCodes::default(),
             len: 0,
             ..*self
         }
@@ -169,7 +212,7 @@ impl IvfPq {
         Some(IvfPq {
             lists,
             quant: self.quant.clone(),
-            sq_codes,
+            sq_codes: SqCodes::Owned(sq_codes),
             len: rows.len(),
             ..*self
         })
@@ -236,6 +279,58 @@ impl IvfPq {
     /// out-of-bounds read in a later search. Allocations are bounded by the
     /// bytes actually present.
     pub fn from_bytes(bytes: &[u8]) -> Result<IvfPq> {
+        let (mut ivf, sq) = Self::parse(bytes)?;
+        ivf.sq_codes = SqCodes::Owned(bytemuck::cast_slice(&bytes[sq]).to_vec());
+        Ok(ivf)
+    }
+
+    /// `from_bytes` on `blob`'s bytes, but the SQ codes stay in `blob`
+    /// (read in place by re-ranking, never copied): for a mapped file.
+    pub fn from_shared(blob: SharedBytes) -> Result<IvfPq> {
+        let (mut ivf, sq) = Self::parse((*blob).as_ref())?;
+        ivf.sq_codes = SqCodes::Shared(blob, sq);
+        Ok(ivf)
+    }
+
+    /// Row `id`'s vector decoded from its SQ code, in stored form (unit
+    /// length for cosine): within `scale / 2` of the original per
+    /// component. For segments that keep no f32 vectors.
+    pub fn decode(&self, id: u32) -> Option<Vec<f32>> {
+        let q = self.quant.as_ref()?;
+        let code = self
+            .sq_codes
+            .get(id as usize * self.dim..)?
+            .get(..self.dim)?;
+        Some(q.sq.decode(code))
+    }
+
+    /// Bytes held in RAM (lists, owned SQ codes, quantizers), not counting
+    /// SQ codes left in a shared buffer.
+    pub fn heap_bytes(&self) -> usize {
+        let lists: usize = self
+            .lists
+            .iter()
+            .map(|l| 4 * l.ids.capacity() + l.codes.capacity())
+            .sum();
+        let sq = match &self.sq_codes {
+            SqCodes::Owned(v) => v.capacity(),
+            SqCodes::Shared(..) => 0,
+        };
+        let quant = self.quant.as_ref().map_or(0, |q| {
+            4 * (q.coarse.as_slice().len()
+                + q.pq
+                    .codebooks()
+                    .iter()
+                    .map(|b| b.as_slice().len())
+                    .sum::<usize>()
+                + self.dim)
+        });
+        lists + sq + quant
+    }
+
+    /// Parses a blob; the SQ codes are left empty and their byte range in
+    /// `bytes` returned.
+    fn parse(bytes: &[u8]) -> Result<(IvfPq, Range<usize>)> {
         let mut r = blob::Reader::new(bytes);
         let (dim, metric) = r.header(MAGIC)?;
         let (nlist, m, nbits, trained) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
@@ -255,7 +350,7 @@ impl IvfPq {
         match (trained, n) {
             (0, 0) => {
                 r.finish()?;
-                return Ok(ivf);
+                return Ok((ivf, 0..0));
             }
             (1, _) => {}
             _ => return Err(Error::Corrupt("bad trained flag")),
@@ -294,7 +389,9 @@ impl IvfPq {
             let codes = r.take(code_bytes)?.to_vec();
             ivf.lists.push(List { ids, codes });
         }
-        ivf.sq_codes = bytemuck::cast_slice(r.take_n(n, dim)?).to_vec();
+        let codes = r.take_n(n, dim)?;
+        // Where the codes sit in `bytes` (`codes` is a subslice of it).
+        let at = codes.as_ptr() as usize - bytes.as_ptr() as usize;
         r.finish()?;
 
         // Search indexes the SQ codes by id, so every id must be < n.
@@ -307,7 +404,7 @@ impl IvfPq {
         }
         ivf.quant = Some(Quantizers { coarse, pq, sq });
         ivf.len = n;
-        Ok(ivf)
+        Ok((ivf, at..at + n * dim))
     }
 
     /// Trains the coarse quantizer, PQ codebooks and SQ ranges on (a sample
@@ -354,14 +451,15 @@ impl IvfPq {
         let n = vectors.len() / dim;
         let mut cells = vec![0u32; n];
         let mut codes = vec![0u8; n * m];
-        let start = self.sq_codes.len();
-        self.sq_codes.resize(start + n * dim, 0);
+        let sq_codes = self.sq_codes.to_mut();
+        let start = sq_codes.len();
+        sq_codes.resize(start + n * dim, 0);
         let metric = self.metric;
         vectors
             .par_chunks_exact(dim)
             .zip(cells.par_iter_mut())
             .zip(codes.par_chunks_exact_mut(m))
-            .zip(self.sq_codes[start..].par_chunks_exact_mut(dim))
+            .zip(sq_codes[start..].par_chunks_exact_mut(dim))
             .for_each_init(
                 || vec![0f32; dim],
                 |r, (((v, cell), code), sq)| {
@@ -635,7 +733,7 @@ mod tests {
         assert_eq!((copy.len, copy.sq_codes.len()), (0, 0));
         // Rows 1000.. again, in order: like a compaction dropping 0..1000.
         copy.add(&data[1000 * DIM..]).unwrap();
-        assert_eq!(copy.sq_codes, ivf.sq_codes[1000 * DIM..]);
+        assert_eq!(*copy.sq_codes, ivf.sq_codes[1000 * DIM..]);
         for (a, b) in ivf.lists.iter().zip(&copy.lists) {
             let kept: Vec<u32> = a
                 .ids
@@ -654,6 +752,27 @@ mod tests {
         );
     }
 
+    /// `decode` is within half an SQ step of the stored form, per component.
+    #[test]
+    fn decode_is_within_half_a_step() {
+        let data = test_data::vectors(2000, DIM, 3);
+        for metric in [Metric::L2, Metric::Cosine] {
+            let mut ivf = IvfPq::new(DIM, metric, cfg()).unwrap();
+            ivf.add(&data).unwrap();
+            let half = ivf.quant.as_ref().unwrap().sq.scale() / 2.0 + 1e-6;
+            for (id, v) in (0u32..).zip(data.as_chunks::<DIM>().0) {
+                let want = metric.prepare(v);
+                let got = ivf.decode(id).unwrap();
+                assert!(
+                    got.iter()
+                        .zip(want.iter())
+                        .all(|(a, b)| (a - b).abs() <= half)
+                );
+            }
+        }
+        assert_eq!(IvfPq::new(DIM, Metric::L2, cfg()).unwrap().decode(0), None);
+    }
+
     /// `retain` gives exactly what re-adding the kept rows would.
     #[test]
     fn retain_matches_re_adding() {
@@ -668,7 +787,7 @@ mod tests {
             .flat_map(|&r| data[r as usize * DIM..][..DIM].to_vec())
             .collect();
         want.add(&vecs).unwrap();
-        assert_eq!((kept.len, &kept.sq_codes), (want.len, &want.sq_codes));
+        assert_eq!((kept.len, &*kept.sq_codes), (want.len, &*want.sq_codes));
         for (a, b) in kept.lists.iter().zip(&want.lists) {
             assert_eq!((&a.ids, &a.codes), (&b.ids, &b.codes));
         }
@@ -926,11 +1045,20 @@ mod tests {
             assert_eq!(back.to_bytes(), bytes);
             assert_eq!((back.len(), back.dim(), back.metric()), (601, DIM, metric));
             assert_eq!(search_all(&back, &queries), search_all(&ivf, &queries));
+            // Codes left in a shared buffer: same results, not in RAM, and
+            // appending copies them out first.
+            let mut shared = IvfPq::from_shared(Arc::new(bytes.clone())).unwrap();
+            assert_eq!(search_all(&shared, &queries), search_all(&ivf, &queries));
+            assert_eq!(back.heap_bytes() - shared.heap_bytes(), 601 * DIM);
+            assert_eq!(shared.decode(600), back.decode(600));
+            assert_eq!(shared.decode(601), None);
+            shared.add(&more).unwrap();
             // A loaded index keeps accepting inserts (4-bit: into a partly
             // filled block).
             ivf.add(&more).unwrap();
             back.add(&more).unwrap();
             assert_eq!(back.to_bytes(), ivf.to_bytes());
+            assert_eq!(shared.to_bytes(), ivf.to_bytes());
         }
         // Untrained, and trained but empty.
         let mut ivf = IvfPq::new(DIM, Metric::L2, cfg()).unwrap();
