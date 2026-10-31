@@ -454,6 +454,30 @@ IVF-PQ segment (only new rows encoded). Same soak settings, 30 minutes
   was skipped by decision (Devang, 2026-10-30); Phase 6 stays unticked
   until a 4-hour run measures it.
 
+### 2026-10-31 — nprobe scaled per segment with its nlist (30-minute soak)
+
+Each IVF-PQ segment now probes `ceil(nprobe · nlist / √ivf_rows)` lists:
+the share of its lists a fresh `ivf_rows`-row segment probes with
+`nprobe` (ADR 0012 addendum 2026-10-31). Here `ivf_rows` 400k → reference
+nlist 632; the big segment keeps nlist 775 → 40 probes instead of 32.
+Same settings and steady-state window (t ≥ 9 min, 22 windows) as the
+absorb-3 run above; CSV `docs/results/soak-nprobe-30m.csv`.
+
+| Variant | p99 median / mean / max | recall@10 median | search/s mean | drift (15 windows) |
+|---------|------------------------:|-----------------:|--------------:|-------------------:|
+| absorb 3 (a2e6e4d) | 1.55 / 1.56 / 1.79 ms | 0.7493 | 6,037 | p99 −10.4%, recall −0.7%, PASS |
+| **+ nprobe per nlist** | **1.52 / 1.53 / 2.04 ms** | **0.7919** | 5,576 | p99 −14.8%, recall +0.1%, PASS |
+
+- **Target met:** recall ≥ 0.765 (0.792, +4.3% absolute, above the 0.765
+  of the two-IVF-PQ-segment layout) at mean p99 ≤ 1.6 ms (1.53).
+  0 errors, 0 violations, 0 reconnects.
+- **Cost:** 7.6% fewer searches per second (the readers are closed-loop,
+  so more work per query shows up as throughput, not p99). One window hit
+  2.04 ms (t = 842 s, the first absorb after the warm-up builds; the same
+  window was the baseline's worst, 1.79 ms); all others ≤ 1.79 ms.
+- Recall still cycles with the absorb (0.77 right after, 0.81 with two
+  HNSW segments), now around a higher level.
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

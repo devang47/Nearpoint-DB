@@ -255,7 +255,9 @@ pub struct Recovery {
 pub struct SearchOptions<'a> {
     /// HNSW beam width (`None`: the index default, 64); raised to `k`.
     pub ef: Option<usize>,
-    /// IVF-PQ lists probed (`None`: [`DEFAULT_NPROBE`]).
+    /// IVF-PQ lists probed in a segment of `ivf_rows` rows (`None`:
+    /// [`DEFAULT_NPROBE`]); bigger segments probe the same share of their
+    /// lists ([`segment_nprobe`]).
     pub nprobe: Option<usize>,
     /// IVF-PQ candidates re-ranked with int8 vectors (`None`:
     /// [`DEFAULT_RERANK`]; at least `k` either way).
@@ -662,9 +664,15 @@ impl Collection {
                 return Ok(Vec::new());
             }
             let d = SearchParams::default();
+            let nprobe = opts.nprobe.unwrap_or(DEFAULT_NPROBE);
             let params = SearchParams {
                 ef: opts.ef.unwrap_or(d.ef),
-                nprobe: opts.nprobe.unwrap_or(DEFAULT_NPROBE),
+                nprobe: match &seg.index {
+                    SegIndex::IvfPq(i, _) => {
+                        segment_nprobe(nprobe, i.config().nlist, self.cfg.ivf_rows)
+                    }
+                    SegIndex::Hnsw(_) => nprobe,
+                },
                 rerank: opts.rerank.unwrap_or(DEFAULT_RERANK),
                 filter: allowed.as_ref(),
             };
@@ -1359,7 +1367,7 @@ fn merge_kinds(kinds: &mut Schema, store: &PayloadStore) -> bool {
 /// points used ~1x and 1.3x sqrt(n) with nprobe 16 and 32), 8-bit PQ with
 /// `pq_m` subspaces.
 fn ivf_config(dim: usize, n: usize, seed: u64) -> ivfpq::Config {
-    let nlist = ((n as f64).sqrt().round() as usize).max(1);
+    let nlist = nlist_for(n);
     ivfpq::Config {
         nlist,
         m: pq_m(dim),
@@ -1367,6 +1375,22 @@ fn ivf_config(dim: usize, n: usize, seed: u64) -> ivfpq::Config {
         max_train: (nlist * 64).max(ivfpq::Config::default().max_train),
         seed,
     }
+}
+
+fn nlist_for(n: usize) -> usize {
+    ((n as f64).sqrt().round() as usize).max(1)
+}
+
+/// `nprobe` scaled from a fresh `ivf_rows`-row segment's nlist to this
+/// segment's: every IVF-PQ segment probes the same share of its lists, so
+/// recall and work don't depend on how compaction split the rows (one 1M
+/// segment probed 32 of ~1000 lists where two 500k ones probed 32 of ~700
+/// each: −1.6% recall).
+fn segment_nprobe(nprobe: usize, nlist: usize, ivf_rows: u32) -> usize {
+    nprobe
+        .saturating_mul(nlist)
+        .div_ceil(nlist_for(ivf_rows as usize))
+        .max(1)
 }
 
 /// The largest m <= max(16, dim / 8) dividing `dim`: 16 bytes per code
@@ -2132,6 +2156,18 @@ mod tests {
             },
         );
         assert_eq!(c.merge_cap(), (2 << 30) / 4096);
+    }
+
+    /// Any IVF-PQ segment probes the share of its lists a fresh `ivf_rows`
+    /// one does.
+    #[test]
+    fn nprobe_scales_with_nlist() {
+        assert_eq!(segment_nprobe(32, 1000, 1_000_000), 32);
+        assert_eq!(segment_nprobe(32, 2000, 1_000_000), 64); // a 4M merge
+        assert_eq!(segment_nprobe(32, 775, 400_000), 40); // soak: 32 * 775 / 632
+        assert_eq!(segment_nprobe(32, 100, 1_000_000), 4); // never 0
+        assert_eq!(segment_nprobe(1, 1, 1_000_000), 1);
+        assert_eq!(segment_nprobe(usize::MAX, 4, 1024), usize::MAX.div_ceil(32));
     }
 
     fn open_with(d: &TempDir, cfg: Config) -> Arc<Collection> {

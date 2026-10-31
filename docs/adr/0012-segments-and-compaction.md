@@ -211,3 +211,19 @@ trained IVF-PQ (k-means + PQ from scratch, 14–17 s), every ~5 minutes.
 - Alternatives: raising the dead-row threshold (fewer rewrites, but more
   dead codes scanned per query); appending to the IVF-PQ segment in place
   (needs a mutable segment file format); both left for later.
+
+## Addendum (2026-10-31): nprobe scales with each segment's nlist
+`nprobe` was applied per segment as is, so recall depended on how
+compaction split the rows: after absorb, one ~1M segment (nlist 775)
+probed 32 lists where two half-size ones had probed 32 each, −1.6%
+recall. Now `nprobe` means the lists probed in a fresh `ivf_rows`-row
+segment (nlist √ivf_rows), and every IVF-PQ segment probes the same share
+of its lists: `ceil(nprobe · nlist / √ivf_rows)`, at least 1, capped at
+nlist by the index. With the default `ivf_rows` (1M) a fresh 1M segment
+still probes 32; a 4M merge (nlist 2000) probes 64. `rerank` stays a
+per-segment count. 30-minute soak: recall 0.749 → 0.792, mean p99
+1.56 → 1.53 ms, 7.6% less throughput (RESULTS.md).
+- Alternatives: a reference of the segment's own √rows (nlist is kept
+  across rewrites, so this drifts as dead rows go); a global
+  probe budget split across segments by size (needs all segments'
+  centroid distances before scanning, a bigger change).

@@ -15,6 +15,17 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-31 — IVF-PQ nprobe scaled per segment with its nlist
+- **What:** `Collection::search` gives each IVF-PQ segment
+  `ceil(nprobe · nlist / √ivf_rows)` probes (`segment_nprobe`, unit
+  test); `nprobe` now means lists probed in an `ivf_rows`-row segment
+  (docs/api.md). ADR 0012 addendum, RESULTS.md, CSV
+  `docs/results/soak-nprobe-30m.csv`.
+- **Why:** after absorb, steady state is one big IVF-PQ segment, and a
+  fixed per-segment nprobe covered a smaller share of it (−1.6% recall).
+  30-minute soak: recall 0.749 → 0.792 at mean p99 1.53 ms (target
+  ≥ 0.765 at ≤ 1.6 ms), for 7.6% less throughput.
+
 ## 2026-10-30 — Compaction absorbs small segments into IVF-PQ, keeping codes
 - **What:** `IvfPq::retain` (a copy with only the given rows' existing
   codes, 8-bit); rewrites keep the biggest IVF-PQ input's codes and encode

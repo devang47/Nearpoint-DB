@@ -169,6 +169,9 @@ tier merges (7–10 s) and fresh IVF-PQ trainings (14–19 s). Absorbing
 background work ~15× (30-minute soak: max p99 2.47 → 1.79 ms, mean
 unchanged, recall −1.6% absolute). Predicted to pass the 4-hour check;
 not run (by decision), so still unticked.
+2026-10-31: nprobe scaled per segment with its nlist wins the recall
+back and more (30 minutes: 0.749 → 0.792, mean p99 1.53 ms, −7.6%
+throughput).
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).

@@ -196,7 +196,7 @@ if none), `404` if missing or deleted.
 | `vector` | required | query, `dim` components |
 | `k` | 10 | results wanted, ≤ 10,000 |
 | `ef` | 64 | HNSW beam width (raised to `k`), ≤ 10,000; higher is slower and more accurate |
-| `nprobe` | 32 | IVF-PQ lists scanned per segment, ≤ 10,000 (capped at the segment's list count); higher is slower and more accurate |
+| `nprobe` | 32 | IVF-PQ lists scanned in a segment of `ivf_rows` rows, ≤ 10,000; bigger segments scan the same share of their lists (capped at the list count); higher is slower and more accurate |
 | `rerank` | 100 | IVF-PQ candidates re-scored with int8 vectors (at least `k`), ≤ 10,000 |
 | `filter` | none | filter expression, shape and semantics in `docs/filters.md`; applied during the search |
 | `with_payload` | false | include each hit's payload (`null` if none) |
