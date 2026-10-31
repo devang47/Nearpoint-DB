@@ -478,6 +478,37 @@ absorb-3 run above; CSV `docs/results/soak-nprobe-30m.csv`.
 - Recall still cycles with the absorb (0.77 right after, 0.81 with two
   HNSW segments), now around a higher level.
 
+### 2026-10-31 — Phase 6 acceptance: 4-hour soak at 71bbdd4 (met)
+
+Same settings as the two earlier 4-hour runs (1M live dim-32 points,
+`seal_rows` 100k, `ivf_rows` 400k, `max_merge_rows` 1.6M, 2 writers,
+4 readers, 1,000 probe queries per 60 s window, `--drift-windows 30`,
+the pre-registered check), at the absorb + nprobe-per-nlist commit.
+Per-window CSV: `docs/results/soak-4h-final.csv`.
+
+| Hour | p99 median | p99 mean | p99 max | windows > 1.8 ms | p50 | searches/s | recall@10 | RSS median (max) |
+|------|-----------:|---------:|--------:|-----------------:|----:|-----------:|----------:|-----------------:|
+| 1 | 1.45 ms | 1.51 ms | 2.07 ms | 6 / 60 | 0.66 ms | 5,554 | 0.7937 | 432 (665) MiB |
+| 2 | 1.47 ms | 1.50 ms | 1.86 ms | 2 / 61 | 0.66 ms | 5,533 | 0.7946 | 434 (588) MiB |
+| 3 | 1.40 ms | 1.43 ms | 1.66 ms | 0 / 61 | 0.66 ms | 5,630 | 0.7926 | 438 (484) MiB |
+| 4 | 1.41 ms | 1.43 ms | 1.64 ms | 0 / 61 | 0.66 ms | 5,620 | 0.7942 | 441 (498) MiB |
+
+| Drift, first vs last N windows (loadtest's upper median) | recall@10 | p99 |
+|-----------------------------------------------------------|----------:|----:|
+| **N = 30 (pre-registered)** | 0.7990 → 0.7949 (−0.5%) | 1.45 → 1.41 ms (**−2.3%, PASS**) |
+| N = 60 (first vs last hour) | 0.7945 → 0.7942 (−0.0%) | 1.45 → 1.41 ms (−2.5%, PASS) |
+
+- **Phase 6 acceptance met:** recall and p99 within 10% of the start by
+  both measures. 266k inserts, 266k replaces and 266k deletes, 80.4M
+  searches (a third filtered); **0 errors, 0 violations, 0 reconnects**.
+- Against the 3300a7d run: recall 0.765 → 0.794, hourly p99 max
+  2.67 → 1.64 ms by hour 4, windows > 1.8 ms 68 → 8 (all 8 in the first
+  2 hours, before the layout settles), ~4% fewer searches/s (5,585 vs
+  ~5,800 mean).
+- RSS flat (median 432 → 441 MiB; the early maxima are the warm-up
+  trainings). 98 background rewrites, one of them an HNSW build (initial
+  load).
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

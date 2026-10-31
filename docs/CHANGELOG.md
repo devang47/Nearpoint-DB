@@ -15,6 +15,15 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-10-31 — Phase 6 met: 4-hour soak at 71bbdd4
+- **What:** reran the Phase 6 soak (same settings, pre-registered
+  30-window check) at the absorb + nprobe-per-nlist commit; results in
+  RESULTS.md, CSV `docs/results/soak-4h-final.csv`; Phase 6 status set to
+  met in PLAN.md.
+- **Why it matters:** recall −0.5% and p99 −2.3% (first vs last hour
+  −0.0% / −2.5%), 0 errors, 0 violations, 0 reconnects, RSS flat. Closes
+  the p99 miss of the two earlier 4-hour runs (+41%, +12.3%).
+
 ## 2026-10-31 — IVF-PQ nprobe scaled per segment with its nlist
 - **What:** `Collection::search` gives each IVF-PQ segment
   `ceil(nprobe · nlist / √ivf_rows)` probes (`segment_nprobe`, unit

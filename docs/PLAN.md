@@ -149,7 +149,7 @@ steady-state size (~24%); see RESULTS.md for why both are given.
 - [x] 6.4 Query fan-out across segments with parallel search and top-k merge.
 **Acceptance:** 4-hour soak test with mixed insert/delete/search; recall
 and p99 latency stay within 10% of the start.
-**Status (2026-10-29): not met (p99).** 4-hour soak, 1M live dim-32
+History (2026-10-29): not met (p99). 4-hour soak, 1M live dim-32
 points, 13.3M inserts + 13.3M deletes: recall drift −0.2%, 0 violations, RSS
 flat (dead rows are compacted away), but p99 rose 1.29 → 1.82 ms (+41%)
 over the first ~2 h, then plateaued; 1 client-side transport error.
@@ -172,6 +172,10 @@ not run (by decision), so still unticked.
 2026-10-31: nprobe scaled per segment with its nlist wins the recall
 back and more (30 minutes: 0.749 → 0.792, mean p99 1.53 ms, −7.6%
 throughput).
+**Status (2026-10-31): met.** 4-hour soak at 71bbdd4, pre-registered
+30-window check: recall 0.799 → 0.795 (−0.5%), p99 1.45 → 1.41 ms
+(−2.3%); first vs last hour −0.0% / −2.5%. 0 errors, 0 violations,
+0 reconnects, RSS flat (~440 MiB). RESULTS.md.
 
 ## Phase 7: Metadata filtering
 - [x] 7.1 Per-segment payload store: typed columns (int, float, keyword, bool).
