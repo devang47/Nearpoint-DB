@@ -207,6 +207,7 @@ mod tests {
         (0usize..300).prop_flat_map(|n| (vec(-1e3f32..1e3, n), vec(-1e3f32..1e3, n)))
     }
 
+    #[cfg(target_feature = "dotprod")]
     fn i8_pair() -> impl Strategy<Value = (Vec<i8>, Vec<i8>)> {
         (0usize..300).prop_flat_map(|n| (vec(any::<i8>(), n), vec(any::<i8>(), n)))
     }

@@ -85,7 +85,9 @@ mod tests {
         std::hint::black_box(&buf);
         let after = peak_memory().unwrap();
         assert!(after.phys_footprint >= before.phys_footprint.max(256 * MB));
-        assert!(after.rss >= 256 * MB);
+        // Peak RSS can stay under 256 MB when the compressor takes pages
+        // (seen on CI's memory-starved VM); phys_footprint counts them.
+        assert!(after.rss >= before.rss && after.rss > 0);
         let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
         set_nocache(&f).unwrap();
         let now = phys_footprint().unwrap();
