@@ -18,6 +18,7 @@ set -euo pipefail
 name=${1:?usage: $0 siftsmall|sift1m|bigann10m|bigann100m [--mirror hf]}
 mirror=${3:-ftp}
 [[ ${2:-} == "" || ${2:-} == --mirror ]] || { echo "unknown option: $2" >&2; exit 2; }
+[[ ${2:-} != --mirror || -n ${3:-} ]] || { echo "--mirror needs a value (hf)" >&2; exit 2; }
 # Each file's expected size = vectors * (4-byte dim + dim * elem_size).
 case $name in
   siftsmall) archive=siftsmall.tar.gz extracted=siftsmall p=siftsmall  # ~5 MB, ~18 MB extracted

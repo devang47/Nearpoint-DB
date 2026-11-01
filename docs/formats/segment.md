@@ -50,8 +50,7 @@ to match exactly; anything else is `Corrupt`.
   (length 0) when the element type is 1: the writer passes no vectors
   for a non-empty segment, and `Segment::vectors()` returns `&[]`. That is
   for indexes whose blob is the whole index (IVF-PQ keeps PQ and int8
-  codes): f32 vectors would cost 4x the int8 codes, which Phase 9's
-  compressed-only mode can't afford. Writers that keep f32 vectors (for
+  codes): f32 vectors would cost 4x the int8 codes. Writers that keep f32 vectors (for
   `get`, or a later f32 re-rank from the map) write element type 0.
 - **Ids:** `count` u64 external ids; `ids[i]` belongs to dense id `i`.
 - **Index blob:** opaque to storage; layouts below.
@@ -160,8 +159,7 @@ Self-contained: loading and searching need no f32 vectors, so its segment
 can be written with element type 1. The engine writes element type 0 by
 default: `get` and `with_vector` read exact vectors from the mapped file
 (never copied into RAM). A collection with `exact_vectors: false` writes
-element type 1 and decodes the SQ codes instead (ADR 0013), as will
-Phase 9's compressed-only mode. Loaded from a mapped file, the SQ codes
+element type 1 and decodes the SQ codes instead (ADR 0013). Loaded from a mapped file, the SQ codes
 (the last part of the blob) are read in place, not copied (ADR 0013).
 
 | Offset | Type | Field |
@@ -206,7 +204,7 @@ codebooks 128 KB + lists 10M × (4 + 16) B + SQ codes 10M × 128 B ≈
 1.48 GB, the in-RAM size. `to_bytes` builds it in one `Vec` (exact
 capacity), so writing a segment holds the index twice for a moment.
 
-**Vectors on load.** `from_bytes` takes the vectors as an owned
+**HNSW vectors on load.** `Hnsw::from_bytes` takes the vectors as an owned
 `Vec<f32>` (callers pass `segment.vectors().to_vec()`). That is one copy:
 for SIFT1M, 512 MB of heap on top of the (evictable) mapped pages. v1
 accepts it so `Hnsw` keeps a single owned representation and stays
@@ -234,7 +232,7 @@ would shrink it, at the cost of a rebuild step on load.
 | Version | Date | Change |
 |---------|------|--------|
 | 1 | 2026-10-28 | Initial format (task 3.2). Fixture: `crates/storage/testdata/segment-v1.seg`. |
-| 2 | 2026-10-28 | Element type 1 = no vector section; blob kind 2 = IVF-PQ. v1 files still load; v1 cannot hold element type 1. Fixture (no vectors): `crates/storage/testdata/segment-v2.seg`. |
+| 2 | 2026-10-28 | Element type 1 = no vector section; blob kind 2 = IVF-PQ (the reader also accepts kind 2 in v1 files). v1 files still load; v1 cannot hold element type 1. Fixture (no vectors): `crates/storage/testdata/segment-v2.seg`. |
 
 HNSW and Flat blobs: version 1, same date. IVF-PQ blob: version 1,
 added with segment v2.

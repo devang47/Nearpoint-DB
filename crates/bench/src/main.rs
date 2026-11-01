@@ -176,6 +176,7 @@ fn main() -> Result<()> {
             read_bin_ground_truth(&dir.join("gt.10M.ibin"))?.0,
         ),
     };
+    ensure!(query.len() > 0, "need at least one query");
     ensure!(base.dim() == query.dim(), "base/query dims differ");
     ensure!(
         gt.len() >= query.len(),

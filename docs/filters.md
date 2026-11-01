@@ -1,8 +1,7 @@
 # Payloads and filters
 
-The payload and filter half of the HTTP API (task 7.2; the endpoints arrive
-with 4.4 and 7.3). Code: `crates/engine/src/{payload,filter}.rs`. Design
-notes: `docs/adr/0005-payloads-and-filters.md`. Every `json` block on this
+The payload and filter half of the HTTP API. Code:
+`crates/engine/src/{payload,filter}.rs`. Design notes: `docs/adr/0005-payloads-and-filters.md`. Every `json` block on this
 page is parsed by a test (`crates/engine/tests/filter.rs`).
 
 ## Payloads
@@ -25,6 +24,9 @@ later value of another type rejects the whole payload with a
 float column accepts integers, because JavaScript sends `10.0` as `10`.
 The reverse doesn't work: if a field's first value is `10`, a later `10.5`
 is rejected. Keyword and keyword-list fields are different types too.
+A seal starts the next segment with the sealed one's column types, so a
+field keeps its type across seals; after a restart, undeclared fields
+start over with the first-value rule.
 
 To fix a field's type up front, declare it in the collection's `schema`
 when creating it (`docs/api.md`, ADR 0011), e.g. `{"price": "float"}`:
@@ -121,16 +123,18 @@ Everything without the `archived` tag (including rows with no tags):
 
 ## Filtered search
 
-A filter is applied during the search, not to its results, so a search
-returns `k` matches whenever the segment has `k` matching rows (task 7.3,
-`docs/adr/0010-filtered-search.md`):
+A filter is applied during the search, not to its results
+(`docs/adr/0010-filtered-search.md`):
 
 - **HNSW** walks the graph as usual, including through rows that don't
   match, but only matching rows enter the result set; it keeps going until
-  it holds `ef` matches nearer than anything left to explore.
+  it holds `ef` matches nearer than anything left to explore. It returns
+  `k` matches whenever the segment has `k` matching rows.
 - **When few rows match**, HNSW computes the exact distance to every
-  matching row instead of walking (task 7.4). It does this when
+  matching row instead of walking. It does this when
   `matches² <= 8 · max(ef, k) · rows`: on 1M vectors at `ef` 64 that is
   under ~22,600 matches (~2.3%), and a segment of a few hundred rows always
   scans. Those results are exact.
-- **Flat** visits only the matching rows.
+- **IVF-PQ and billion segments** skip non-matching rows inside the
+  `nprobe` lists they scan, so a very selective filter can return fewer
+  than `k` matches from them; raise `nprobe` if that happens.

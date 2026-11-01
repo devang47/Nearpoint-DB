@@ -1,12 +1,12 @@
 #!/bin/zsh
-# Streams the BIGANN 1B base into a billion-mode build directory (Phase 9),
+# Streams the BIGANN 1B base into a billion-mode build directory (ADR 0014),
 # resuming from the committed row after any failure, until `refine` is
 # published. The directory must already hold `quant` (`billion train`).
 # Usage: tools/billion-build.sh <dir> [total_rows]   (default 1,000,000,000)
 set -u
 dir=$1 total=${2:-1000000000}
-bin=${BILLION_BIN:-./target/release/billion}
 here=${0:A:h}
+bin=${BILLION_BIN:-$here/../target/release/billion}
 for attempt in {1..200}; do
   [[ -f "$dir/refine" ]] && { echo "stream complete"; exit 0; }
   from=$("$bin" status --dir "$dir") || exit 1

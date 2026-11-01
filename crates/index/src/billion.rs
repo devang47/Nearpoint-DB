@@ -1,4 +1,4 @@
-//! Billion mode (Phase 9, ADR 0014): an IVF-PQ whose lists and re-rank
+//! Billion mode (ADR 0014): an IVF-PQ whose lists and re-rank
 //! codes live in files, built by streaming the raw vectors once.
 //!
 //! - **Coarse quantizer:** `nlist` (up to 65,536) centroids from two-level
@@ -58,8 +58,8 @@ fn sub(a: &[f32], b: &[f32], out: &mut [f32]) {
 }
 
 impl Quantizers {
-    /// Trains on `data` (row-major, `dim` floats per row; a 10M sample in
-    /// Phase 9). Deterministic for a given `seed`, except the HNSW graph
+    /// Trains on `data` (row-major, `dim` floats per row; e.g. a 10M
+    /// sample for BIGANN). Deterministic for a given `seed`, except the HNSW graph
     /// (parallel insertion), which only affects which near-equal centroid
     /// wins an assignment.
     pub fn train(data: &[f32], dim: usize, cfg: TrainConfig) -> Result<Quantizers> {
@@ -111,8 +111,9 @@ impl Quantizers {
         graph.reserve(coarse.k());
         graph.add(coarse.as_slice())?;
 
-        // PQ on residuals, then the refinement PQ on what PQ left, both on
-        // a sample (PqConfig's max_train).
+        // PQ on residuals, then the refinement PQ on what PQ left: the
+        // residuals of a 262k-row sample, which each PQ subsamples again
+        // to its `max_train`.
         let sample = quant::sample(data, dim, 262_144, cfg.seed).into_owned();
         let s = sample.len() / dim;
         let mut residuals = vec![0f32; s * dim];
@@ -421,7 +422,10 @@ pub struct BillionParams<'a> {
 
 pub type Skip<'a> = dyn Fn(u32) -> bool + Sync + 'a;
 
-/// The sorted list layout, borrowed from a mapped file.
+/// The sorted list layout, borrowed from a mapped file. `search` trusts
+/// it (`storage::billion` checks it on open): it panics unless `offsets`
+/// is ascending with `nlist + 1` entries and its last one is the row
+/// count of `codes` and `ids`.
 pub struct Lists<'a> {
     /// `nlist + 1` row offsets.
     pub offsets: &'a [u64],

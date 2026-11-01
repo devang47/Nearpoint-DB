@@ -1,6 +1,6 @@
 # Billion-mode build directory
 
-Phase 9 (ADR 0014). Code: `crates/storage/src/billion.rs` (files),
+Billion mode (ADR 0014). Code: `crates/storage/src/billion.rs` (files),
 `crates/index/src/billion.rs` (the `quant` body), `crates/bench/src/bin/billion.rs`
 (train / build / sort / eval), `tools/billion-{stream,build}.sh` (the
 streamed download). All integers little-endian with explicit widths;

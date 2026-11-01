@@ -1,4 +1,4 @@
-//! Write-ahead log (task 3.1). See docs/formats/wal.md.
+//! Write-ahead log. See docs/formats/wal.md.
 //!
 //! A WAL is a directory of segment files named by the LSN of their first
 //! record (`00000000000000000001.wal`). Every record carries a CRC32; on
@@ -22,13 +22,13 @@ use std::time::Duration;
 /// append gets the previous LSN + 1, with no gaps, across reopens.
 pub type Lsn = u64;
 
-pub const MAGIC: [u8; 8] = *b"NPNT_WAL";
-pub const VERSION: u32 = 1;
+pub(crate) const MAGIC: [u8; 8] = *b"NPNT_WAL";
+pub(crate) const VERSION: u32 = 1;
 const FILE_HEADER_LEN: usize = 16; // magic 8 | version u32 | crc u32
 const RECORD_HEADER_LEN: usize = 17; // crc u32 | len u32 | kind u8 | lsn u64
 /// Largest record body accepted on write and on read. A longer length
 /// field is "impossible" and treated as corruption.
-pub const MAX_BODY_LEN: u32 = 64 << 20;
+pub(crate) const MAX_BODY_LEN: u32 = 64 << 20;
 const KIND_UPSERT: u8 = 1;
 const KIND_DELETE: u8 = 2;
 
@@ -55,7 +55,7 @@ pub type Result<T> = std::result::Result<T, WalError>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
-    /// `payload` is opaque bytes (metadata from Phase 7).
+    /// `payload` is opaque bytes (the engine stores JSON there).
     Upsert {
         id: u64,
         vector: Vec<f32>,
@@ -90,7 +90,8 @@ pub struct Recovered {
     pub records: Vec<(Lsn, Record)>,
     /// Bytes discarded: the torn/corrupt tail plus every later file.
     pub dropped_bytes: u64,
-    /// Whole files deleted because they followed a torn/corrupt record.
+    /// Whole files deleted because they followed a torn/corrupt record or
+    /// an LSN gap.
     pub dropped_files: usize,
 }
 
@@ -316,13 +317,17 @@ impl Wal {
     pub fn remove_before(&self, lsn: Lsn) -> Result<usize> {
         let s = &*self.shared;
         let doomed: Vec<Lsn> = {
-            let mut inner = lock(&s.inner);
+            let inner = lock(&s.inner);
             // File i holds [files[i], files[i+1]); removable if files[i+1] <= lsn.
             let n = inner.files.windows(2).take_while(|w| w[1] <= lsn).count();
-            inner.files.drain(..n).collect()
+            inner.files[..n].to_vec()
         };
+        // Untrack each file only once it's gone, so a failed delete is
+        // retried by the next call. Callers are serialized by the engine,
+        // so nothing else drains the front of `files` meanwhile.
         for &first in &doomed {
             fs::remove_file(file_path(&s.dir, first))?;
+            lock(&s.inner).files.remove(0);
         }
         if !doomed.is_empty() {
             sync_dir(&s.dir)?;
@@ -409,7 +414,8 @@ fn parse_file_name(name: &str) -> Option<Lsn> {
     if digits.len() != 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse().ok()
+    // LSNs start at 1; a file named 0 would underflow `durable`.
+    digits.parse().ok().filter(|&lsn| lsn != 0)
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -554,7 +560,7 @@ fn decode(buf: &[u8], expected_lsn: Lsn) -> Option<(Record, usize)> {
     body.is_empty().then_some((record, total))
 }
 
-/// Crash simulation for task 3.4a. Compiled only with `--features failpoints`.
+/// Crash simulation for tests. Compiled only with `--features failpoints`.
 #[cfg(feature = "failpoints")]
 pub mod failpoint {
     use std::cell::Cell;

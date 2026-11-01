@@ -43,7 +43,7 @@ Upsert body (`len = 16 + 4*dim + payload_len`):
 | 4           | dim `u32`   |
 | 4 × dim     | vector, `f32` each |
 | 4           | payload_len `u32` |
-| payload_len | payload (opaque bytes; metadata from Phase 7) |
+| payload_len | payload (opaque bytes; the engine stores JSON) |
 
 Delete body (`len = 8`): id `u64`.
 
@@ -93,8 +93,7 @@ dropping a `Wal` does a final best-effort sync.
 
 Plain `fsync(2)` on macOS does not flush the drive's write cache; only
 `fcntl(fd, F_FULLFSYNC)` does. Checked in the Rust 1.98.1 std source
-(`library/std/src/sys/fs/unix.rs`, read from the rust-docs `src/` pages
-since rust-src isn't installed): on `target_vendor = "apple"`, both
+(`library/std/src/sys/fs/unix.rs`): on `target_vendor = "apple"`, both
 `File::sync_all` (`fsync`) and `File::sync_data` (`datasync`) call
 `libc::fcntl(fd, libc::F_FULLFSYNC)`. So the WAL uses `sync_data`
 directly with no libc call. std has **no fallback** to `fsync` if

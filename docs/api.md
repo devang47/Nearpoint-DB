@@ -1,6 +1,6 @@
 # HTTP API
 
-JSON over HTTP/1.1 (task 4.4). Code: `crates/server/src/lib.rs`; design:
+JSON over HTTP/1.1. Code: `crates/server/src/lib.rs`; design:
 `docs/adr/0011-server-and-concurrency.md`. Python client:
 `clients/python/nearpoint.py`.
 
@@ -17,6 +17,11 @@ cargo run --release -p server -- --data-dir ~/data/Nearpoint/db
 | `--sync` | `NEARPOINT_SYNC` | `batch` | WAL durability: `always`, `batch` (group commit) or `<n>ms` (fsync every n ms; a power loss can lose that window) |
 | `--build-threads` | `NEARPOINT_BUILD_THREADS` | `0` | threads for background index builds and compaction; 0 = half the cores, so builds don't starve searches |
 | `--memory-limit-mib` | `NEARPOINT_MEMORY_LIMIT_MIB` | `0` | upserts get `503` while the process's phys_footprint is above this many MiB (0 = no limit); searches, gets and deletes still run (ADR 0013) |
+
+There is no authentication or TLS: anyone who can reach the port can
+read, write and drop every collection, and `attach_billion` moves a
+server-side directory of their choosing. Keep it on loopback (the
+default) or behind a proxy that authenticates.
 
 A background thread per collection seals, rebuilds and compacts
 segments (ADR 0012); one rewrite runs at a time across collections:
@@ -50,7 +55,7 @@ Errors from Nearpoint are JSON: `{"error": "<message>"}`.
 
 | Status | When |
 |--------|------|
-| 400 | invalid input: wrong vector length, NaN/infinite or > 1e15 component, zero `cosine` vector, payload type conflict, bad filter type, invalid config or name, `k`/`ef`/`nprobe`/`rerank` over 10,000, malformed bulk body |
+| 400 | invalid input: wrong vector length, NaN/infinite or > 1e15 component, zero `cosine` vector, payload type conflict, bad filter type, invalid config or name, `k`/`ef`/`nprobe`/`rerank` over 10,000, malformed bulk body, unparsable path parameter such as a non-numeric id (plain text) |
 | 404 | no such collection, point, or the collection was dropped during the request |
 | 409 | collection already exists |
 | 413 | body over 256 MiB (plain text) |
@@ -100,7 +105,7 @@ Creates a collection. `name`: 1–64 characters of `A-Z a-z 0-9 _ -`.
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `dim` | yes | vector dimension, > 0 |
+| `dim` | yes | vector dimension, 1..=65,536 |
 | `metric` | yes | `l2` (squared Euclidean), `inner_product` (negated dot) or `cosine` (1 − cos) |
 | `hnsw` | no | any of `m` (≥ 2, default 16), `ef_construction` (≥ 1, default 200), `seed` (default 42) |
 | `schema` | no | declared payload field types: `int`, `float`, `bool`, `keyword`, `keyword_list`. Undeclared fields take the type of their first value in each segment (`docs/filters.md`); segments whose undeclared fields differ in type are never merged, so declare fields you filter on |
@@ -127,7 +132,7 @@ description:
 ```
 
 `points` is the live (not deleted) point count. `segments` lists the
-current segments (`hnsw`, `ivf_pq`, then the in-memory `mutable` one) with
+current segments (`billion`, `hnsw`, `ivf_pq`, then the in-memory `mutable` one) with
 their row counts, deleted or replaced rows included in `rows` and counted
 in `dead`.
 

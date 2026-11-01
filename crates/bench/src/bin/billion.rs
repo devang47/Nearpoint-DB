@@ -1,4 +1,4 @@
-//! Billion mode (Phase 9, ADR 0014): train on a sample, encode a stream of
+//! Billion mode (ADR 0014): train on a sample, encode a stream of
 //! raw vectors into a build directory, sort it into lists, evaluate.
 //!
 //! ```text
@@ -140,6 +140,7 @@ fn build(dir: &Path, from: u64, total: u64, batch: usize) -> Result<()> {
     let (d, m) = (q.dim(), q.m());
     let (mut w, done) = StreamWriter::open(dir, m)?;
     ensure!(from == done, "--from {from}, but {done} rows are committed");
+    ensure!(batch > 0, "--batch must be at least 1");
     let (t, mut rows) = (Instant::now(), done);
     let mut stdin = io::stdin().lock();
     let mut raw = vec![0u8; batch * d];
@@ -203,7 +204,6 @@ impl Shared for RefineBytes {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn eval(
     dir: &Path,
     queries: &Path,
@@ -219,6 +219,7 @@ fn eval(
         b.m() == q.m() && b.nlist() == q.nlist(),
         "lists and quant differ"
     );
+    ensure!(nq > 0, "--nq must be at least 1");
     let qs = read_bin::<u8>(queries, Some(nq))?;
     let (gt_ids, _) = read_bin_ground_truth(gt)?;
     ensure!(

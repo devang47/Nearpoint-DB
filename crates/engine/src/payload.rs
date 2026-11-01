@@ -325,7 +325,6 @@ impl PayloadStore {
         (!out.is_empty()).then_some(out)
     }
 
-    /// The type of `field`, if any row has it.
     /// Approximate bytes held in RAM (bitmaps at their serialized size).
     pub fn heap_bytes(&self) -> usize {
         self.columns
@@ -346,6 +345,7 @@ impl PayloadStore {
             .sum()
     }
 
+    /// The type of `field`, if any row has it.
     pub fn kind(&self, field: &str) -> Option<Kind> {
         self.columns.get(field).map(Column::kind)
     }

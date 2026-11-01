@@ -1,4 +1,4 @@
-//! The HTTP/JSON API (task 4.4), documented endpoint by endpoint in
+//! The HTTP/JSON API, documented endpoint by endpoint in
 //! docs/api.md. Every engine call runs on tokio's blocking pool, so a
 //! WAL fsync or a long search never stalls the async workers.
 
@@ -21,9 +21,9 @@ use storage::wal::WalError;
 
 /// Largest request body. A bulk upsert is decoded into vectors and WAL
 /// records next to the body, so peak memory is a few times this.
-pub const MAX_BODY: usize = 256 << 20;
+const MAX_BODY: usize = 256 << 20;
 /// Largest `k`, `ef`, `nprobe` or `rerank` a search accepts.
-pub const MAX_K: usize = 10_000;
+const MAX_K: usize = 10_000;
 
 /// Upserts are refused (503) while the process's phys_footprint is above
 /// this many bytes; 0 = no limit. Deletes, searches and gets still run.
@@ -56,7 +56,7 @@ pub fn router(db: Arc<Db>) -> Router {
 
 /// An error response: `{"error": "..."}` with the status.
 #[derive(Debug)]
-pub struct ApiError(StatusCode, String);
+struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -357,18 +357,19 @@ async fn upsert(
     blocking(move || {
         let dim = c.config().dim;
         let n = req.points.len();
+        // Check every length before reserving n * dim floats.
+        if let Some((i, p)) = (req.points.iter().enumerate()).find(|(_, p)| p.vector.len() != dim) {
+            return Err(bad(format!(
+                "points[{i}]: vector has {} components, collection dim is {dim}",
+                p.vector.len()
+            )));
+        }
         let (mut ids, mut vectors, mut payloads) = (
             Vec::with_capacity(n),
             Vec::with_capacity(n * dim),
             Vec::with_capacity(n),
         );
-        for (i, p) in req.points.into_iter().enumerate() {
-            if p.vector.len() != dim {
-                return Err(bad(format!(
-                    "points[{i}]: vector has {} components, collection dim is {dim}",
-                    p.vector.len()
-                )));
-            }
+        for p in req.points {
             ids.push(p.id);
             vectors.extend_from_slice(&p.vector);
             payloads.push(p.payload);
@@ -396,13 +397,13 @@ async fn bulk(
 
 /// Ids, row-major vectors and payloads (empty: none), as `upsert_batch`
 /// takes them.
-pub type Batch = (Vec<u64>, Vec<f32>, Vec<Value>);
+type Batch = (Vec<u64>, Vec<f32>, Vec<Value>);
 
 /// Decodes a bulk body (docs/api.md): blocks of
 /// `n u32 | dim u32 | payload_len u32 | ids u64×n | vectors f32×n·dim |
 /// payload_len bytes of JSON lines`, little-endian. Payloads come back
 /// empty if no block has any.
-pub fn decode_bulk(mut b: &[u8], dim: usize) -> Result<Batch, String> {
+fn decode_bulk(mut b: &[u8], dim: usize) -> Result<Batch, String> {
     let (mut ids, mut vectors, mut payloads) = (Vec::new(), Vec::new(), Vec::new());
     let mut any_payload = false;
     let mut block = 0;

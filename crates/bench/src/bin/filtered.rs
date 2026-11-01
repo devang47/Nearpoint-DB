@@ -1,4 +1,4 @@
-//! Filtered-search harness (tasks 7.3/7.4): builds HNSW once, then for each
+//! Filtered-search harness: builds HNSW once, then for each
 //! filter kind and selectivity picks a subset of the base ids, computes
 //! exact filtered ground truth by brute force over it, and runs the queries
 //! one at a time with that filter. Reports recall, the distances each
@@ -53,9 +53,9 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     k: usize,
     /// Run only the first N queries (ground truth costs N full scans of
-    /// each filter).
-    #[arg(long, default_value_t = 1000)]
-    queries: usize,
+    /// each filter). Default: 1000, or all 100 for siftsmall.
+    #[arg(long)]
+    queries: Option<usize>,
     #[arg(long, default_value_t = 16)]
     m: usize,
     #[arg(long, default_value_t = 200)]
@@ -97,13 +97,14 @@ fn main() -> Result<()> {
         Some(rest) => PathBuf::from(std::env::var("HOME").context("HOME unset")?).join(rest),
         None => PathBuf::from(&args.data),
     };
-    let (dir, prefix, name) = match args.dataset {
-        Dataset::Siftsmall => ("siftsmall", "siftsmall", "siftsmall"),
-        Dataset::Sift1m => ("sift1m", "sift", "sift1m"),
+    let (dir, prefix, name, nq) = match args.dataset {
+        Dataset::Siftsmall => ("siftsmall", "siftsmall", "siftsmall", 100),
+        Dataset::Sift1m => ("sift1m", "sift", "sift1m", 1000),
     };
     let file = |kind: &str| root.join(dir).join(format!("{prefix}_{kind}.fvecs"));
     let base = read_xvecs::<f32>(&file("base"), None)?;
-    let query = read_xvecs::<f32>(&file("query"), Some(args.queries))?;
+    let query = read_xvecs::<f32>(&file("query"), Some(args.queries.unwrap_or(nq)))?;
+    ensure!(!query.is_empty(), "need at least one query");
     ensure!(base.dim() == query.dim(), "base/query dims differ");
     ensure!(args.k > 0, "k must be at least 1");
 
@@ -328,7 +329,11 @@ fn run(
         wanted += truth.len();
         for h in &result {
             id_hits += usize::from(truth.iter().any(|t| t.id == h.id));
-            tie_hits += usize::from(kernels::scalar::l2_sq(q, base.row(h.id as usize)) <= kth.dist);
+            // A hit outside the filter is a leak, never a match.
+            let allowed = params.filter.is_none_or(|f| f.contains(h.id));
+            tie_hits += usize::from(
+                allowed && kernels::scalar::l2_sq(q, base.row(h.id as usize)) <= kth.dist,
+            );
         }
     }
     let total = started.elapsed();

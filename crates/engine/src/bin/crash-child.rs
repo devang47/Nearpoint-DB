@@ -1,4 +1,4 @@
-//! Writer for the SIGKILL crash test (task 3.4b, `tests/crash.rs`): opens
+//! Writer for the SIGKILL crash test (`tests/crash.rs`): opens
 //! the collection in `<dir>` and runs random upserts, deletes and seals
 //! until killed. Before each op it prints the op (`U <id> <ver>`, `D <id>`,
 //! `S` or `M` for a background step), and `ok` once the op is acknowledged.

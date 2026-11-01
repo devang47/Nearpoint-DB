@@ -1,4 +1,4 @@
-//! Segment file format v2 (v1: task 3.2). See docs/formats/segment.md.
+//! Segment file format v2 (reads v1 too). See docs/formats/segment.md.
 //! v2 adds element type "none": a segment without f32 vectors (an IVF-PQ
 //! segment whose index keeps its own codes). v1 files still load.
 //!
@@ -21,10 +21,10 @@ use memmap2::Mmap;
 compile_error!("segment files are little-endian and their sections are mapped in place");
 
 /// First and last 8 bytes of every segment file.
-pub const MAGIC: [u8; 8] = *b"NPSEGMT\0";
+pub(crate) const MAGIC: [u8; 8] = *b"NPSEGMT\0";
 /// The format version this build writes and the newest it reads (it
 /// also reads v1).
-pub const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 2;
 
 const HEADER_LEN: usize = 64;
 const FOOTER_LEN: usize = 96;
@@ -247,7 +247,7 @@ fn verify_vectors(b: &[u8], layout: &Layout) -> Result<()> {
 }
 
 /// `<path>.tmp`: where a segment is built before it's renamed into place.
-pub fn tmp_path(path: &Path) -> PathBuf {
+pub(crate) fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     PathBuf::from(s)

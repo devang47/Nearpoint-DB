@@ -124,11 +124,12 @@ impl Hnsw {
 
     /// Bytes held in RAM: vectors, levels and both layers' lists.
     pub fn heap_bytes(&self) -> usize {
-        let upper: usize = self.upper.iter().map(|u| 16 + 4 * u.len()).sum();
+        // A `Box<[_]>` is 16 B; empty ones (most nodes) allocate nothing.
+        let upper: usize = self.upper.iter().map(|u| 4 * u.len()).sum();
         4 * self.vectors.capacity()
             + self.levels.capacity()
             + 4 * self.layer0.capacity()
-            + 24 * self.upper.capacity()
+            + 16 * self.upper.capacity()
             + upper
     }
 
@@ -159,7 +160,7 @@ impl Hnsw {
     /// Rebuilds an index from `to_bytes` output and its vectors (in stored
     /// form, as `vectors()` returned them; they are not normalized again).
     /// Takes ownership of the vectors, so loading from a mapped segment
-    /// costs one copy in RAM (v1 keeps `Hnsw` owning a `Vec<f32>`).
+    /// costs one copy in RAM (`Hnsw` owns its vectors).
     ///
     /// Everything is validated, so a corrupt blob is an error here rather
     /// than a panic or an out-of-bounds read during a later search.
@@ -468,7 +469,15 @@ impl Hnsw {
     /// would, else a budgeted walk (ADR 0010).
     pub fn plan(&self, k: usize, params: &SearchParams) -> Plan {
         match params.filter {
-            Some(f) if brute_force_wins(f.len(), params.ef.max(k), self.len()) => Plan::BruteForce,
+            Some(f)
+                if brute_force_wins(
+                    f.range_cardinality(..self.len() as u32),
+                    params.ef.max(k),
+                    self.len(),
+                ) =>
+            {
+                Plan::BruteForce
+            }
             _ => Plan::Graph,
         }
     }
@@ -527,7 +536,7 @@ pub enum Plan {
     /// walks under the budget cost what they cost, walks over it cost
     /// budget + brute force = 2x brute force. A larger budget raises that
     /// worst case to (1 + c)x; a smaller one aborts walks that were
-    /// cheaper than brute force (ADR 0010, 7.5 addendum).
+    /// cheaper than brute force (ADR 0010, walk-budget addendum).
     Graph,
     /// The filtered walk without a budget: runs to the end however many
     /// distances it takes. For benchmarks and tests of the walk itself.

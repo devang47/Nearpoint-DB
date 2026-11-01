@@ -19,5 +19,5 @@ proptest.workspace = true
 workspace = true
 
 [features]
-# Crash-simulation hooks for tests (task 3.4a). See wal::failpoint.
+# Crash-simulation hooks for tests. See wal::failpoint.
 failpoints = []

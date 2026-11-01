@@ -1,5 +1,5 @@
 //! Loads a prefix of a big-ann-benchmarks `.u8bin` base through the HTTP
-//! API and measures the result (Phase 8.3).
+//! API and measures the result.
 //!
 //! 1. Load: `--writers` connections stream `--batch`-row bulk upserts of
 //!    ids `0..n` with payload `{"tag": "t<id % 10>"}`. A 503 (the server's
@@ -15,7 +15,7 @@
 //! 4. Delete every id `≡ 0 (mod --delete-every)` and measure again: no
 //!    deleted id may come back (counted as violations).
 //!
-//! `--purge` (8.2) empties the page cache before each measured pass; the
+//! `--purge` empties the page cache before each measured pass; the
 //! dataset files are read with `F_NOCACHE` either way, so they never push
 //! the server's segment pages out.
 //!
@@ -89,7 +89,7 @@ struct Args {
     /// Delete ids `≡ 0 (mod this)` before the second measurement; 0 = skip.
     #[arg(long, default_value_t = 100)]
     delete_every: u64,
-    /// Cold cache (8.2): `sudo -n /usr/sbin/purge` right before each
+    /// Cold cache: `sudo -n /usr/sbin/purge` right before each
     /// measured pass, so each starts with no file pages cached.
     #[arg(long)]
     purge: bool,
@@ -421,6 +421,10 @@ fn run(
 fn main() -> anyhow::Result<()> {
     let a = Args::parse();
     let (queries, dim) = read_u8bin(&a.query_file, a.queries.max(a.filtered))?;
+    ensure!(
+        queries.len() / dim >= a.queries.max(a.filtered),
+        "query file has fewer rows than --queries / --filtered"
+    );
     let (gt, gk) = read_gt(&a.gt)?;
     ensure!(gt.len() / gk >= a.queries, "ground truth has fewer queries");
     let mut http = Http::new(&a.addr);

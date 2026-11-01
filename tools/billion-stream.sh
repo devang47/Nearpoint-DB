@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Writes rows [first, total) of the BIGANN 1B base (u8, dim 128, no header)
-# to stdout, for `billion build` (Phase 9). Fetches 64 MB range chunks,
+# to stdout, for `billion build`. Fetches 64 MB range chunks,
 # `par` at a time with the next group already downloading, and deletes each
 # chunk once it is piped on: at most 2 * par chunks (~0.5 GB) of raw data
 # are ever on disk. Exits non-zero if a chunk fails after curl's retries;

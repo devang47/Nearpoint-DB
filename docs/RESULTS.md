@@ -631,7 +631,7 @@ layout: 38 IVF-PQ segments of 2.2–3.5M rows (a 4-way merge would pass the
 - Restart: 60 s to first reply (every segment's blob, 15 GB, is read for
   its CRC at open; ADR 0013).
 
-### 2026-11-01 — 8.2 cold cache (4e999d5, `.context/cold100m.sh`)
+### 2026-11-01 — 8.2 cold cache (4e999d5)
 
 Same 100M data directory (after the 1M deletes). `sudo -n purge` before
 the server start and, with `bigload --purge`, before each measured pass;

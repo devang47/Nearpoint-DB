@@ -1,5 +1,7 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   check:
     runs-on: macos-latest # Apple Silicon, same arch as the target Mac mini

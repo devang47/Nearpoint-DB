@@ -26,8 +26,9 @@ followed by an fsync of `collections/`.
 | `CONFIG` | the collection's settings (below); written once at create |
 | `MANIFEST` | live segments, their tombstones, covered LSN (below) |
 | `wal/` | the WAL (`wal.md`) |
-| `<file>.seg` | a sealed segment (`segment.md`): HNSW blob, or IVF-PQ blob with the f32 vectors kept (element type 0) |
+| `<file>.seg` | a sealed segment (`segment.md`): HNSW blob, or IVF-PQ blob with the f32 vectors kept (element type 0) or, with `exact_vectors: false`, without them (element type 1) |
 | `<file>.payloads` | that segment's payloads (`payloads.md`) |
+| `<file>.billion/` | an attached billion-mode build (`billion.md`); no `.seg` or `.payloads` |
 
 `<file>` is the segment's file id, zero-padded to 20 digits. Since
 manifest v2 it comes from a counter (one past the largest id in the
@@ -36,7 +37,9 @@ files are named by the LSN their seal covered, and those names stay
 valid ids. On open, `*.tmp` files and `.seg`/`.payloads` files the
 manifest doesn't list are deleted (leftovers of a crashed seal, build or
 compaction, or inputs of a compaction that crashed before deleting
-them); other names are ignored. No `MANIFEST` means no sealed segments
+them). An unlisted `<file>.billion/` (an attach that crashed before
+publishing) is kept, with a warning, since it is the user's moved build;
+file ids continue past it. Other names are ignored. No `MANIFEST` means no sealed segments
 (`covered = 0`).
 
 ## Framing (shared with `payloads.md`)
@@ -112,11 +115,13 @@ no live row is a no-op. A compaction may likewise drop such rows. ADR
 ## Recovery rules
 
 1. Read the manifest (v2, or v1; none: empty). Delete garbage files.
-2. Open each listed segment (every CRC checked), check dim and metric
-   against the config, load its index (HNSW: vectors copied into RAM;
-   IVF-PQ: index in RAM, f32 vectors left in the mapped file) and
-   payloads, apply its tombstones. A segment without f32 vectors, a flat
-   blob, or an index whose length differs from the id count is corrupt.
+2. Open each listed segment (every CRC checked except an IVF-PQ
+   segment's vector section, verified later in the background), check dim
+   and metric against the config, load its index (HNSW: vectors copied
+   into RAM; IVF-PQ: index in RAM, vectors left in the mapped file) and
+   payloads, apply its tombstones. An HNSW segment without f32 vectors, a
+   flat blob, or an index whose length differs from the id count is
+   corrupt.
    An id live in two rows is corrupt.
 3. Open the WAL (torn tail truncated). Records with LSN ≤ covered are
    skipped; the next one must be exactly `covered + 1`, or the WAL must
@@ -134,6 +139,7 @@ Seal, build and compaction order and crash analysis: ADR 0008, ADR 0012.
 | 2 | 2026-10-29 | Segment ids are file ids from a counter, not LSNs (may exceed `covered`); same layout. v1 still read. Fixture: `crates/engine/testdata/manifest-v2`. |
 
 `CONFIG`: v1 (task 4.1); Phase 6 added optional keys (`seal_rows`,
-`ivf_rows`, `max_merge_rows`) without a version change. The config lives
+`ivf_rows`, `max_merge_rows`), and later `exact_vectors`, without a
+version change. The config lives
 in its own file, written once, so seals never rewrite it, and the name is
 the directory name.

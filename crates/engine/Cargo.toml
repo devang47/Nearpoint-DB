@@ -17,7 +17,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# Turns on the WAL's crash-simulation hooks for engine's tests (task 3.4a).
+# Turns on the WAL's crash-simulation hooks for engine's tests.
 storage = { path = "../storage", features = ["failpoints"] }
 
 [lints]

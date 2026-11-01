@@ -1,5 +1,5 @@
-"""Minimal Nearpoint client (task 4.5): stdlib only, one method per
-endpoint in docs/api.md.
+"""Minimal Nearpoint client: stdlib only, a method for each collection and
+point endpoint in docs/api.md (not /metrics or attach_billion).
 
     from nearpoint import Client
     c = Client("http://127.0.0.1:7700")
@@ -26,8 +26,9 @@ import urllib.request
 
 
 class NearpointError(Exception):
-    """A non-2xx response. `status` 503 means the write outcome is unknown
-    (the server's WAL failed): it may or may not be durable."""
+    """A non-2xx response. A 503 whose message starts with `memory limit`
+    wrote nothing (retry later); any other 503 means the write outcome is
+    unknown (the server's WAL failed): it may or may not be durable."""
 
     def __init__(self, status, message):
         super().__init__(f"HTTP {status}: {message}")

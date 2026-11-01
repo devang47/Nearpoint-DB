@@ -26,7 +26,7 @@ The roadmap lives in `docs/PLAN.md`. Always check it before starting work.
 - Metadata: per-segment columnar store; filters → roaring bitmaps.
 
 ## Workspace layout
-- `crates/kernels`  distance functions (scalar + NEON, f32/f16/int8)
+- `crates/kernels`  distance functions (scalar + NEON, f32/int8, 4-bit PQ fast-scan)
 - `crates/quant`    k-means, product quantization, scalar quantization
 - `crates/index`    `Index` trait; flat, HNSW, IVF-PQ implementations
 - `crates/storage`  WAL, segment file format, mmap, checksums

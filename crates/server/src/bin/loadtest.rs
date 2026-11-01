@@ -1,6 +1,6 @@
 //! Load test: concurrent upserts (JSON and bulk), replacements, deletes,
-//! seals and searches against a running server. Phase 4 acceptance (default
-//! mode) and the Phase 6 soak (`--live N`).
+//! seals and searches against a running server: a fixed workload (default
+//! mode) or a soak at a steady live count (`--live N`).
 //!
 //! Checks, for the whole run:
 //! - every request succeeds (any non-2xx or I/O error is an error);
@@ -62,7 +62,7 @@ struct Args {
     /// Collection to (re)create; dropped at the end unless `--keep`.
     #[arg(long, default_value = "loadtest")]
     collection: String,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
     writers: u64,
     #[arg(long, default_value_t = 4)]
     readers: u64,
@@ -72,8 +72,8 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     batch: usize,
     /// Write rounds per second per writer (each: one insert, one replace,
-    /// one delete request). Bounds RAM: rows are never compacted yet.
-    #[arg(long, default_value_t = 10)]
+    /// one delete request).
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     rounds_per_sec: u64,
     /// Seal every this many seconds (0: never).
     #[arg(long, default_value_t = 60)]
@@ -81,7 +81,7 @@ struct Args {
     #[arg(long)]
     keep: bool,
     /// Soak mode: preload this many points and keep the live count there
-    /// (0: the default Phase 4 mode).
+    /// (0: the default fixed-workload mode).
     #[arg(long, default_value_t = 0)]
     live: usize,
     /// Soak: probe (pause writers, measure recall) and report every this

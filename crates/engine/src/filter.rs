@@ -114,14 +114,6 @@ pub fn evaluate(filter: &Filter, store: &PayloadStore, universe: u32) -> Result<
     Ok(bits)
 }
 
-/// Fraction of the universe a bitmap keeps, for the brute-force planner.
-pub fn selectivity(bits: &RoaringBitmap, universe: u32) -> f64 {
-    if universe == 0 {
-        return 0.0;
-    }
-    bits.len() as f64 / f64::from(universe)
-}
-
 fn all(universe: u32) -> RoaringBitmap {
     let mut b = RoaringBitmap::new();
     b.insert_range(0..universe);

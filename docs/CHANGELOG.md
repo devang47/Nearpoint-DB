@@ -15,6 +15,35 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — Pre-publish review: fixes and cleanup
+- **What:** an independent review of every crate, the client, the tools and
+  the docs, and fixes for what it found:
+  - engine: a seal's next segment keeps the frozen segment's column types
+    (`freeze`). Before, a write accepted while a seal was pending could
+    make WAL replay fail with `TypeConflict` after a crash, so the
+    collection (and server) wouldn't open. `Db::open` skips stray files
+    in `collections/` (a `.DS_Store` failed it). An unattached
+    `<file>.billion` is kept and file ids continue past it instead of
+    being reused. `dim` is capped at 65,536. Tests for each.
+  - server: upsert checks vector lengths before reserving `n × dim`
+    floats (with a huge `dim` that aborted the process). docs/api.md now
+    says the API has no authentication. Unused `thiserror` and needless
+    `pub`s removed.
+  - storage: WAL files named LSN 0 are ignored (`durable` underflow);
+    `remove_before` untracks a file only after it is deleted; a failed
+    billion `sort` removes `lists.tmp`; checked arithmetic on billion
+    footer sizes; a flaky phys_footprint assertion dropped.
+  - index: `Hnsw::heap_bytes` no longer over-counts 24 B per node;
+    `plan` counts only in-range filter ids, as `search_with` does.
+  - bench/tools: filtered recall doesn't count hits outside the filter;
+    guards for `--batch 0`, zero queries and siftsmall's 100 queries;
+    loadtest never retries a create/drop; script path and flag fixes.
+  - docs: filtered-search semantics for IVF-PQ and billion segments,
+    manifest/segment format drift, README 1B RAM (0.17 GB), task and
+    phase numbers dropped from code comments.
+- **Why:** final publish. Measured numbers are unchanged (RESULTS.md
+  reports phys_footprint, not `heap_bytes`).
+
 ## 2026-11-01 — CI: gate the int8 test strategy on dotprod
 - **What:** `i8_pair` in `crates/kernels/src/neon.rs` tests now carries
   `#[cfg(target_feature = "dotprod")]`, like the tests that use it.

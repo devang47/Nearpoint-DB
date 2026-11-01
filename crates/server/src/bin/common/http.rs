@@ -57,9 +57,11 @@ impl Http {
         let mut res = self.try_call(method, path, ctype, body);
         // RFC 9112 §9.3.1: a server may close an idle keep-alive connection;
         // a request that fails on a reused one before any reply byte is
-        // retried once on a new one. Every request here is idempotent
-        // (searches, gets, upserts and deletes by id).
-        if reused && matches!(&res, Err(e) if e.is::<Stale>()) {
+        // retried once on a new one, unless it creates or drops a
+        // collection (a retry would see 409/404). The rest are idempotent
+        // (searches, gets, seals, upserts and deletes by id).
+        let retryable = method != "PUT" && method != "DELETE";
+        if reused && retryable && matches!(&res, Err(e) if e.is::<Stale>()) {
             RECONNECTS.fetch_add(1, SeqCst);
             self.conn = None;
             res = self.try_call(method, path, ctype, body);

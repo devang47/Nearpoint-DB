@@ -1,4 +1,4 @@
-//! The collection registry (task 4.1): every collection under one data
+//! The collection registry: every collection under one data
 //! directory, reopened on start without flags. Layout and the `CONFIG`
 //! file: docs/formats/manifest.md; design: ADR 0011.
 //!
@@ -162,6 +162,11 @@ impl Db {
         let mut colls = BTreeMap::new();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
+            // Stray files (e.g. Finder's .DS_Store) are neither collections
+            // nor staging directories.
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
@@ -517,5 +522,14 @@ mod tests {
         drop(hold_b);
         t.join().unwrap();
         Db::open(&d.0, SyncPolicy::Batch).unwrap();
+    }
+
+    #[test]
+    fn stray_files_in_collections_are_ignored() {
+        let d = TempDir::new("stray");
+        drop(Db::open(&d.0, SyncPolicy::Batch).unwrap());
+        fs::write(d.0.join("collections/.DS_Store"), b"x").unwrap();
+        fs::write(d.0.join("collections/notes"), b"x").unwrap();
+        assert!(Db::open(&d.0, SyncPolicy::Batch).unwrap().list().is_empty());
     }
 }

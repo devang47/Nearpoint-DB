@@ -1,6 +1,6 @@
 //! The `Index` trait and its flat, HNSW and IVF-PQ implementations.
 //!
-//! Indexes own their vectors and hand out dense ids `0..len()` in insertion
+//! Indexes own their data and hand out dense ids `0..len()` in insertion
 //! order; mapping to user-facing ids is the engine's job.
 
 use std::borrow::Cow;
@@ -145,7 +145,7 @@ pub trait Index: Send + Sync {
         self.len() == 0
     }
     /// Adds `vectors` (row-major, a multiple of `dim()` long) and returns
-    /// their ids. Building an index is `add` on an empty one; batches are
+    /// their ids. Building an index is `add` on an empty one; batches may be
     /// inserted in parallel.
     fn add(&mut self, vectors: &[f32]) -> Result<Range<u32>>;
     /// The `k` nearest vectors to `query`, nearest first.

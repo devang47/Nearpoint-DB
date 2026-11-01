@@ -1,6 +1,6 @@
 //! `evaluate` against a row-by-row reference over the same payloads.
 
-use engine::{Bounds, Error, Filter, Kind, PayloadStore, Scalar, evaluate, selectivity};
+use engine::{Bounds, Error, Filter, Kind, PayloadStore, Scalar, evaluate};
 use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
@@ -226,8 +226,7 @@ fn documented_semantics() {
     assert_eq!(rows(&s, json!({"eq": {"stock": false}})), [] as [u32; 0]);
 
     let bits = evaluate(&parse(json!({"exists": "color"})), &s, 5).unwrap();
-    assert_eq!(selectivity(&bits, 5), 0.4);
-    assert_eq!(selectivity(&bits, 0), 0.0);
+    assert_eq!(bits.len(), 2);
 }
 
 #[test]

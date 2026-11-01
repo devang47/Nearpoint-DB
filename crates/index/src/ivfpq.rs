@@ -38,7 +38,7 @@ const MAGIC: &[u8; 4] = b"NPIV";
 pub struct Config {
     /// Coarse cells (inverted lists).
     pub nlist: usize,
-    /// PQ subspaces = bytes per code. Must divide `dim`.
+    /// PQ subspaces (m bytes per code at 8 bits, m/2 at 4). Must divide `dim`.
     pub m: usize,
     /// Bits per PQ sub-code: 8, or 4 for fast-scan (then `m <= 256`).
     pub nbits: u32,
@@ -71,8 +71,8 @@ pub struct IvfPq {
     len: usize,
 }
 
-/// A buffer an index can borrow its SQ codes from: in practice the mapped
-/// segment file's index blob.
+/// A buffer an index can borrow its SQ codes from, such as a region of
+/// a mapped file.
 pub trait Shared: Send + Sync {
     fn bytes(&self) -> &[u8];
 
@@ -689,7 +689,7 @@ impl Index for IvfPq {
             let offset = 128.0 * scale * query.iter().sum::<f32>() + kernels::dot(query, min);
             let mut code = vec![0f32; self.dim];
             // Mapped codes: request every candidate's page first, so the
-            // reads overlap (BIGANN 100M, 39 segments: p50 65 -> 48 ms).
+            // reads overlap (docs/RESULTS.md has the measured gain).
             self.sq_codes.will_need(hits.iter().map(|h| h.id), self.dim);
             for h in &mut hits {
                 let c = &self.sq_codes[h.id as usize * self.dim..][..self.dim];

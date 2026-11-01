@@ -1,4 +1,4 @@
-//! A collection (tasks 3.3–3.4, 4.2–4.3, 6.1–6.4): a WAL, one mutable
+//! A collection: a WAL, one mutable
 //! in-RAM HNSW segment, sealed segments, an external-id map and tombstones,
 //! all in one directory. Layout, LSN coverage and the seal protocol are in
 //! docs/adr/0008-collection-recovery.md; sealing at a size, the builder,
@@ -70,6 +70,8 @@ pub const DEFAULT_NPROBE: usize = 32;
 pub const DEFAULT_RERANK: usize = 100;
 /// Smallest `ivf_rows`: 8-bit PQ trains 256 centroids per subspace.
 const MIN_IVF_ROWS: u32 = 1024;
+/// Bounds per-row allocations sized from `dim` (an API caller picks it).
+const MAX_DIM: usize = 65_536;
 /// Largest accepted vector component: keeps squared distances finite.
 const MAX_COMPONENT: f32 = 1e15;
 /// A merge's f32 copy at most this big (4M rows at dim 128).
@@ -112,8 +114,10 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        if self.dim == 0 || self.hnsw.m < 2 || self.hnsw.ef_construction == 0 {
-            return Err(Error::Invalid("need dim > 0, m >= 2, ef_construction >= 1"));
+        if !(1..=MAX_DIM).contains(&self.dim) || self.hnsw.m < 2 || self.hnsw.ef_construction == 0 {
+            return Err(Error::Invalid(
+                "need 1 <= dim <= 65536, m >= 2, ef_construction >= 1",
+            ));
         }
         if self.seal_rows == 0 || self.max_merge_rows == 0 || self.ivf_rows < MIN_IVF_ROWS {
             return Err(Error::Invalid(
@@ -326,8 +330,8 @@ pub struct Memory {
     pub mapped: u64,
 }
 
-/// A segment's index. IVF-PQ keeps its f32 vectors in the mapped file
-/// (not in RAM): `get` stays exact and Phase 8 can re-rank from them.
+/// A segment's index. IVF-PQ keeps its vector section (exact f32, or
+/// int8 codes with `exact_vectors: false`) in the mapped file, not in RAM.
 /// `open` doesn't check that section's CRC (it can be GBs); the third
 /// field is the result of `verify_vectors` once `maintain` has run it
 /// (`true` from the start for a file this process wrote). HNSW vectors
@@ -339,7 +343,7 @@ enum SegIndex {
     Billion(Box<BillionSeg>),
 }
 
-/// A billion-mode build attached as a segment (task 9.5, ADR 0014). Its row
+/// A billion-mode build attached as a segment (ADR 0014). Its row
 /// r is id r: ids are implicit and never in `live` (1B entries would be
 /// ~20 GB); `Collection::base_row` finds them. Never compacted.
 struct BillionSeg {
@@ -534,7 +538,7 @@ impl Collection {
         fs::create_dir_all(&dir)?;
         let manifest = read_manifest(&dir.join(MANIFEST))?;
         let keep: Vec<u64> = manifest.segs.iter().map(|s| s.0).collect();
-        remove_garbage(&dir, &keep)?;
+        let last_file = remove_garbage(&dir, &keep)?;
 
         let mut segs = Vec::new();
         let mut live = HashMap::new();
@@ -563,7 +567,7 @@ impl Collection {
         }
         let mut segs = base.segs;
         let key = segs.len() as u32;
-        segs.push(new_mutable(&cfg, key));
+        segs.push(new_mutable(&cfg, key, &cfg.schema));
 
         let (wal, rec) = Wal::open(dir.join("wal"), cfg.sync)?;
         let c = Collection {
@@ -575,7 +579,7 @@ impl Collection {
                 closed: false,
             }),
             maint: Mutex::new(Maint {
-                next_file: keep.iter().max().map_or(1, |m| m + 1),
+                next_file: last_file + 1,
                 pending: None,
                 closed: false,
             }),
@@ -1071,8 +1075,15 @@ impl Collection {
             self.wal.remove_before(last + 1)?;
             return Ok(());
         }
+        // A crash before the seal publishes replays the frozen rows and
+        // every later one into a single segment, so the new segment keeps
+        // the frozen one's column types: replay then can't conflict.
+        let kinds: Schema = (read(&frozen.seg).payloads.kinds())
+            .map(|(f, k)| (f.clone(), k))
+            .collect();
         let mut next = (*snap).clone();
-        next.segs.push(new_mutable(&self.cfg, self.new_key()));
+        next.segs
+            .push(new_mutable(&self.cfg, self.new_key(), &kinds));
         *write(&self.snap) = Arc::new(next);
         m.pending = Some(Pending {
             key: frozen.key,
@@ -1729,7 +1740,7 @@ fn open_billion(dir: &Path, cfg: &Config) -> Result<BillionSeg> {
     let files = Arc::new(Billion::open(dir)?);
     if quant.dim() != cfg.dim || quant.nlist() != files.nlist() || quant.m() != files.m() {
         return Err(Error::Invalid(
-            "billion build doesn't match the collection's dim",
+            "billion build is inconsistent or has another dim",
         ));
     }
     if files.len() > u64::from(u32::MAX) {
@@ -1839,11 +1850,11 @@ impl ivfpq::Shared for Blob {
     }
 }
 
-fn new_mutable(cfg: &Config, key: u32) -> View {
+fn new_mutable(cfg: &Config, key: u32, schema: &Schema) -> View {
     let seg = Seg {
         index: SegIndex::Hnsw(Hnsw::new(cfg.dim, cfg.metric, cfg.hnsw)),
         ids: Vec::new(),
-        payloads: PayloadStore::with_schema(&cfg.schema),
+        payloads: PayloadStore::with_schema(schema),
     };
     View {
         key,
@@ -1939,16 +1950,25 @@ fn file_path(dir: &Path, file: u64, ext: &str) -> PathBuf {
 
 /// Deletes `*.tmp` files and segment files the manifest doesn't list:
 /// leftovers of a crashed write, seal or compaction.
-fn remove_garbage(dir: &Path, keep: &[u64]) -> Result<()> {
+/// Returns the highest file id on disk, so a new file never reuses one.
+/// An unlisted billion directory (an attach that crashed before
+/// publishing) is the user's build moved in: it is kept, not deleted.
+fn remove_garbage(dir: &Path, keep: &[u64]) -> Result<u64> {
     let mut removed = false;
+    let mut last = keep.iter().copied().max().unwrap_or(0);
     for entry in fs::read_dir(dir)? {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else { continue };
-        let file = name
-            .strip_suffix(".seg")
-            .or_else(|| name.strip_suffix(".payloads"))
-            .filter(|d| d.len() == 20 && d.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|d| d.parse::<u64>().ok());
+        let numbered = |suffix| {
+            name.strip_suffix(suffix)
+                .filter(|d: &&str| d.len() == 20 && d.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|d| d.parse::<u64>().ok())
+        };
+        if let Some(f) = numbered(".billion").filter(|f| !keep.contains(f)) {
+            tracing::warn!(dir = %dir.join(name).display(), "unattached billion build");
+            last = last.max(f);
+        }
+        let file = numbered(".seg").or_else(|| numbered(".payloads"));
         if name.ends_with(".tmp") || file.is_some_and(|f| !keep.contains(&f)) {
             fs::remove_file(dir.join(name))?;
             removed = true;
@@ -1957,7 +1977,7 @@ fn remove_garbage(dir: &Path, keep: &[u64]) -> Result<()> {
     if removed {
         File::open(dir)?.sync_all()?;
     }
-    Ok(())
+    Ok(last)
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -2303,6 +2323,24 @@ mod tests {
             drop(c);
             check(&open(&d), &model);
         }
+    }
+
+    /// A write accepted while a seal is pending must replay after a crash,
+    /// even though replay puts it in one segment with the frozen rows.
+    #[test]
+    fn write_during_failed_seal_replays() {
+        let d = TempDir::new("pending-types");
+        let c = open(&d);
+        c.upsert(1, &vec_for(1, 0), &json!({"x": 1})).unwrap();
+        CRASH_AFTER.set(2); // files written, manifest not published
+        assert!(c.seal().is_err());
+        CRASH_AFTER.set(0);
+        // The open segment has the frozen one's types: "x" is still int.
+        assert!(c.upsert(2, &vec_for(2, 0), &json!({"x": "s"})).is_err());
+        c.upsert(2, &vec_for(2, 0), &json!({"x": 2})).unwrap();
+        drop(c);
+        let c = open(&d);
+        assert_eq!(c.get(2).unwrap().1, json!({"x": 2}));
     }
 
     #[test]

@@ -1,10 +1,10 @@
-//! Task 3.4b: SIGKILL a writer (`src/bin/crash-child.rs`) at random
+//! SIGKILL a writer (`src/bin/crash-child.rs`) at random
 //! moments, reopen the collection, and check that every acknowledged
 //! upsert is there with its vector and payload and every acknowledged
 //! delete is gone. The one op in flight at the kill may go either way.
 //!
 //! SIGKILL keeps the OS page cache, so this tests the process, not power
-//! loss (that rests on the WAL's F_FULLFSYNC, task 3.1).
+//! loss (that rests on the WAL's F_FULLFSYNC).
 //!
 //! Seeded: `NEARPOINT_CRASH_SEED=<seed>` reruns a failure.
 
@@ -190,8 +190,8 @@ fn crash_cycles(cycles: usize) {
     let mut rng = seed;
     let mut model = Model::new();
     for cycle in 0..cycles {
-        // A fresh collection every 25 cycles keeps the segment count
-        // bounded (no compaction yet) while still crashing over many
+        // A fresh collection every 25 cycles keeps the directory small
+        // while still crashing over many
         // generations of seals and replays.
         if cycle.is_multiple_of(25) {
             let _ = std::fs::remove_dir_all(&dir);
@@ -211,7 +211,7 @@ fn sigkill_20_cycles() {
     crash_cycles(20);
 }
 
-/// The 3.4 acceptance run:
+/// The 1000-cycle acceptance run:
 /// `cargo test --release -p engine --test crash -- --ignored --nocapture`
 #[test]
 #[ignore]

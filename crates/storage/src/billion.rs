@@ -1,4 +1,4 @@
-//! Billion-mode files (Phase 9; layouts in docs/formats/billion.md).
+//! Billion-mode files (ADR 0014; layouts in docs/formats/billion.md).
 //!
 //! A build directory holds, in order of creation:
 //! - `quant`: the trained quantizers (framed, opaque to storage);
@@ -35,7 +35,7 @@ const LISTS_VERSION: u32 = 1;
 const REFINE_FOOTER: usize = 32;
 const LISTS_FOOTER: usize = 48;
 /// Most lists a `u16` list id can name.
-pub const MAX_NLIST: usize = 1 << 16;
+pub(crate) const MAX_NLIST: usize = 1 << 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -238,6 +238,14 @@ type Visit<'a> = dyn FnMut(u64, u16, &[u8]) -> Result<()> + 'a;
 /// and write it in place. Checks the stream's CRC against `progress` on
 /// every pass. Returns the number of passes after the count.
 pub fn sort(dir: &Path, nlist: usize, budget: usize) -> Result<usize> {
+    let tmp = dir.join("lists.tmp");
+    // A failed sort would otherwise leave a full-size tmp file on disk.
+    sort_into(dir, &tmp, nlist, budget).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+fn sort_into(dir: &Path, tmp: &Path, nlist: usize, budget: usize) -> Result<usize> {
     if nlist == 0 || nlist > MAX_NLIST {
         return Err(Error::Invalid("nlist must be 1..=65536"));
     }
@@ -285,8 +293,7 @@ pub fn sort(dir: &Path, nlist: usize, budget: usize) -> Result<usize> {
     let ids_len = n * 4;
     let by_id_at = ids_at + ids_len;
     let end = by_id_at + n * 2;
-    let tmp = dir.join("lists.tmp");
-    let out = File::create(&tmp)?;
+    let out = File::create(tmp)?;
     out.set_len(end)?;
 
     // The counting pass also writes each id's list (in id order).
@@ -370,7 +377,7 @@ pub fn sort(dir: &Path, nlist: usize, budget: usize) -> Result<usize> {
     foot.extend_from_slice(&c.to_le_bytes());
     out.write_all_at(&foot, end)?;
     out.sync_data()?;
-    fs::rename(&tmp, dir.join("lists"))?;
+    fs::rename(tmp, dir.join("lists"))?;
     sync_dir(dir)?;
     Ok(ranges.len())
 }
@@ -452,16 +459,23 @@ impl Billion {
         if nlist == 0 || nlist > MAX_NLIST || m == 0 || n > u64::from(u32::MAX) + 1 {
             return Err(Error::Corrupt(lp, "bad footer fields"));
         }
-        let size = |x: u64| usize::try_from(x).map_err(|_| Error::Invalid("file too big"));
+        // Footer fields are untrusted: checked arithmetic, so a forged
+        // footer is a length mismatch rather than an overflow.
+        let size = |x: Option<u64>| {
+            x.and_then(|x| usize::try_from(x).ok())
+                .ok_or(Error::Invalid("file too big"))
+        };
+        let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::Invalid("file too big"));
+        let codes_len = size(n.checked_mul(m as u64))?;
         let codes_at = 8 * (nlist + 1);
-        let codes_end = codes_at + size(n * m as u64)?;
+        let codes_end = add(codes_at, codes_len)?;
         let ids_at = codes_end.next_multiple_of(4);
-        let ids_end = ids_at + size(n * 4)?;
-        let by_id_end = ids_end + size(n * 2)?;
-        if lists.len() != by_id_end + LISTS_FOOTER {
+        let ids_end = add(ids_at, size(n.checked_mul(4))?)?;
+        let by_id_end = add(ids_end, size(n.checked_mul(2))?)?;
+        if lists.len() != add(by_id_end, LISTS_FOOTER)? {
             return Err(Error::Corrupt(lp, "length differs from its footer"));
         }
-        if refine.len() != size(n * m as u64)? + REFINE_FOOTER {
+        if refine.len() != add(codes_len, REFINE_FOOTER)? {
             return Err(Error::Corrupt(rp, "length differs from its footer"));
         }
         crcs[3] = refine_crc;
