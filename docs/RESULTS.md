@@ -25,7 +25,7 @@ on disk.
 | 1M | SIFT1M via API, sealed + restarted | 0.957 (id) | 0.266 ms | 0.482 ms | – | 717 MiB RSS | – | 44.2 s load |
 | 10M | BIGANN 10M, IVF-PQ nlist 4096, nprobe 32, rerank 100 (harness) | 0.918 (tie-aware) | 0.593 ms | 1.52 ms | 1,486 | 2,791 MiB peak (incl. 1.2 GB harness copy) | – | 160 s |
 | 10M | BIGANN 10M via API, all features, `exact_vectors: false` | 0.970 (id) | 0.98 ms | 7.65 ms | 800 | 4,910 MiB peak, 1,470 MiB steady | 1.6 GB | 576 s load |
-| 100M | BIGANN 100M via API, all features, 1M deletes | **0.977** (id) | **50.0 ms** | **92.9 ms** | 19 | **8,965 MiB peak** (load), 6.6 GB serving | 16 GB | 3,852 s load |
+| 100M | BIGANN 100M via API, all features, 1M deletes | **0.977** (id) | **50.0 ms** | **92.9 ms** | 19 | **8,965 MiB peak** (load), 6,623 MiB serving | 16 GB | 3,852 s load |
 | 1B | BIGANN 1B billion mode via API, nprobe 64, rerank 100, 10M deletes | **0.666** (id) | **38.8 ms** | **86.8 ms** | 25 | **≤ 164 MiB** | **38 GB** (peak 56.06 GB) | 7.7 h stream + 5 min sort/verify (+ 3.6 min train) |
 
 Targets (AGENTS.md / PLAN.md): 1M–100M with every feature at p99 < 100

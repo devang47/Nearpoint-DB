@@ -15,8 +15,8 @@ read-only "billion mode" serves 1B vectors from the same machine.
 | Scale | Dataset, mode | recall@10 | p50 | p99 | RAM | Disk | Build / load |
 |------:|---------------|----------:|----:|----:|----:|-----:|-------------:|
 | 1M | SIFT1M, HNSW (in-process) | 0.963 | 0.11 ms | 0.14 ms | 1.3 GB | in RAM | 44 s |
-| 10M | BIGANN 10M via API, all features | 0.970 | 0.98 ms | 7.7 ms | 4.9 GB peak, 1.5 GB steady | 1.6 GB | 10 min |
-| 100M | BIGANN 100M via API, all features | **0.977** | **50 ms** | **93 ms** | **9.0 GB peak**, 6.6 GB serving | 16 GB | 64 min |
+| 10M | BIGANN 10M via API, all features | 0.970 | 0.98 ms | 7.7 ms | 5.1 GB peak, 1.5 GB steady | 1.6 GB | 10 min |
+| 100M | BIGANN 100M via API, all features | **0.977** | **50 ms** | **93 ms** | **9.4 GB peak**, 6.9 GB serving | 16 GB | 64 min |
 | 1B | BIGANN 1B, billion mode via API | **0.666** | **39 ms** | **87 ms** | **0.16 GB** | **38 GB** (56 GB peak) | 7.7 h (the download) |
 
 - **Targets:** 1M–100M with every feature at p99 < 100 ms, recall@10 ≥
