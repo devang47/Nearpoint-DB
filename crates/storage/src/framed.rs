@@ -37,23 +37,12 @@ pub fn write(path: &Path, magic: [u8; 8], version: u32, body: &[u8]) -> Result<(
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
 
-    let tmp = crate::segment::tmp_path(path);
-    let res = (|| {
-        let mut f = File::create(&tmp)?;
+    crate::replace_atomically(path, |tmp| {
+        let mut f = File::create(tmp)?;
         f.write_all(&buf)?;
         f.sync_data()?;
-        fs::rename(&tmp, path)
-    })();
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp); // best effort; the error is what matters
-    }
-    res?;
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    File::open(dir)?.sync_all()?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Reads and verifies a file written by [`write`] and returns its body.
@@ -115,7 +104,7 @@ mod tests {
         let path = tmp_dir("rt").join("f");
         for body in [&b""[..], b"hello framed file"] {
             write(&path, M, 3, body).unwrap();
-            assert!(!crate::segment::tmp_path(&path).exists());
+            assert!(!crate::tmp_path(&path).exists());
             assert_eq!(read(&path, M, 3).unwrap(), body);
         }
         let img = fs::read(&path).unwrap();

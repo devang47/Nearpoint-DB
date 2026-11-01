@@ -1,6 +1,7 @@
 //! The HTTP/JSON API, documented endpoint by endpoint in
-//! docs/api.md. Every engine call runs on tokio's blocking pool, so a
-//! WAL fsync or a long search never stalls the async workers.
+//! docs/api.md. Every engine call that can do I/O or a search runs on
+//! tokio's blocking pool, so a WAL fsync or a long search never stalls the
+//! async workers; lookups that only take an in-memory lock stay inline.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -19,9 +20,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use storage::wal::WalError;
 
-/// Largest request body. A bulk upsert is decoded into vectors and WAL
-/// records next to the body, so peak memory is a few times this.
+/// Largest bulk upsert body. It is decoded into vectors and WAL records
+/// next to the body, so peak memory is a few times this.
 const MAX_BODY: usize = 256 << 20;
+/// Largest JSON body. Smaller than the bulk limit: a JSON payload or
+/// filter parses into a `Value` of up to ~16x its text size.
+const MAX_JSON_BODY: usize = 32 << 20;
 /// Largest `k`, `ef`, `nprobe` or `rerank` a search accepts.
 const MAX_K: usize = 10_000;
 
@@ -47,10 +51,13 @@ pub fn router(db: Arc<Db>) -> Router {
         .route("/collections/{name}/attach_billion", post(attach_billion))
         .route("/collections/{name}/search", post(search))
         .route("/collections/{name}/points", post(upsert))
-        .route("/collections/{name}/points/bulk", post(bulk))
+        .route(
+            "/collections/{name}/points/bulk",
+            post(bulk).layer(DefaultBodyLimit::max(MAX_BODY)),
+        )
         .route("/collections/{name}/points/delete", post(delete))
         .route("/collections/{name}/points/{id}", get(get_point))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
         .with_state(db)
 }
 

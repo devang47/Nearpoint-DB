@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use crate::framed;
+use crate::{framed, le_u32, le_u64, sync_dir};
 
 pub const QUANT_MAGIC: [u8; 8] = *b"NPBQUANT";
 pub const QUANT_VERSION: u32 = 1;
@@ -45,6 +45,8 @@ pub enum Error {
     Framed(#[from] framed::Error),
     #[error("{0}: {1}")]
     Corrupt(PathBuf, &'static str),
+    #[error("{path}: unsupported version {found}")]
+    UnsupportedVersion { path: PathBuf, found: u32 },
     #[error("{0}: checksum mismatch in {1}")]
     Checksum(PathBuf, &'static str),
     #[error("{0}")]
@@ -52,22 +54,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-fn le_u32(b: &[u8], at: usize) -> u32 {
-    let mut x = [0u8; 4];
-    x.copy_from_slice(&b[at..at + 4]);
-    u32::from_le_bytes(x)
-}
-
-fn le_u64(b: &[u8], at: usize) -> u64 {
-    let mut x = [0u8; 8];
-    x.copy_from_slice(&b[at..at + 8]);
-    u64::from_le_bytes(x)
-}
-
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
 
 /// Rows committed to `stream` / `refine.tmp`, and each file's CRC32 over
 /// exactly those rows.
@@ -422,7 +408,10 @@ fn footer<'a>(
         return Err(Error::Corrupt(path.to_owned(), "bad magic"));
     }
     if le_u32(f, 8) != version {
-        return Err(Error::Corrupt(path.to_owned(), "unsupported version"));
+        return Err(Error::UnsupportedVersion {
+            path: path.to_owned(),
+            found: le_u32(f, 8),
+        });
     }
     if crc32fast::hash(&f[..len - 4]) != le_u32(f, len - 4) {
         return Err(Error::Checksum(path.to_owned(), "footer"));

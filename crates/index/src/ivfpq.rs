@@ -550,7 +550,7 @@ fn quantize_lut(table: &[f32], lut: &mut Vec<u8>) -> (f32, f32) {
 }
 
 /// `v -= c`, component-wise.
-fn subtract(v: &mut [f32], c: &[f32]) {
+pub(crate) fn subtract(v: &mut [f32], c: &[f32]) {
     for (a, b) in v.iter_mut().zip(c) {
         *a -= b;
     }

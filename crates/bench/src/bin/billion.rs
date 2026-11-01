@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use bench::dataset::{read_bin, read_bin_ground_truth};
+use bench::{mib, percentile};
 use clap::{Parser, Subcommand};
 use index::Hit;
 use index::billion::{BillionParams, Lists, Quantizers, TrainConfig};
@@ -104,10 +105,6 @@ fn quant(dir: &Path) -> Result<Quantizers> {
     let b = storage::framed::read(&dir.join("quant"), QUANT_MAGIC, QUANT_VERSION)
         .context("reading quant")?;
     Ok(Quantizers::from_bytes(&b)?)
-}
-
-fn mib(b: u64) -> f64 {
-    b as f64 / f64::from(1 << 20)
 }
 
 fn train(sample: &Path, rows: usize, dir: &Path, cfg: TrainConfig) -> Result<()> {
@@ -257,7 +254,7 @@ fn eval(
                 hits += got.iter().filter(|h| truth.contains(&h.id)).count();
             }
             lat.sort_by(f64::total_cmp);
-            let pct = |x: f64| lat[((lat.len() - 1) as f64 * x).round() as usize];
+            let pct = |x: f64| percentile(&lat, x);
             println!(
                 "nprobe {np:>4} rerank {rr:>5}: recall@{k} {:.4}, p50 {:.2} ms, p99 {:.2} ms, mean {:.2} ms, \
                  phys_footprint {:.0} MiB (peak {:.0})",

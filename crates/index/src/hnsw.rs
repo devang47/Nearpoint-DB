@@ -84,6 +84,8 @@ pub struct Hnsw {
 }
 
 impl Hnsw {
+    /// Panics unless `dim > 0`, `m >= 2` and `ef_construction >= 1`
+    /// (the engine validates its config before building one).
     pub fn new(dim: usize, metric: Metric, cfg: Config) -> Self {
         assert!(dim > 0 && cfg.m >= 2 && cfg.ef_construction >= 1);
         Hnsw {

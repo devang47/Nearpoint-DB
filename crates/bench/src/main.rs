@@ -11,14 +11,14 @@
 //! then computed by brute force (`Flat`) instead of read from disk.
 
 use std::borrow::Cow;
-use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use bench::dataset::{Vectors, read_bin, read_bin_ground_truth, read_xvecs};
+use bench::{mib, ms, percentile};
 use clap::{Parser, ValueEnum};
 use index::{Flat, Hnsw, Index, IvfPq, Metric, SearchParams, hnsw, ivfpq};
 
@@ -145,10 +145,7 @@ impl Rows {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let root = match args.data.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var("HOME").context("HOME unset")?).join(rest),
-        None => PathBuf::from(&args.data),
-    };
+    let root = bench::expand_home(&args.data)?;
     let name = match args.dataset {
         Dataset::Siftsmall => "siftsmall",
         Dataset::Sift1m => "sift1m",
@@ -273,18 +270,11 @@ fn main() -> Result<()> {
     );
 
     let mut csv = match &args.csv {
-        Some(path) => {
-            let new = !path.exists();
-            let mut f = File::options().create(true).append(true).open(path)?;
-            if new {
-                writeln!(
-                    f,
-                    "dataset,index,m,ef_construction,seed,ef,nlist,pq_m,nbits,nprobe,rerank,\
-                     k,recall,id_recall,p50_ms,p95_ms,p99_ms,qps,build_s,threads"
-                )?;
-            }
-            Some(f)
-        }
+        Some(path) => Some(bench::open_csv(
+            path,
+            "dataset,index,m,ef_construction,seed,ef,nlist,pq_m,nbits,nprobe,rerank,\
+             k,recall,id_recall,p50_ms,p95_ms,p99_ms,qps,build_s,threads",
+        )?),
         None => None,
     };
 
@@ -369,7 +359,6 @@ fn main() -> Result<()> {
     }
 
     let mem = storage::sys::peak_memory()?;
-    let mib = |b: u64| b as f64 / (1 << 20) as f64;
     println!(
         "peak_rss={:.0}MiB peak_phys_footprint={:.0}MiB (harness data {:.0}MiB, \
          so build + index ~{:.0}MiB)",
@@ -379,10 +368,6 @@ fn main() -> Result<()> {
         mib(mem.phys_footprint.saturating_sub(loaded))
     );
     Ok(())
-}
-
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1e3
 }
 
 struct Run {
@@ -438,7 +423,7 @@ fn run_queries(
     let total = started.elapsed();
 
     latencies.sort();
-    let pct = |p: f64| latencies[((latencies.len() - 1) as f64 * p).round() as usize];
+    let pct = |p: f64| percentile(&latencies, p);
     let n = (query.len() * k) as f64;
     Ok(Run {
         recall: tie_hits as f64 / n,

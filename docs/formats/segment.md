@@ -40,7 +40,7 @@ to match exactly; anything else is `Corrupt`.
 | 16     | u32     | dim (> 0) |
 | 20     | u32     | metric code: 0 = L2, 1 = inner product, 2 = cosine (`index::Metric::code`) |
 | 24     | u64     | vector count |
-| 32     | u32     | blob kind: 0 = flat, 1 = hnsw, 2 = ivf-pq |
+| 32     | u32     | blob kind: 0 = flat (reserved: never written, the engine rejects it), 1 = hnsw, 2 = ivf-pq |
 | 36     | [u8; 28]| reserved, zero |
 
 ### Sections
@@ -117,16 +117,10 @@ covers them.
 
 | Offset | Type    | Field |
 |--------|---------|-------|
-| 0      | [u8; 4] | magic: `NPFL` (flat), `NPHW` (hnsw) or `NPIV` (ivf-pq) |
+| 0      | [u8; 4] | magic: `NPHW` (hnsw) or `NPIV` (ivf-pq) |
 | 4      | u32     | blob version (1) |
 | 8      | u32     | dim |
 | 12     | u32     | metric code |
-
-### Flat blob v1 (24 bytes)
-
-| Offset | Type | Field |
-|--------|------|-------|
-| 16     | u64  | vector count |
 
 ### HNSW blob v1
 
@@ -144,7 +138,7 @@ covers them.
 Each list is written at full capacity exactly as in memory:
 `[count, id_1, ..., id_cap]`; slots past `count` are ignored.
 
-`Hnsw::from_bytes` / `Flat::from_bytes` reject (as `index::Error::Corrupt`
+`Hnsw::from_bytes` rejects (as `index::Error::Corrupt`
 or `UnsupportedBlobVersion`): bad magic, unknown metric, dim 0, m < 2,
 ef_construction 0, n > u32::MAX, vector count ≠ n × dim, level > 16, any
 size overflow, truncation or trailing bytes, a list count ≥ capacity, a
@@ -234,5 +228,5 @@ would shrink it, at the cost of a rebuild step on load.
 | 1 | 2026-10-28 | Initial format (task 3.2). Fixture: `crates/storage/testdata/segment-v1.seg`. |
 | 2 | 2026-10-28 | Element type 1 = no vector section; blob kind 2 = IVF-PQ (the reader also accepts kind 2 in v1 files). v1 files still load; v1 cannot hold element type 1. Fixture (no vectors): `crates/storage/testdata/segment-v2.seg`. |
 
-HNSW and Flat blobs: version 1, same date. IVF-PQ blob: version 1,
+HNSW blob: version 1, same date (a flat blob, `NPFL`, existed then but was never written by the engine and has been removed). IVF-PQ blob: version 1,
 added with segment v2.

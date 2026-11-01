@@ -15,6 +15,31 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-02 — Pre-publish review, part 2: the remaining findings
+- **What:**
+  - storage: one copy of `le_u32`/`le_u64`, `sync_dir`, `tmp_path` and
+    the tmp → sync → rename → fsync-dir sequence (`replace_atomically`)
+    in `lib.rs`; billion files report `UnsupportedVersion { found }`;
+    the macOS-only `sys` tests are gated.
+  - index: the never-written flat blob (`NPFL`) is removed (blob kind 0
+    stays reserved in docs/formats/segment.md); billion mode reuses
+    `ivfpq::subtract` and one `rebuild` for both re-rank and `get`;
+    constructor panics documented.
+  - engine: crash writer and test share `src/bin/crash-child/common.rs`;
+    a failed create removes its directory so a retry works; filters.md
+    covers a field typed differently in two segments.
+  - server: JSON bodies capped at 32 MiB (bulk keeps 256 MiB).
+  - Python client: `nprobe`/`rerank` on search, collection settings as
+    keyword arguments, `attach_billion`, `metrics`; CI now runs its tests
+    against a live server, with read-only permissions.
+  - bench: shared `expand_home`, `open_csv`, `percentile`, `ms`, `mib`.
+  - tools: `billion-stream.sh` stops the curls, not just their subshells.
+  - RESULTS.md: "round N" / "agent run" wording replaced.
+- **Why:** the review findings left open in the first pass. A JSON
+  payload parses into a `Value` of up to ~16x its text, so 256 MiB JSON
+  bodies could take ~4 GiB each. The rest is duplication and gaps an
+  outside reader would trip on. 1,000-cycle SIGKILL test re-run: pass.
+
 ## 2026-11-01 — Pre-publish review: fixes and cleanup
 - **What:** an independent review of every crate, the client, the tools and
   the docs, and fixes for what it found:

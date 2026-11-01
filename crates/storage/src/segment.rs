@@ -10,12 +10,14 @@
 //! (`storage` must not depend on `index`). The metric is likewise stored
 //! as the raw code from `index::Metric::code`.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use memmap2::Mmap;
+
+use crate::{le_u32, le_u64};
 
 #[cfg(target_endian = "big")]
 compile_error!("segment files are little-endian and their sections are mapped in place");
@@ -135,18 +137,6 @@ fn usize_range(r: &Range<u64>) -> Option<Range<usize>> {
     Some(usize::try_from(r.start).ok()?..usize::try_from(r.end).ok()?)
 }
 
-fn le_u32(b: &[u8], at: usize) -> u32 {
-    let mut a = [0; 4];
-    a.copy_from_slice(&b[at..at + 4]);
-    u32::from_le_bytes(a)
-}
-
-fn le_u64(b: &[u8], at: usize) -> u64 {
-    let mut a = [0; 8];
-    a.copy_from_slice(&b[at..at + 8]);
-    u64::from_le_bytes(a)
-}
-
 const SECTION_NAMES: [&str; 3] = ["vector section", "id section", "index blob"];
 
 /// Validates a segment image and returns its layout. Checks magic,
@@ -246,13 +236,6 @@ fn verify_vectors(b: &[u8], layout: &Layout) -> Result<()> {
     Ok(())
 }
 
-/// `<path>.tmp`: where a segment is built before it's renamed into place.
-pub(crate) fn tmp_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
-    PathBuf::from(s)
-}
-
 /// Writes a segment atomically: to `<path>.tmp`, `sync_data`, rename to
 /// `path`, then fsync the parent directory. Readers never see a partial
 /// file under `path`; on error the tmp file is removed. Replaces any
@@ -269,19 +252,8 @@ pub fn write(path: &Path, seg: &SegmentData<'_>) -> Result<()> {
     let secs = sections(seg.dim as u64, count as u64, vectors, seg.blob.len() as u64)
         .ok_or(Error::InvalidInput("segment too large"))?;
 
-    let tmp = tmp_path(path);
     let elem = if vectors { ELEM_F32 } else { ELEM_NONE };
-    let res = write_file(&tmp, seg, &secs, elem).and_then(|()| Ok(fs::rename(&tmp, path)?));
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp); // best effort; the error is what matters
-    }
-    res?;
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    File::open(dir)?.sync_all()?;
-    Ok(())
+    crate::replace_atomically(path, |tmp| write_file(tmp, seg, &secs, elem))
 }
 
 fn write_file(tmp: &Path, seg: &SegmentData<'_>, secs: &[Range<u64>; 3], elem: u32) -> Result<()> {
@@ -412,6 +384,9 @@ impl Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmp_path;
+    use std::fs;
+    use std::path::PathBuf;
 
     /// A fresh, empty directory under the system temp dir.
     fn tmp_dir(name: &str) -> PathBuf {

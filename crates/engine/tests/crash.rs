@@ -1,4 +1,4 @@
-//! SIGKILL a writer (`src/bin/crash-child.rs`) at random
+//! SIGKILL a writer (`src/bin/crash-child/`) at random
 //! moments, reopen the collection, and check that every acknowledged
 //! upsert is there with its vector and payload and every acknowledged
 //! delete is gone. The one op in flight at the kill may go either way.
@@ -14,53 +14,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use engine::collection::{Collection, Config, SearchOptions};
-use index::{Metric, hnsw};
-use serde_json::{Value, json};
-use storage::wal::SyncPolicy;
+use engine::collection::{Collection, SearchOptions};
 
-// Must match src/bin/crash-child.rs.
-const IDS: u64 = 64;
-const DIM: u64 = 8;
-
-fn config() -> Config {
-    Config {
-        dim: DIM as usize,
-        metric: Metric::L2,
-        hnsw: hnsw::Config {
-            m: 8,
-            ef_construction: 32,
-            seed: 7,
-        },
-        schema: Default::default(),
-        // Small, so background seals and merges run in most cycles.
-        seal_rows: 16,
-        ivf_rows: 1024,
-        max_merge_rows: 1_000_000,
-        exact_vectors: true,
-        sync: SyncPolicy::Batch,
-    }
-}
-
-fn vector(id: u64, ver: u64) -> Vec<f32> {
-    (0..DIM)
-        .map(|i| (splitmix64(id ^ ver.rotate_left(17) ^ i) >> 40) as f32 / 1024.0)
-        .collect()
-}
-
-fn payload(id: u64, ver: u64) -> Value {
-    if ver.is_multiple_of(5) {
-        return Value::Null;
-    }
-    json!({"ver": ver, "tag": if id.is_multiple_of(2) { "even" } else { "odd" }})
-}
-
-fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
+#[path = "../src/bin/crash-child/common.rs"]
+mod common;
+use common::{IDS, config, payload, splitmix64, vector};
 
 #[derive(Debug, Clone, Copy)]
 enum Op {

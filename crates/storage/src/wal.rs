@@ -18,6 +18,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::{le_u32, le_u64, sync_dir};
+
 /// Log sequence number. The first record ever written has LSN 1; every
 /// append gets the previous LSN + 1, with no gaps, across reopens.
 pub type Lsn = u64;
@@ -418,10 +420,6 @@ fn parse_file_name(name: &str) -> Option<Lsn> {
     digits.parse().ok().filter(|&lsn| lsn != 0)
 }
 
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
 fn file_header() -> [u8; FILE_HEADER_LEN] {
     let mut h = [0u8; FILE_HEADER_LEN];
     h[..8].copy_from_slice(&MAGIC);
@@ -438,14 +436,14 @@ fn check_header(path: &Path, bytes: &[u8]) -> Result<()> {
     let h = bytes
         .get(..FILE_HEADER_LEN)
         .ok_or_else(|| WalError::CorruptHeader(path.into()))?;
-    let version = le_u32(&h[8..12]);
+    let version = le_u32(h, 8);
     if version != VERSION {
         return Err(WalError::UnsupportedVersion {
             path: path.into(),
             found: version,
         });
     }
-    if crc32fast::hash(&h[..12]) != le_u32(&h[12..16]) {
+    if crc32fast::hash(&h[..12]) != le_u32(h, 12) {
         return Err(WalError::CorruptHeader(path.into()));
     }
     Ok(())
@@ -465,18 +463,6 @@ fn create_file(dir: &Path, first_lsn: Lsn) -> Result<File> {
     fs::rename(&tmp, file_path(dir, first_lsn))?;
     sync_dir(dir)?;
     Ok(f) // cursor is at the end of the header
-}
-
-fn le_u32(b: &[u8]) -> u32 {
-    let mut a = [0u8; 4];
-    a.copy_from_slice(b);
-    u32::from_le_bytes(a)
-}
-
-fn le_u64(b: &[u8]) -> u64 {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(b);
-    u64::from_le_bytes(a)
 }
 
 fn encode(lsn: Lsn, record: &Record) -> Result<Vec<u8>> {
@@ -519,13 +505,13 @@ fn encode(lsn: Lsn, record: &Record) -> Result<Vec<u8>> {
 /// length. `None` for anything torn, corrupt or out of sequence.
 fn decode(buf: &[u8], expected_lsn: Lsn) -> Option<(Record, usize)> {
     let h = buf.get(..RECORD_HEADER_LEN)?;
-    let len = le_u32(&h[4..8]);
+    let len = le_u32(h, 4);
     if len > MAX_BODY_LEN {
         return None;
     }
     let total = RECORD_HEADER_LEN + len as usize;
     let rec = buf.get(..total)?;
-    if crc32fast::hash(&rec[4..]) != le_u32(&rec[..4]) || le_u64(&rec[9..17]) != expected_lsn {
+    if crc32fast::hash(&rec[4..]) != le_u32(rec, 0) || le_u64(rec, 9) != expected_lsn {
         return None;
     }
     let mut body = &rec[RECORD_HEADER_LEN..];
@@ -536,15 +522,15 @@ fn decode(buf: &[u8], expected_lsn: Lsn) -> Option<(Record, usize)> {
     };
     let record = match rec[8] {
         KIND_UPSERT => {
-            let id = le_u64(take(8)?);
-            let dim = le_u32(take(4)?) as usize;
+            let id = le_u64(take(8)?, 0);
+            let dim = le_u32(take(4)?, 0) as usize;
             let vector = take(dim.checked_mul(4)?)?
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .map(|&c| f32::from_le_bytes(c))
                 .collect();
-            let plen = le_u32(take(4)?) as usize;
+            let plen = le_u32(take(4)?, 0) as usize;
             let payload = take(plen)?.to_vec();
             Record::Upsert {
                 id,
@@ -553,7 +539,7 @@ fn decode(buf: &[u8], expected_lsn: Lsn) -> Option<(Record, usize)> {
             }
         }
         KIND_DELETE => Record::Delete {
-            id: le_u64(take(8)?),
+            id: le_u64(take(8)?, 0),
         },
         _ => return None,
     };

@@ -53,7 +53,7 @@ comparison (optional in 10.1): not done.
 | 2026-10-28 | 5.4–5.6 | SIFT1M | ivfpq nlist=1024 m=16 8-bit nprobe=16 rerank=100 | 42 | 0.9167 (0.9159) | 0.170 ms | 0.234 ms | 5720 | 969 MiB | 968 MiB | – | 25.8 s | dcabd5e |
 | 2026-10-28 | 5.5 | SIFT1M | ivfpq nlist=1024 m=32 4-bit nprobe=32 rerank=200 | 42 | 0.9540 (0.9532) | 0.127 ms | 0.164 ms | 7738 | 970 MiB | 970 MiB | – | 17.1 s | dcabd5e |
 | 2026-10-28 | 7.3 regression | SIFT1M | hnsw M=16 efc=200 ef=64, unfiltered | 42 | 0.9608 (0.9602) | 0.108 ms | 0.195 ms | 8934 | 1922 MiB | 1922 MiB | – | 42.8 s | dcabd5e |
-| 2026-10-28 | 7.3 regression | SIFT1M | same, pre-round build (35e7c82), run back to back | 42 | 0.9634 (0.9627) | 0.109 ms | 0.165 ms | 8932 | 1257 MiB | 1256 MiB | – | 44.1 s | 35e7c82 |
+| 2026-10-28 | 7.3 regression | SIFT1M | same, previous build (35e7c82), run back to back | 42 | 0.9634 (0.9627) | 0.109 ms | 0.165 ms | 8932 | 1257 MiB | 1256 MiB | – | 44.1 s | 35e7c82 |
 | 2026-10-28 | 2.3 (rebuild) | SIFT1M | hnsw M=16 efc=200 ef=64 | 42 | 0.9602 (0.9595) | 0.108 ms | 0.145 ms | 9310 | 1257 MiB | 1256 MiB | – | 43.5 s | e96bb03 |
 | 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 **ef=64** | 42 | **0.9632** (0.9625) | **0.106 ms** | 0.138 ms | 9512 | 1257 MiB | 1256 MiB | – | **44.4 s** | 5839104 |
 | 2026-10-28 | 2.3 | SIFT1M | hnsw M=16 efc=200 ef=128 | 42 | 0.9894 (0.9888) | 0.192 ms | 0.244 ms | 5367 | 1257 MiB | 1256 MiB | – | 44.4 s | 5839104 |
@@ -103,7 +103,7 @@ comparison (optional in 10.1): not done.
   segments IVF-PQ is the index; a `reserve` before batched `add` would
   remove the regrowth spike (Phase 8).
 - **Unfiltered HNSW after 7.3:** no regression. Back to back with the
-  pre-round build: p50 0.108 vs 0.109 ms, 8,934 vs 8,932 QPS. (An
+  previous build: p50 0.108 vs 0.109 ms, 8,934 vs 8,932 QPS. (An
   earlier post-merge run showed 0.116 ms under background load.) Peak
   memory differs only because the bench now adds in batches.
 - The Mac slept during some runs (`pmset` log); `Instant` stops during
@@ -268,7 +268,7 @@ queries as above; quiet machine, `caffeinate -dims`. Full table:
   unbudgeted walk (0 fallbacks, same distances): a one-off stall like
   the 2026-10-28 one; ef 128 is 0.458 vs 0.451 ms.
 
-## IVF-PQ metrics (round 3)
+## IVF-PQ metrics
 
 `bench --index ivfpq --metric l2|ip|cosine`, SIFT1M, nlist 1024, 10k
 queries, ground truth by brute force with `Flat` for ip/cosine. Quiet
@@ -287,7 +287,7 @@ machine, commit 8f67ec3. Full sweep: `docs/results/sift1m-ivfpq-metrics.csv`.
 - Cosine tracks L2, but SIFT's norms are nearly constant (506–511), so
   this doesn't stress cosine.
 - **Inner product misses 0.9** at every swept setting; more probes barely
-  help, more re-rank does (agent run, 1k queries: 0.9247 at 64 / 1000,
+  help, more re-rank does (separate run, 1k queries: 0.9247 at 64 / 1000,
   0.9427 at 1024 / 5000). The int8 re-rank is the ceiling. IVF-PQ is for
   L2/cosine collections until an f32 re-rank exists (PLAN 6.2 note).
 
@@ -539,7 +539,7 @@ Per-window CSV: `docs/results/soak-4h-final.csv`.
   trainings). 98 background rewrites, one of them an HNSW build (initial
   load).
 
-### 2026-10-31 — housekeeping round regression check (30-minute soak, 310a003)
+### 2026-10-31 — cleanup batch regression check (30-minute soak, 310a003)
 
 Lazy vectors CRC, payloads v2 (columnar), one maintenance thread per
 collection, merged. Same settings and steady-state window as the nprobe
@@ -550,7 +550,7 @@ segments, 1M live dim-32 rows).
 | Build | p99 median / mean / max | recall@10 median | search/s mean | drift (15 windows) |
 |-------|------------------------:|-----------------:|--------------:|-------------------:|
 | 71bbdd4 (nprobe per nlist) | 1.52 / 1.53 / 2.04 ms | 0.7919 | 5,576 | p99 −14.8%, PASS |
-| **310a003 (round 8 merged)** | **1.41 / 1.42 / 1.55 ms** | **0.7942** | 5,669 | p99 +2.0%, recall −0.1%, PASS |
+| **310a003 (cleanup batch merged)** | **1.41 / 1.42 / 1.55 ms** | **0.7942** | 5,669 | p99 +2.0%, recall −0.1%, PASS |
 
 - No regression; 0 errors, 0 violations, 0 reconnects. The lower p99 is
   within run-to-run noise for single 30-minute runs (not attributed).

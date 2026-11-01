@@ -77,7 +77,11 @@ strings, numbers and booleans.
 - **Type mismatches are errors** (`TypeMismatch`): `range` on a keyword,
   list or bool field, a string compared with a number field, a number
   compared with a keyword field, and so on. These are reported even inside
-  a branch that would otherwise match nothing.
+  a branch that would otherwise match nothing. Types are per segment, so
+  an undeclared field that got different types in different segments
+  (possible across restarts) fails every filter that compares it with
+  the wrong type in any segment; declare the field in `schema` to rule
+  this out.
 - Deleted rows are removed by the engine after evaluation, not by the
   filter.
 

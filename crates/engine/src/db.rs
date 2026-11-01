@@ -208,8 +208,12 @@ impl Db {
         let path = self.dir.join(name);
         fs::rename(&staging, &path)?;
         sync_dir(&self.dir)?;
-        let (c, _) = Collection::open(&path, cfg)?;
-        let e = Entry::spawn(name, c)?;
+        // On failure, remove the directory so a retried create can succeed.
+        let opened = Collection::open(&path, cfg).and_then(|(c, _)| Ok(Entry::spawn(name, c)?));
+        if opened.is_err() {
+            let _ = fs::remove_dir_all(&path);
+        }
+        let e = opened?;
         let c = Arc::clone(&e.coll);
         let mut colls = self.colls.write().unwrap_or_else(PoisonError::into_inner);
         colls.insert(name.to_owned(), e);

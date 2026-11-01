@@ -10,7 +10,10 @@ set -u
 url=${BIGANN_URL:-https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/base.1B.u8bin}
 first=$1 total=$2 dim=128 chunk=500000 par=${STREAM_PAR:-4}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/np-stream.XXXXXX")
-trap 'kill ${(v)pid} 2>/dev/null; rm -rf "$tmp"' EXIT
+# Each fetch is a subshell running curl: stop the curls, not just the
+# subshells, and clean up on signals too.
+trap 'for p in ${(v)pid}; do pkill -P $p; kill $p; done 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'exit 1' INT TERM HUP PIPE
 n=$(( (total - first + chunk - 1) / chunk ))
 typeset -A pid
 fetch() {

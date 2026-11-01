@@ -47,7 +47,7 @@ directory, so a restart needs no other flags.
   per `--sync`, and is visible to every search that starts after the
   acknowledgement. A deleted id never appears in a search that started
   after the delete was acknowledged.
-- Request bodies are limited to 256 MiB.
+- Request bodies are limited to 32 MiB, except the bulk upsert (256 MiB).
 
 ### Errors
 
@@ -58,7 +58,7 @@ Errors from Nearpoint are JSON: `{"error": "<message>"}`.
 | 400 | invalid input: wrong vector length, NaN/infinite or > 1e15 component, zero `cosine` vector, payload type conflict, bad filter type, invalid config or name, `k`/`ef`/`nprobe`/`rerank` over 10,000, malformed bulk body, unparsable path parameter such as a non-numeric id (plain text) |
 | 404 | no such collection, point, or the collection was dropped during the request |
 | 409 | collection already exists |
-| 413 | body over 256 MiB (plain text) |
+| 413 | body over 32 MiB, or 256 MiB for the bulk upsert (plain text) |
 | 415, 422, 400 | body isn't JSON, has the wrong shape or an unknown field (plain text from the framework, not JSON) |
 | 500 | I/O error or corrupt data (the server logs it) |
 | 503 | **write outcome unknown**: the WAL failed with this write in flight (ADR 0007). It may or may not be durable and was not applied. Every later write to that collection gets 503 until the server restarts; after the restart, read the points back to learn the outcome. Never retried as a success. |

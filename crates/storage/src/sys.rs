@@ -72,7 +72,7 @@ pub fn set_nocache(f: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

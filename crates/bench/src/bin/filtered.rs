@@ -13,13 +13,13 @@
 //! `cargo run --release -p bench --bin filtered -- --dataset sift1m \
 //!     --selectivity 0.01,0.1,0.5 --ef 64,128 --plan auto,walk --filter random,far`
 
-use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use bench::dataset::{Vectors, read_xvecs};
+use bench::{ms, percentile};
 use clap::{Parser, ValueEnum};
 use index::hnsw::{self, Plan};
 use index::{Hit, Hnsw, Index, Metric, SearchParams};
@@ -93,10 +93,7 @@ enum PlanArg {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let root = match args.data.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var("HOME").context("HOME unset")?).join(rest),
-        None => PathBuf::from(&args.data),
-    };
+    let root = bench::expand_home(&args.data)?;
     let (dir, prefix, name, nq) = match args.dataset {
         Dataset::Siftsmall => ("siftsmall", "siftsmall", "siftsmall", 100),
         Dataset::Sift1m => ("sift1m", "sift", "sift1m", 1000),
@@ -126,18 +123,11 @@ fn main() -> Result<()> {
     );
 
     let mut csv = match &args.csv {
-        Some(path) => {
-            let new = !path.exists();
-            let mut f = File::options().create(true).append(true).open(path)?;
-            if new {
-                writeln!(
-                    f,
-                    "dataset,m,ef_construction,seed,selectivity,filtered,ef,k,plan,\
-                     recall,id_recall,mean_distances,p50_ms,p99_ms,qps"
-                )?;
-            }
-            Some(f)
-        }
+        Some(path) => Some(bench::open_csv(
+            path,
+            "dataset,m,ef_construction,seed,selectivity,filtered,ef,k,plan,\
+             recall,id_recall,mean_distances,p50_ms,p99_ms,qps",
+        )?),
         None => None,
     };
 
@@ -215,10 +205,6 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1e3
 }
 
 /// Each id kept independently with probability `s`, from a hash of
@@ -340,7 +326,7 @@ fn run(
     let distances = (hnsw::distances() - distances) as f64 / query.len() as f64;
 
     latencies.sort();
-    let pct = |p: f64| latencies[((latencies.len() - 1) as f64 * p).round() as usize];
+    let pct = |p: f64| percentile(&latencies, p);
     let n = wanted.max(1) as f64;
     Ok(Run {
         recall: tie_hits as f64 / n,

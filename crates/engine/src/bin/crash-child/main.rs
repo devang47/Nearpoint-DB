@@ -4,54 +4,12 @@
 //! `S` or `M` for a background step), and `ok` once the op is acknowledged.
 //!
 //! Usage: `crash-child <dir> <seed>`. Vectors and payloads are derived
-//! from (id, ver); `tests/crash.rs` derives the same ones.
+//! from (id, ver) in `common.rs`, shared with `tests/crash.rs`.
 
-use engine::collection::{Collection, Config};
-use index::{Metric, hnsw};
-use serde_json::{Value, json};
-use storage::wal::SyncPolicy;
+mod common;
 
-const IDS: u64 = 64;
-const DIM: u64 = 8;
-
-fn config() -> Config {
-    Config {
-        dim: DIM as usize,
-        metric: Metric::L2,
-        hnsw: hnsw::Config {
-            m: 8,
-            ef_construction: 32,
-            seed: 7,
-        },
-        schema: Default::default(),
-        // Small, so background seals and merges run in most cycles.
-        seal_rows: 16,
-        ivf_rows: 1024,
-        max_merge_rows: 1_000_000,
-        exact_vectors: true,
-        sync: SyncPolicy::Batch,
-    }
-}
-
-fn vector(id: u64, ver: u64) -> Vec<f32> {
-    (0..DIM)
-        .map(|i| (splitmix64(id ^ ver.rotate_left(17) ^ i) >> 40) as f32 / 1024.0)
-        .collect()
-}
-
-fn payload(id: u64, ver: u64) -> Value {
-    if ver.is_multiple_of(5) {
-        return Value::Null;
-    }
-    json!({"ver": ver, "tag": if id.is_multiple_of(2) { "even" } else { "odd" }})
-}
-
-fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
+use common::{IDS, config, payload, splitmix64, vector};
+use engine::collection::Collection;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

@@ -84,6 +84,17 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(self.c.get_collection(self.name)["points"], 2)
         self.assertEqual(self.c.seal(self.name), {"sealed": True})
         self.assertEqual(self.c.get(self.name, 3)["vector"], [2.0, 0.0, 0.0])
+        hits = self.c.search(self.name, [2, 0, 0], k=1, nprobe=4, rerank=10)
+        self.assertEqual([h["id"] for h in hits], [3])
+        self.assertIn("nearpoint_", self.c.metrics())
+
+    def test_config_kwargs(self):
+        name = self.name + "-cfg"
+        try:
+            info = self.c.create_collection(name, dim=2, seal_rows=1000, exact_vectors=False)
+            self.assertEqual((info["seal_rows"], info["exact_vectors"]), (1000, False))
+        finally:
+            self.c.drop_collection(name)
 
     def test_errors(self):
         self.c.upsert(self.name, [{"id": 1, "vector": [0, 0, 0]}])  # filters run on non-empty segments

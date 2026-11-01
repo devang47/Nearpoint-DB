@@ -19,7 +19,7 @@ use std::collections::BinaryHeap;
 use quant::{Centroids, KMeans, Pq, PqConfig};
 use rayon::prelude::*;
 
-use crate::ivfpq::SharedBytes;
+use crate::ivfpq::{SharedBytes, subtract};
 use crate::{Error, Hit, Index, Metric, Result, SearchParams, blob, check_dim};
 
 const MAGIC: &[u8; 4] = b"NPBQ";
@@ -49,12 +49,6 @@ pub struct Quantizers {
     graph: crate::Hnsw,
     pq: Pq,
     refine: Pq,
-}
-
-fn sub(a: &[f32], b: &[f32], out: &mut [f32]) {
-    for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
-        *o = x - y;
-    }
 }
 
 impl Quantizers {
@@ -89,15 +83,15 @@ impl Quantizers {
             .par_iter()
             .enumerate()
             .map(|(cell, rows)| -> Result<Vec<f32>> {
-                let x: Vec<f32> = rows
-                    .iter()
-                    .flat_map(|&r| data[r as usize * dim..][..dim].iter().copied())
-                    .collect();
                 if rows.len() < k2 {
                     return Err(Error::InvalidConfig(
                         "a first-level cell has fewer rows than nlist / k1: train on more data",
                     ));
                 }
+                let x: Vec<f32> = rows
+                    .iter()
+                    .flat_map(|&r| data[r as usize * dim..][..dim].iter().copied())
+                    .collect();
                 let c = KMeans {
                     seed: cfg.seed ^ cell as u64,
                     ..KMeans::new(k2, dim)
@@ -120,18 +114,18 @@ impl Quantizers {
         residuals
             .par_chunks_exact_mut(dim)
             .zip(sample.par_chunks_exact(dim))
-            .for_each(|(r, x)| sub(x, coarse.get(coarse.assign(x).0 as usize), r));
+            .for_each(|(r, x)| {
+                r.copy_from_slice(x);
+                subtract(r, coarse.get(coarse.assign(x).0 as usize));
+            });
         let pq_cfg = PqConfig {
             seed: cfg.seed,
             ..PqConfig::new(dim, cfg.m)
         };
         let pq = pq_cfg.train(&residuals)?;
-        residuals.par_chunks_exact_mut(dim).for_each(|r| {
-            let p = pq.decode(&pq.encode(r));
-            for (x, y) in r.iter_mut().zip(p) {
-                *x -= y;
-            }
-        });
+        residuals
+            .par_chunks_exact_mut(dim)
+            .for_each(|r| subtract(r, &pq.decode(&pq.encode(r))));
         let refine = PqConfig {
             seed: cfg.seed ^ 1,
             ..pq_cfg
@@ -196,11 +190,10 @@ impl Quantizers {
                 |r, (((list, code), rcode), x)| -> Result<()> {
                     let c = self.nearest(x, 1, 32)?.first().map_or(0, |h| h.id);
                     *list = c as u16;
-                    sub(x, self.coarse.get(c as usize), r);
+                    r.copy_from_slice(x);
+                    subtract(r, self.coarse.get(c as usize));
                     self.pq.encode_into(r, code);
-                    for (x, y) in r.iter_mut().zip(self.pq.decode(code)) {
-                        *x -= y;
-                    }
+                    subtract(r, &self.pq.decode(code));
                     self.refine.encode_into(r, rcode);
                     Ok(())
                 },
@@ -243,7 +236,8 @@ impl Quantizers {
                     if a == b {
                         return Vec::new();
                     }
-                    sub(query, self.coarse.get(l), r);
+                    r.copy_from_slice(query);
+                    subtract(r, self.coarse.get(l));
                     let table = self.pq.distance_table(r);
                     let mut best = BinaryHeap::with_capacity(short + 1);
                     for (row, code) in (a..b).zip(lists.codes[a * m..b * m].chunks_exact(m)) {
@@ -287,14 +281,7 @@ impl Quantizers {
                 .get(h.id as usize * m..(h.id as usize + 1) * m)
                 .ok_or(Error::Corrupt("refine code past the end"))?;
             let pc = &lists.codes[row * m..(row + 1) * m];
-            x.copy_from_slice(self.coarse.get(*list as usize));
-            for ((v, p), r) in x
-                .iter_mut()
-                .zip(self.pq.decode(pc))
-                .zip(self.refine.decode(rc))
-            {
-                *v += p + r;
-            }
+            self.rebuild(*list as usize, pc, rc, &mut x);
             out.push(Hit {
                 id: h.id,
                 dist: kernels::l2_sq(query, &x),
@@ -324,15 +311,21 @@ impl Quantizers {
         let row = a + lists.ids.get(a..b)?.binary_search(&id).ok()?;
         let pc = lists.codes.get(row * m..(row + 1) * m)?;
         let rc = refine.get(id as usize * m..(id as usize + 1) * m)?;
-        let mut x = self.coarse.get(l).to_vec();
-        for ((v, p), r) in x
+        let mut x = vec![0f32; self.dim()];
+        self.rebuild(l, pc, rc, &mut x);
+        Some(x)
+    }
+
+    /// Writes `centroid(list) + pq(pc) + refine(rc)` into `out`.
+    fn rebuild(&self, list: usize, pc: &[u8], rc: &[u8], out: &mut [f32]) {
+        out.copy_from_slice(self.coarse.get(list));
+        for ((v, p), r) in out
             .iter_mut()
             .zip(self.pq.decode(pc))
             .zip(self.refine.decode(rc))
         {
             *v += p + r;
         }
-        Some(x)
     }
 
     /// Bytes held in RAM: centroids, codebooks and the centroid graph.

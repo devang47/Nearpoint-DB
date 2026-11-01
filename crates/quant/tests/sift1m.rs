@@ -15,6 +15,9 @@ fn path(name: &str) -> PathBuf {
     PathBuf::from(home).join("data/Nearpoint/sift1m").join(name)
 }
 
+// The reader, top-k and recall below repeat `bench`'s on purpose: `bench`
+// depends on `quant`, so a dev-dependency back would be a cycle.
+
 /// Reads .fvecs / .ivecs: each record is `[d: i32][d x 4 bytes]`. Returns
 /// the raw 4-byte words, row-major, and d.
 fn read_vecs(name: &str) -> (Vec<[u8; 4]>, usize) {

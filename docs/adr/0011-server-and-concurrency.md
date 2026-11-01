@@ -67,9 +67,10 @@ top of whatever this round does.
 - **HTTP.** axum, JSON everywhere except `POST .../points/bulk`, whose
   body is blocks of `n u32 | dim u32 | payload_len u32 | ids u64×n |
   vectors f32×n·dim | JSON lines`, little-endian, all blocks one batch
-  (docs/api.md). Every engine call runs on `spawn_blocking`; a panic there
-  is a 500. Bodies are capped at 256 MiB. Server config is flags plus env
-  vars only: data dir, bind address, sync policy.
+  (docs/api.md). Every engine call that does I/O or searches runs on
+  `spawn_blocking`; a panic there is a 500. Bodies are capped at 256 MiB
+  (bulk) or 32 MiB (JSON). Server config is flags plus env vars only:
+  data dir, bind address, sync policy.
 - **Error mapping.** `Error::Unknown` and a poisoned WAL are 503 with a
   body saying the write may or may not be durable and that a restart
   recovers. Never a 2xx: the handler only answers 2xx when

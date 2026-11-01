@@ -1,5 +1,5 @@
-"""Minimal Nearpoint client: stdlib only, a method for each collection and
-point endpoint in docs/api.md (not /metrics or attach_billion).
+"""Minimal Nearpoint client: stdlib only, one method per endpoint in
+docs/api.md.
 
     from nearpoint import Client
     c = Client("http://127.0.0.1:7700")
@@ -67,8 +67,10 @@ class Client:
     def health(self):
         return self._call("GET", "/health")
 
-    def create_collection(self, name, dim, metric="l2", hnsw=None, schema=None):
-        body = {"dim": dim, "metric": metric}
+    def create_collection(self, name, dim, metric="l2", hnsw=None, schema=None, **config):
+        """`config`: any other collection setting in docs/api.md
+        (`seal_rows`, `ivf_rows`, `max_merge_rows`, `exact_vectors`)."""
+        body = {"dim": dim, "metric": metric, **config}
         if hnsw:
             body["hnsw"] = hnsw
         if schema:
@@ -114,17 +116,28 @@ class Client:
                 return None
             raise
 
-    def search(self, name, vector, k=10, ef=None, filter=None, with_payload=False, with_vector=False):
+    def search(self, name, vector, k=10, ef=None, filter=None, with_payload=False, with_vector=False,
+               nprobe=None, rerank=None):
         """A list of hits {"id", "dist", ["payload"], ["vector"]}, nearest first."""
         body = {"vector": list(vector), "k": k, "with_payload": with_payload, "with_vector": with_vector}
-        if ef is not None:
-            body["ef"] = ef
-        if filter is not None:
-            body["filter"] = filter
+        for key, value in (("ef", ef), ("nprobe", nprobe), ("rerank", rerank), ("filter", filter)):
+            if value is not None:
+                body[key] = value
         return self._call("POST", f"/collections/{self._name(name)}/search", body)["hits"]
 
     def seal(self, name):
         return self._call("POST", f"/collections/{self._name(name)}/seal")
+
+    def attach_billion(self, name, dir):
+        """Moves a finished billion-mode build at server path `dir` into
+        the empty collection `name` (docs/api.md)."""
+        return self._call("POST", f"/collections/{self._name(name)}/attach_billion", {"dir": dir})
+
+    def metrics(self):
+        """The Prometheus text from /metrics."""
+        req = urllib.request.Request(self.url + "/metrics")
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return r.read().decode()
 
 
 def encode_bulk(ids, vectors, payloads=None):

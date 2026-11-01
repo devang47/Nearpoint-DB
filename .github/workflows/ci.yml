@@ -8,3 +8,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/check.sh
+      - name: Python client against a live server
+        run: |
+          cargo build -p server
+          target/debug/server --data-dir "$RUNNER_TEMP/db" &
+          for _ in $(seq 50); do curl -sf localhost:7700/health && break; sleep 0.2; done
+          curl -sf localhost:7700/health # the tests skip, not fail, without a server
+          python3 clients/python/test_nearpoint.py -v
+          kill %1
