@@ -15,6 +15,13 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — CI: gate the int8 test strategy on dotprod
+- **What:** `i8_pair` in `crates/kernels/src/neon.rs` tests now carries
+  `#[cfg(target_feature = "dotprod")]`, like the tests that use it.
+- **Why:** GitHub's macOS runner VM doesn't expose dotprod under
+  `target-cpu=native`, so those tests compiled out and the unused helper
+  failed clippy `-D warnings`; every CI run had been red since round 3.
+
 ## 2026-11-01 — Phase 10: summary table and README
 - **What:** RESULTS.md opens with a summary by scale (1M / 10M / 100M /
   1B: recall, p50 / p99, QPS for one client, RAM, disk, build time, from
