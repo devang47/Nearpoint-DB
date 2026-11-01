@@ -1,0 +1,53 @@
+=== 2026-11-01 08:25:58 stream complete
+stream complete: 1000000000 rows in 27719 s
+stream complete
+    Finished `release` profile [optimized] target(s) in 0.24s
+=== 2026-11-01 08:25:58 sort
+sorted in 7 passes, 154 s
+verified in 155 s
+total 109482528
+drwxr-xr-x@ 9 kitatsu  staff          288 Nov  1 08:28 .
+drwxr-xr-x@ 6 kitatsu  staff          192 Nov  1 05:08 ..
+-rwxr-xr-x@ 1 kitatsu  staff      1689024 Nov  1 00:43 billion-bin
+-rw-r--r--@ 1 kitatsu  staff        45525 Nov  1 08:25 build.log
+-rw-r--r--@ 1 kitatsu  staff  22000524344 Nov  1 08:28 lists
+-rw-r--r--@ 1 kitatsu  staff           44 Nov  1 08:25 progress
+-rw-r--r--@ 1 kitatsu  staff     51197464 Nov  1 00:43 quant
+-rw-r--r--@ 1 kitatsu  staff  16000000032 Nov  1 08:25 refine
+-rw-r--r--@ 1 kitatsu  staff  18000000000 Nov  1 08:25 stream
+=== 2026-11-01 08:31:09 eval
+1000000000 rows, nlist 65536, m 16; 10000 queries, recall@10 (id match vs the first 10 ground-truth ids)
+nprobe   32 rerank   100: recall@10 0.6509, p50 19.03 ms, p99 35.01 ms, mean 19.49 ms, phys_footprint 160 MiB (peak 160)
+nprobe   32 rerank  1000: recall@10 0.6577, p50 34.76 ms, p99 53.11 ms, mean 35.37 ms, phys_footprint 162 MiB (peak 162)
+nprobe   64 rerank   100: recall@10 0.6664, p50 35.78 ms, p99 60.81 ms, mean 36.15 ms, phys_footprint 162 MiB (peak 162)
+nprobe   64 rerank  1000: recall@10 0.6745, p50 54.38 ms, p99 81.68 ms, mean 54.95 ms, phys_footprint 166 MiB (peak 166)
+nprobe  128 rerank   100: recall@10 0.6735, p50 69.76 ms, p99 125.56 ms, mean 70.57 ms, phys_footprint 166 MiB (peak 166)
+nprobe  128 rerank  1000: recall@10 0.6822, p50 93.51 ms, p99 145.61 ms, mean 94.03 ms, phys_footprint 167 MiB (peak 167)
+nprobe  256 rerank   100: recall@10 0.6764, p50 141.92 ms, p99 257.69 ms, mean 143.15 ms, phys_footprint 111 MiB (peak 168)
+nprobe  256 rerank  1000: recall@10 0.6855, p50 176.79 ms, p99 287.32 ms, mean 178.03 ms, phys_footprint 123 MiB (peak 168)
+=== peak build dir (KiB), min free (KiB)
+54741264 11235380
+=== 2026-11-01 10:16:27 attach + bigload
+{"dim":128,"exact_vectors":true,"hnsw":{"ef_construction":200,"m":16,"seed":42},"ivf_rows":1000000,"max_merge_rows":4000000,"metric":"l2","name":"bigann","points":1000000000,"schema":{},"seal_rows":100000,"segments":[{"dead":0,"index":"billion","rows":1000000000},{"dead":0,"index":"mutable","rows":0
+
+=== 10:16:28 bigload nprobe 64
+before deletes: unfiltered recall@10 0.6664 p50 38.81 p99 86.76 mean 40.54 ms (10000 queries); filtered 10% recall@10 NaN p50 NaN p99 NaN ms (0 queries); violations 0; phys_footprint 103 MiB (peak 149); memory MiB: id_map 0, ids 0, index 83, payloads 0, mutable 0; mapped 36240 MiB
+deleted 10000000 ids in 7.4 s
+after deletes: unfiltered recall@10 0.6670 p50 39.28 p99 82.90 mean 40.57 ms (10000 queries); filtered 10% recall@10 NaN p50 NaN p99 NaN ms (0 queries); violations 0; phys_footprint 138 MiB (peak 156); memory MiB: id_map 0, ids 0, index 83, payloads 0, mutable 0; mapped 36240 MiB
+=== 10:30:07 bigload nprobe 128
+before deletes: unfiltered recall@10 0.6703 p50 74.00 p99 136.59 mean 75.40 ms (10000 queries); filtered 10% recall@10 NaN p50 NaN p99 NaN ms (0 queries); violations 0; phys_footprint 138 MiB (peak 156); memory MiB: id_map 0, ids 0, index 83, payloads 0, mutable 0; mapped 36240 MiB
+deleted 10000000 ids in 0.5 s
+after deletes: unfiltered recall@10 0.6741 p50 73.73 p99 133.64 mean 74.87 ms (10000 queries); filtered 10% recall@10 NaN p50 NaN p99 NaN ms (0 queries); violations 0; phys_footprint 138 MiB (peak 156); memory MiB: id_map 0, ids 0, index 83, payloads 0, mutable 0; mapped 36240 MiB
+nearpoint_memory_bytes{collection="bigann",component="id_map"} 0
+nearpoint_memory_bytes{collection="bigann",component="ids"} 0
+nearpoint_memory_bytes{collection="bigann",component="index"} 87373224
+nearpoint_memory_bytes{collection="bigann",component="payloads"} 0
+nearpoint_memory_bytes{collection="bigann",component="mutable"} 0
+nearpoint_mapped_bytes{collection="bigann"} 38000524296
+nearpoint_points{collection="bigann"} 990000000
+nearpoint_segments{collection="bigann",index="billion"} 1
+nearpoint_segments{collection="bigann",index="mutable"} 1
+nearpoint_phys_footprint_bytes 145172208
+nearpoint_phys_footprint_peak_bytes 163997424
+nearpoint_rss_peak_bytes 6878969856
+STEP done 2026-11-01 10:55:10

@@ -224,16 +224,22 @@ decoded int8 with `exact_vectors: false`.
 - [x] 9.1 Train coarse quantizer + PQ on a 10M sample. Two-level k-means
       (256 × 256 = 65,536 lists) + HNSW over the centroids, PQ16 +
       16-byte refinement PQ; 214 s on BIGANN's first 10M (ADR 0014).
-- [ ] 9.2 Streaming builder: `curl` range download piped into the builder's
+- [x] 9.2 Streaming builder: `curl` range download piped into the builder's
       stdin → encode → append (list_id, code, id) to temp file → discard raw
       data. Resumable from the last committed byte offset.
-- [ ] 9.3 Multi-pass on-disk counting sort into the final IVF list layout.
-- [ ] 9.4 Optional refinement codes for second-stage re-ranking.
+- [x] 9.3 Multi-pass on-disk counting sort into the final IVF list layout.
+- [x] 9.4 Optional refinement codes for second-stage re-ranking (16-byte
+      PQ of the PQ residual; ADR 0014).
 - [x] 9.5 Load as a read-only compressed segment in the engine.
       `attach_billion`: ids `0..n` implicit, deletes and replacements
       tombstone it, never compacted (ADR 0014 addendum).
 **Acceptance:** 1B vectors, p99 < 100 ms, peak disk ≤ 60 GB,
 recall published honestly against the official 1B ground truth.
+**Status (2026-11-01): met.** BIGANN 1B streamed once (7.7 h, the
+download), never stored; through the API at nprobe 64 / rerank 100:
+p99 86.8 ms, recall@10 **0.666** (id match, official GT), peak disk
+56.06 GB, server phys_footprint ≤ 164 MiB; 0 violations after 10M
+deletes. Recall is capped by the 32-byte codes (0.69 at nprobe 256).
 
 ## Phase 10: Results and write-up
 - [ ] 10.1 Benchmark table: 1M/10M/100M/1B × recall, p50/p99, QPS,

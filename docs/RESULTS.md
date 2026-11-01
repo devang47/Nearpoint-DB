@@ -636,6 +636,71 @@ Order: cold, warm, cold, warm.
   ~250 MB/s through page faults): the next thing to make lazy, like the
   vectors section was.
 
+## Phase 9: billion mode, BIGANN 1B (2026-11-01, 09a79ee)
+
+Quantizers (`billion train`) on BIGANN's first 10M rows: 65,536 lists
+(two-level k-means 256 × 256) with an HNSW over the centroids, PQ16 on
+the residual, a 16-byte refinement PQ: 214 s, peak phys_footprint 6,171
+MiB. Then the whole 1B base streamed once (`tools/billion-build.sh`:
+64 MB range chunks, 4 at a time, deleted once piped), encoded, sorted,
+verified. Queries: the 10,000 public queries; recall@10 is id match
+against the first 10 ids of the official ground truth (`GT_1B`;
+ground-truth ids deleted in the run are skipped), not tie-aware. One query
+at a time. Logs `docs/results/bigann1b-{build,post}.log`.
+
+### Build
+
+| Step | Time | Notes |
+|------|-----:|-------|
+| stream + encode 1B rows | 27,719 s (7.7 h) | one attempt, no resume needed; 33.6–35.7k rows/s = the download (≈4.5 MB/s, 4 connections); encode alone does 74k rows/s |
+| sort (7 passes, 3 GiB budget) | 154 s | |
+| verify every CRC (38 GB) | 155 s | |
+| **peak disk** (build directory, sampled every 30 s) | **56.06 GB** | stream 18 + refine 16 + lists 22; plus ≤ 0.5 GB of raw chunks in flight while streaming (when the directory is ≤ 34 GB) |
+| final index | 38.05 GB | lists 22.0 GB + refine 16.0 GB + quant 51 MB |
+
+### Search, standalone (`billion eval`, after the sort)
+
+| nprobe | rerank | recall@10 | p50 | p99 | phys_footprint |
+|-------:|-------:|----------:|----:|----:|---------------:|
+| 32 | 100 | 0.6509 | 19.0 ms | 35.0 ms | 160 MiB |
+| 32 | 1000 | 0.6577 | 34.8 ms | 53.1 ms | 162 MiB |
+| **64** | **100** | **0.6664** | **35.8 ms** | **60.8 ms** | 162 MiB |
+| 64 | 1000 | 0.6745 | 54.4 ms | 81.7 ms | 166 MiB |
+| 128 | 100 | 0.6735 | 69.8 ms | 125.6 ms | 166 MiB |
+| 128 | 1000 | 0.6822 | 93.5 ms | 145.6 ms | 167 MiB |
+| 256 | 100 | 0.6764 | 141.9 ms | 257.7 ms | 168 MiB |
+| 256 | 1000 | 0.6855 | 176.8 ms | 287.3 ms | 168 MiB |
+
+### Through the API (attached as a segment, 9.5)
+
+`attach_billion` into an empty collection, then `bigload` (10,000
+queries, rerank 100), delete every id ≡ 0 (mod 100) (10M deletes), again.
+
+| nprobe | pass | recall@10 | p50 | p99 |
+|-------:|------|----------:|----:|----:|
+| **64** | before deletes | **0.6664** | 38.8 ms | **86.8 ms** |
+| 64 | after 10M deletes | 0.6670 | 39.3 ms | 82.9 ms |
+| 128 | before deletes | 0.6703 | 74.0 ms | 136.6 ms |
+| 128 | after deletes | 0.6741 | 73.7 ms | 133.6 ms |
+
+- **Phase 9 acceptance met:** 1B vectors, p99 86.8 ms (< 100) through
+  the API at nprobe 64, peak disk 56.06 GB (≤ 60), recall@10 **0.666**
+  against the official 1B ground truth. 0 violations after 10M deletes
+  (7.4 s for the 1,000 delete requests). Server phys_footprint 103–164
+  MiB (centroids, codebooks, the centroid graph: 83 MiB; the 38 GB of
+  lists and codes are mapped); peak RSS 6.6 GB (mapped pages).
+- **Recall is the codes' limit, not the probes':** 32 bytes per vector
+  (PQ16 + refine16) reach 0.69 at nprobe 256 / rerank 1000 (0.76 on the
+  same quantizers at 10M). More re-ranking barely helps (+0.01), so the
+  error is in the stored codes; better recall needs longer codes (and
+  their disk) or OPQ, not a slower search.
+- Latency is ~linear in nprobe: each probe scans ~15k codes from the
+  mapped lists (16 B each; 2.6 MB of codes plus ids per query at
+  nprobe 64), mostly from SSD since 38 GB don't fit the page cache.
+- The 10M dry run with the same code: recall@10 0.727 (nprobe 64,
+  rerank 100), p99 0.78 ms standalone; 0.727 / 0.79 ms through the API,
+  server phys_footprint 139 MiB.
+
 ## Quantization quality (tasks 5.1–5.3)
 
 `cargo test --release -p quant --test sift1m -- --ignored --nocapture`.

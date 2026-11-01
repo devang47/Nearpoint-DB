@@ -73,4 +73,6 @@ none of its rows; `vectors_ok` is false, so compaction never picks it.
   deletes, replacements or new rows next to the billion ones); ids in the
   id map (RAM); u64 row → id arrays like other segments (8 GB).
 - Measured at 10M (RESULTS.md): recall identical to the standalone tool,
-  server phys_footprint 139 MiB.
+  server phys_footprint 139 MiB. At 1B through the API: recall@10 0.666,
+  p99 86.8 ms (nprobe 64, rerank 100), phys_footprint ≤ 164 MiB; peak
+  build disk 56.06 GB.

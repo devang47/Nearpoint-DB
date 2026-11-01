@@ -15,6 +15,15 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — Phase 9 met: BIGANN 1B in billion mode
+- **What:** streamed and encoded the BIGANN 1B base (one attempt, 7.7 h),
+  sorted (7 passes, 154 s), verified, evaluated standalone, attached
+  through the API and measured with 10M deletes. RESULTS.md, PLAN 9.2–9.4
+  ticked, logs `docs/results/bigann1b-*.log`.
+- **Why it matters:** p99 86.8 ms at nprobe 64 through the API, peak disk
+  56.06 GB, recall@10 0.666 against the official ground truth, server
+  phys_footprint ≤ 164 MiB. Recall is the 32-byte codes' ceiling.
+
 ## 2026-11-01 — 9.5: billion build as an engine segment
 - **What:** `SegIndex::Billion` (quantizers + mapped files);
   `Collection::attach_billion` and `POST /collections/{name}/attach_billion`;
