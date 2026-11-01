@@ -21,6 +21,12 @@ Format:
 - **Why:** GitHub's macOS runner VM doesn't expose dotprod under
   `target-cpu=native`, so those tests compiled out and the unused helper
   failed clippy `-D warnings`; every CI run had been red since round 3.
+- **What (2):** `storage::sys` peak-memory test no longer requires peak
+  RSS >= 256 MB, only that it is read and monotone.
+- **Why (2):** on the CI VM the compressor took pages, so peak RSS stayed
+  under 256 MB (flaky: passed on push, failed on the PR run). The
+  phys_footprint assertions, which count compressed pages, still check
+  the 256 MB.
 
 ## 2026-11-01 — Phase 10: summary table and README
 - **What:** RESULTS.md opens with a summary by scale (1M / 10M / 100M /
