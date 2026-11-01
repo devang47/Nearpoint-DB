@@ -7,6 +7,36 @@ recall@10 is tie-aware (a hit is a result whose true distance is <= the
 10th ground-truth distance; `docs/adr/0002-tie-aware-recall.md`); the
 id-match figure is always recorded beside it. Warm cache unless noted.
 
+## Summary by scale (task 10.1, 2026-11-01)
+
+The headline run at each scale, from the sections below (nothing
+re-measured here). Mac mini M4, 10 cores, 16 GB, internal SSD. "API"
+rows go through the HTTP server with `bigload` or `loadtest`; others are
+the in-process harness. Queries run one at a time from one client, so
+**QPS (1 client) = 1 / mean latency**, not peak throughput (4 concurrent
+clients: ~13.9k searches/s on ~40k live dim-32 points in the Phase 4 load
+test, ~5.6k/s on 1M dim-32 IVF-PQ in the Phase 6 soak). RAM
+is phys_footprint (what macOS memory pressure counts); disk is the index
+on disk.
+
+| Scale | Dataset, mode | recall@10 | p50 | p99 | QPS (1 client) | RAM | Disk | Build / load |
+|------:|---------------|----------:|----:|----:|---------------:|----:|-----:|-------------:|
+| 1M | SIFT1M, HNSW M16 ef64 (harness) | 0.963 (tie-aware) | 0.106 ms | 0.138 ms | 9,512 | 1,256 MiB peak (incl. ~0.5 GB harness copy) | in RAM | 44.4 s |
+| 1M | SIFT1M via API, sealed + restarted | 0.957 (id) | 0.266 ms | 0.482 ms | – | 717 MiB RSS | – | 44.2 s load |
+| 10M | BIGANN 10M, IVF-PQ nlist 4096, nprobe 32, rerank 100 (harness) | 0.918 (tie-aware) | 0.593 ms | 1.52 ms | 1,486 | 2,791 MiB peak (incl. 1.2 GB harness copy) | – | 160 s |
+| 10M | BIGANN 10M via API, all features, `exact_vectors: false` | 0.970 (id) | 0.98 ms | 7.65 ms | 800 | 4,910 MiB peak, 1,470 MiB steady | 1.6 GB | 576 s load |
+| 100M | BIGANN 100M via API, all features, 1M deletes | **0.977** (id) | **50.0 ms** | **92.9 ms** | 19 | **8,965 MiB peak** (load), 6.6 GB serving | 16 GB | 3,852 s load |
+| 1B | BIGANN 1B billion mode via API, nprobe 64, rerank 100, 10M deletes | **0.666** (id) | **38.8 ms** | **86.8 ms** | 25 | **≤ 164 MiB** | **38 GB** (peak 56.06 GB) | 7.7 h stream + 5 min sort/verify (+ 3.6 min train) |
+
+Targets (AGENTS.md / PLAN.md): 1M–100M with every feature at p99 < 100
+ms, recall@10 ≥ 0.9, ≤ 10 GB: **met** at 100M with a thin p99 margin
+(cold cache the same: 80–93 ms). 1B compressed at p99 < 100 ms, ≤ 60 GB
+peak disk, recall published: **met**, recall 0.666, the 32-byte codes'
+limit (0.686 at nprobe 256, p99 287 ms). Same-machine FAISS / Qdrant
+comparison (optional in 10.1): not done.
+
+## Detailed runs
+
 | Date | Task | Dataset | Index + params | Seed | recall@10 | p50 | p99 | QPS | Peak RSS | Peak phys_footprint | Disk | Build time | Commit |
 |------|------|---------|----------------|------|-----------|-----|-----|-----|----------|---------------------|------|------------|--------|
 | 2026-10-28 | HNSW memory | BIGANN 10M | hnsw M=16 efc=200 ef=64, reserve + striped locks (memory-bound, see note) | 42 | 0.9154 (0.9153) | *0.285 ms* | *6.26 ms* | *1045* | 7231 MiB | **8501 MiB** | – | 714.9 s | 8f67ec3 |

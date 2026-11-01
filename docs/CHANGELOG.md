@@ -15,6 +15,17 @@ Format:
 
 <!-- new entries go directly below this line -->
 
+## 2026-11-01 — Phase 10: summary table and README
+- **What:** RESULTS.md opens with a summary by scale (1M / 10M / 100M /
+  1B: recall, p50 / p99, QPS for one client, RAM, disk, build time, from
+  the recorded runs); README rewritten: status, results, architecture
+  diagram (segments, billion mode, maintenance threads, prefetch),
+  quickstart for the server, benchmarks and billion mode. PLAN 10.1–10.2
+  ticked.
+- **Why:** the roadmap's last phase: the numbers in one place, and a
+  README that matches what the code does now (the old one stopped at
+  Phase 2).
+
 ## 2026-11-01 — Phase 9 met: BIGANN 1B in billion mode
 - **What:** streamed and encoded the BIGANN 1B base (one attempt, 7.7 h),
   sorted (7 passes, 154 s), verified, evaluated standalone, attached

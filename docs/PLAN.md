@@ -242,8 +242,9 @@ p99 86.8 ms, recall@10 **0.666** (id match, official GT), peak disk
 deletes. Recall is capped by the 32-byte codes (0.69 at nprobe 256).
 
 ## Phase 10: Results and write-up
-- [ ] 10.1 Benchmark table: 1M/10M/100M/1B × recall, p50/p99, QPS,
+- [x] 10.1 Benchmark table: 1M/10M/100M/1B × recall, p50/p99, QPS,
       RAM, disk, build time. Our own numbers are the deliverable;
       same-machine FAISS/Qdrant comparison is an optional stretch
-      (needs Python + Docker on the mini).
-- [ ] 10.2 README with architecture diagram, quickstart, and results.
+      (needs Python + Docker on the mini). RESULTS.md "Summary by
+      scale"; the FAISS/Qdrant stretch not done.
+- [x] 10.2 README with architecture diagram, quickstart, and results.
